@@ -107,11 +107,28 @@ Cross-reference with SigNoz:
 - `signoz_search_traces` for failing spans
 - `signoz_query_metrics` for resource usage trends
 
-Cross-reference with git (for recent code changes):
+Cross-reference with git and GitLab MRs (was this caused by a recent deploy?):
 ```bash
-cd ~/repos/<repo> && git log --oneline -10
-cd ~/repos/<repo> && git log --since="24 hours ago" --oneline
+# Recent commits on the deployed branch (dev or main depending on cluster)
+cd ~/repos/<repo> && git fetch origin && git log origin/dev --oneline -10
+cd ~/repos/<repo> && git log origin/dev --since="6 hours ago" --oneline
+
+# Recent merged MRs via GitLab API
+# Use $GITLAB_TOKEN from .env (loaded at startup)
+# Project IDs: web-app=70690979 workers=75857737 data-pipelines=75857792
+#   data-cluster=75857874 k8s-charts=75858254 data-cluster-helm=77561397
+#   data-cluster-operator=77563199 skupper-gateway=77743902
+curl -s "https://gitlab.com/api/v4/projects/<PROJECT_ID>/merge_requests?state=merged&per_page=5&order_by=updated_at" \
+  -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '.[] | {title, merged_at, web_url, target_branch}'
+
+# View a specific MR's changes
+curl -s "https://gitlab.com/api/v4/projects/<PROJECT_ID>/merge_requests/<MR_IID>/changes" \
+  -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '{title, description, changes: [.changes[] | .new_path]}'
 ```
+
+**This is critical**: if an alert fires within ~30 minutes of a merged MR, the MR is the
+prime suspect. Include the MR link in any escalation. If the MR was merged to `dev` and
+the issue is on a dev cluster, a rollback or fix-forward is needed — escalate with the MR URL.
 
 ### Step 3: Decide (fix or escalate?)
 
@@ -249,9 +266,11 @@ Just log internally: "Alert X resolved, no action was needed."
 2. Query recent traces: `signoz_search_traces` with `has_error = true AND response_status_code >= '500'`
 3. Check pod health: `kubectl get pods`, look for restarts or pending pods
 4. Check recent deployments: `kubectl rollout history deployment/<service>`
-5. Check recent git commits: `cd ~/repos/<repo> && git log --since="2 hours ago" --oneline`
+5. **Check recent MRs**: query the GitLab API for recently merged MRs on the affected repo.
+   If an MR was merged in the last 30 min–1 hr, it's the prime suspect. Read the MR diff to confirm.
 6. If a single pod is erroring: restart it
-7. If all pods error: escalate (likely a code or config issue)
+7. If all pods error AND recent MR found: escalate with MR link (needs rollback or fix-forward)
+8. If all pods error AND no recent MR: escalate (infrastructure or config issue)
 
 ### Pod CrashLooping (critical)
 1. Get pod status: `kubectl describe pod`
