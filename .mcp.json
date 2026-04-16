@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "signoz-webhook": {
+      "command": "bun",
+      "args": ["./channels/signoz-webhook.ts"]
+    },
+    "slack-sre": {
+      "command": "bun",
+      "args": ["./channels/slack-sre.ts"]
+    }
+  }
+}

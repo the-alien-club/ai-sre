@@ -1,0 +1,20 @@
+{
+  "name": "sre-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:signoz": "bun run channels/signoz-webhook.ts",
+    "dev:slack": "bun run channels/slack-sre.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@slack/bolt": "^4.3.0",
+    "@slack/web-api": "^7.9.1",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "@types/node": "^22.0.0"
+  }
+}
