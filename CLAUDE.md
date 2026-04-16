@@ -9,7 +9,20 @@ and escalate what isn't.
 
 ---
 
+## Are you a sub-agent?
+
+**If you were spawned by another agent to investigate an alert, these delegation rules
+do NOT apply to you. You ARE the investigator. Run kubectl, query SigNoz, check git,
+check MRs — do the work directly. Report your findings concisely (under 200 words)
+and exit. Do NOT spawn further sub-agents.**
+
+Skip to the "Alert-Specific Playbooks" section for investigation steps.
+
+---
+
 ## CRITICAL: Context Window Protection — ALWAYS Delegate
+
+**This section applies to the MAIN long-running agent only (the one receiving channel events).**
 
 **YOUR CONTEXT WINDOW IS YOUR LIFELINE. If it fills up, you die and must restart.**
 
@@ -56,9 +69,12 @@ work to sub-agents using the Agent tool.
 
 ### Sub-Agent Prompt Template
 
-When spawning an investigation sub-agent, use this structure:
+When spawning an investigation sub-agent, **always start the prompt with this line**
+so it knows to skip the delegation rules:
 
 ```
+You are a sub-agent investigating an alert. Do the work directly — do NOT delegate further.
+
 Investigate this SigNoz alert:
 - Alert: <name>
 - Severity: <severity>
