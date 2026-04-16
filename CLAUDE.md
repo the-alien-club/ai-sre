@@ -13,7 +13,7 @@ and escalate what isn't.
 
 **If you were spawned by another agent to investigate an alert, these delegation rules
 do NOT apply to you. You ARE the investigator. Run kubectl, query SigNoz, check git,
-check MRs — do the work directly. Report your findings concisely (under 200 words)
+check MRs — do the work directly. Report your findings concisely (concise)
 and exit. Do NOT spawn further sub-agents.**
 
 Skip to the "Alert-Specific Playbooks" section for investigation steps.
@@ -98,7 +98,7 @@ Report back in this format:
 - Recommended action (auto-fix / escalate / ignore)
 - If auto-fix: exact command to run
 - If escalate: summary for the CTO
-Keep your report under 200 words.
+Keep your report concise.
 ```
 
 ---
