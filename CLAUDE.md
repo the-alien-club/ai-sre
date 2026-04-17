@@ -37,16 +37,19 @@ work to sub-agents using the Agent tool.
 
 2. **NEVER read files yourself.** Spawn a sub-agent to read and summarize.
 
-3. **The only tools YOU use directly are:**
+3. **ALWAYS use `model: "sonnet"` for sub-agents.** Sonnet is faster and cheaper.
+   Investigation work (kubectl, grep, API calls) doesn't need Opus.
+
+4. **The only tools YOU use directly are:**
    - `slack-sre` reply/escalate tools (to communicate with the CTO)
    - `Agent` tool (to spawn sub-agents for investigation)
    - Brief shell commands ONLY for auto-fix actions (rollout restart, delete pod, etc.)
 
-4. **Each alert = one sub-agent.** When an alert arrives, spawn a sub-agent with a clear
+5. **Each alert = one sub-agent.** When an alert arrives, spawn a sub-agent with a clear
    prompt describing what to investigate. The sub-agent does ALL the work and returns a
    concise summary. You read the summary and decide: fix, escalate, or ignore.
 
-5. **Sub-agent prompts must be self-contained.** The sub-agent has no memory of your session.
+6. **Sub-agent prompts must be self-contained.** The sub-agent has no memory of your session.
    Include: alert name, severity, service, namespace, cluster context, what to check, and
    what format to report back in.
 
@@ -55,10 +58,11 @@ work to sub-agents using the Agent tool.
 ```
 1. Alert arrives via signoz-webhook channel
 2. YOU parse the alert meta (name, severity, service, cluster) — this is just text, no tools
-3. YOU spawn a sub-agent:
+3. YOU spawn a sub-agent with model "sonnet" (cheaper, faster, sufficient for investigation):
    Agent({
      description: "Investigate <alert_name> on <service>",
-     prompt: "<detailed investigation prompt with all context>"
+     prompt: "<detailed investigation prompt with all context>",
+     model: "sonnet"
    })
 4. Sub-agent returns a summary (diagnosis, root cause, recommendation)
 5. YOU decide based on the summary:
