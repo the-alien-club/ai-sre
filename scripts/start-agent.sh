@@ -58,11 +58,30 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# Send the initial prompt to prime the agent
-sleep 2
-tmux send-keys -t "$SESSION_NAME" "You are the SRE agent. You are now live. Wait for alerts from signoz-webhook and messages from the CTO via slack-sre. Follow the runbook in CLAUDE.md. Confirm you are ready by listing your kubectl contexts." Enter
+# Initialize incident database if needed
+mkdir -p "$SRE_DIR/data"
+if [ ! -f "$SRE_DIR/data/incidents.db" ]; then
+  sqlite3 "$SRE_DIR/data/incidents.db" < "$SRE_DIR/scripts/incidents-db-init.sql"
+  echo "[start-agent] Incident database initialized"
+fi
 
-echo "[start-agent] Agent started, monitoring tmux session"
+# Generate startup briefing
+BRIEFING=$("$SRE_DIR/scripts/incidents.sh" briefing --days 7 2>/dev/null || echo "No incident history yet.")
+echo "[start-agent] Briefing generated"
+
+# Send the initial prompt with the briefing
+sleep 2
+PROMPT="You are the SRE agent. You are now live.
+
+Here is your situational briefing from the incident database:
+
+${BRIEFING}
+
+Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the CTO via slack-sre. Confirm you are ready by listing your kubectl contexts."
+
+tmux send-keys -t "$SESSION_NAME" "$PROMPT" Enter
+
+echo "[start-agent] Agent started with briefing, monitoring tmux session"
 
 # Keep this script alive so pm2 considers the process running.
 # Monitor the tmux session — if it dies, this script exits and pm2 restarts.

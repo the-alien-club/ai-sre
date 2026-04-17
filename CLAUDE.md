@@ -65,6 +65,63 @@ work to sub-agents using the Agent tool.
    - False positive → log briefly, done
    - Auto-fixable → run the ONE fix command yourself, then confirm via another sub-agent
    - Needs escalation → use the escalate tool with the sub-agent's findings
+6. ALWAYS log the outcome: the sub-agent must call `./scripts/incidents.sh log` before returning
+```
+
+---
+
+## Incident Memory
+
+You have a persistent SQLite database at `data/incidents.db` that survives restarts.
+Every investigation MUST be logged. Every sub-agent MUST check history before investigating.
+
+### Sub-agents: before investigating, check history
+
+Always include this in the sub-agent prompt:
+```bash
+# Check if this alert has fired recently
+./scripts/incidents.sh check --alert "<alert_name>" --cluster "<cluster>"
+```
+
+If the alert fired multiple times recently and was always noise, the sub-agent can
+short-circuit: "This alert has fired 5 times in 7 days and was noise every time. Likely noise again."
+
+### Sub-agents: after investigating, log the result
+
+Every sub-agent MUST log the outcome before returning:
+```bash
+./scripts/incidents.sh log \
+  --alert "<alert_name>" \
+  --severity "<critical|warning|info>" \
+  --status "<firing|resolved>" \
+  --cluster "<cluster>" \
+  --service "<service>" \
+  --verdict "<real|noise|false_positive|known_issue|flapping>" \
+  --action "<auto_fixed|escalated|ignored|monitoring>" \
+  --cause "<brief root cause>"
+```
+
+Optional flags: `--resolution`, `--related-mr`, `--namespace`, `--notes`, `--duration`
+
+### Main agent: startup briefing
+
+On startup, you receive a briefing generated from the incident database. It tells you:
+- How many alerts were processed in the last 7 days
+- Recurring noise patterns (consider suggesting threshold tuning)
+- Recent real incidents and their resolutions
+- Pending escalations that were never acknowledged
+
+Use this briefing to calibrate your responses. If an alert has been noise 10 times this
+week, don't spawn a full investigation — just log it as known noise.
+
+### Available commands
+
+```bash
+./scripts/incidents.sh check --alert "name" [--cluster ctx] [--days 7]   # Recent history
+./scripts/incidents.sh fingerprint --fp "abc123"                          # By fingerprint
+./scripts/incidents.sh patterns [--days 7]                                # Recurring patterns
+./scripts/incidents.sh briefing [--days 7]                                # Generate briefing
+./scripts/incidents.sh resolve --id 42 --resolution "what fixed it"      # Mark resolved
 ```
 
 ### Sub-Agent Prompt Template
@@ -75,6 +132,10 @@ so it knows to skip the delegation rules:
 ```
 You are a sub-agent investigating an alert. Do the work directly — do NOT delegate further.
 
+FIRST: Check incident history before investigating:
+  ./scripts/incidents.sh check --alert "<name>" --cluster "<cluster>"
+If this alert has been noise multiple times recently, you can short-circuit.
+
 Investigate this SigNoz alert:
 - Alert: <name>
 - Severity: <severity>
@@ -83,6 +144,7 @@ Investigate this SigNoz alert:
 - Cluster context: <kubectl context to use>
 - Namespace: <namespace if known>
 - Started: <timestamp>
+- Fingerprint: <fingerprint>
 
 Investigation steps:
 1. Check pod health: kubectl --context <ctx> get pods -n <ns>
@@ -91,9 +153,17 @@ Investigation steps:
 4. Check recent MRs: curl -s "https://gitlab.com/api/v4/projects/<ID>/merge_requests?state=merged&per_page=5&order_by=updated_at" -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '.[0:3] | .[].title'
 5. [Add alert-specific checks from the playbooks below]
 
+LAST: Log the result before returning:
+  ./scripts/incidents.sh log --alert "<name>" --severity "<sev>" --status "<status>" \
+    --cluster "<cluster>" --service "<service>" --fingerprint "<fp>" \
+    --verdict "<real|noise|false_positive|known_issue>" \
+    --action "<auto_fixed|escalated|ignored|monitoring>" \
+    --cause "<brief cause>"
+
 Report back in this format:
 - Real or false positive?
 - Root cause (if identified)
+- History: has this fired before? What happened?
 - Was a recent MR merged that could have caused this?
 - Recommended action (auto-fix / escalate / ignore)
 - If auto-fix: exact command to run
