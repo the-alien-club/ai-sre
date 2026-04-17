@@ -53,6 +53,21 @@ WHERE created_at > datetime('now', '-7 days')
 GROUP BY alert_name, cluster, service
 ORDER BY fire_count DESC;
 
+-- Investigation context trail — sub-agents write notes as they work.
+-- Multiple notes per incident, timestamped, building a full investigation log.
+CREATE TABLE IF NOT EXISTS incident_context (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    incident_id INTEGER,             -- links to incidents.id (if logged yet)
+    fingerprint TEXT NOT NULL,        -- alert fingerprint (always available before incident is logged)
+    author TEXT NOT NULL DEFAULT 'sub-agent',  -- who wrote this: sub-agent, main-agent, cto
+    phase TEXT NOT NULL,             -- triage, investigation, diagnosis, fix, verification, resolution
+    content TEXT NOT NULL            -- the actual context note
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_fingerprint ON incident_context(fingerprint, created_at);
+CREATE INDEX IF NOT EXISTS idx_context_incident ON incident_context(incident_id, created_at);
+
 -- View: recent escalations still pending
 CREATE VIEW IF NOT EXISTS pending_escalations AS
 SELECT

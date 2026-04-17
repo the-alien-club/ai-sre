@@ -45,6 +45,11 @@ Also check recent MRs on the relevant repo:
   curl -s "https://gitlab.com/api/v4/projects/<PROJECT_ID>/merge_requests?state=merged&per_page=5&order_by=updated_at" \
     -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '.[0:3] | .[] | {title, merged_at, web_url}'
 
+IMPORTANT: Save context notes as you investigate using:
+  ./scripts/incidents.sh context --fp "<fingerprint>" --phase "<phase>" --content "<what you found>"
+Phases: triage, investigation, diagnosis, fix, verification, resolution
+Save a note at EACH phase — this builds the investigation trail for the incident report.
+
 LAST: Log the result before returning:
   ./scripts/incidents.sh log --alert "<name>" --severity "<sev>" --status "<status>" \
     --cluster "<cluster>" --service "<service>" \
@@ -67,3 +72,4 @@ Be concise.
    - False positive / noise → done
    - Auto-fixable → run the fix command, then spawn a verification sub-agent
    - Needs escalation → use the `escalate` tool with the sub-agent's findings
+   - **Resolved** → invoke `/incident-report` to compile and publish the full report

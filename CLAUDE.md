@@ -507,7 +507,8 @@ Use these slash commands to invoke specific workflows without loading them into 
 
 | Skill | Purpose |
 |---|---|
-| `/investigate` | Spawn a sub-agent to investigate an alert (includes playbook selection, history check, MR check, incident logging) |
+| `/investigate` | Spawn a sub-agent to investigate an alert (playbook, history check, MR check, context trail, logging) |
+| `/incident-report` | Compile full incident report from investigation trail and publish to Notion |
 | `/noise-report` | Generate alert tuning proposals for the CTO when recurring noise is detected |
 | `/daily-summary` | Generate end-of-day summary of all incidents and send to CTO |
 | `/check-history` | Query incident database for past occurrences of an alert |

@@ -29,7 +29,7 @@ case "$CMD" in
     log)
         # Parse named arguments
         ALERT="" SEVERITY="" STATUS="" CLUSTER="" NAMESPACE="" SERVICE=""
-        VERDICT="" ACTION="" CAUSE="" RESOLUTION="" RELATED_MR="" NOTES="" DURATION=""
+        VERDICT="" ACTION="" CAUSE="" RESOLUTION="" RELATED_MR="" NOTES="" DURATION="" FP=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --alert) ALERT="$2"; shift 2;;
@@ -38,6 +38,7 @@ case "$CMD" in
                 --cluster) CLUSTER="$2"; shift 2;;
                 --namespace) NAMESPACE="$2"; shift 2;;
                 --service) SERVICE="$2"; shift 2;;
+                --fingerprint|--fp) FP="$2"; shift 2;;
                 --verdict) VERDICT="$2"; shift 2;;
                 --action) ACTION="$2"; shift 2;;
                 --cause) CAUSE="$2"; shift 2;;
@@ -54,7 +55,7 @@ case "$CMD" in
             exit 1
         fi
 
-        sqlite3 "$DB" "INSERT INTO incidents (alert_name, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ('$(echo "$ALERT" | sed "s/'/''/g")', '${SEVERITY}', '${STATUS:-firing}', '${CLUSTER}', '${NAMESPACE}', '${SERVICE}', '${VERDICT}', '${ACTION}', '$(echo "$CAUSE" | sed "s/'/''/g")', '$(echo "$RESOLUTION" | sed "s/'/''/g")', '${RELATED_MR}', '$(echo "$NOTES" | sed "s/'/''/g")', ${DURATION:-NULL});"
+        sqlite3 "$DB" "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ('$(echo "$ALERT" | sed "s/'/''/g")', '${FP}', '${SEVERITY}', '${STATUS:-firing}', '${CLUSTER}', '${NAMESPACE}', '${SERVICE}', '${VERDICT}', '${ACTION}', '$(echo "$CAUSE" | sed "s/'/''/g")', '$(echo "$RESOLUTION" | sed "s/'/''/g")', '${RELATED_MR}', '$(echo "$NOTES" | sed "s/'/''/g")', ${DURATION:-NULL});"
 
         echo "Incident logged: $ALERT ($VERDICT → $ACTION)"
         ;;
@@ -145,6 +146,56 @@ case "$CMD" in
         [ "$TOTAL" = "0" ] && echo "No incidents recorded yet. Fresh start."
         ;;
 
+    context)
+        # Write a context note for an ongoing investigation
+        FP="" PHASE="" CONTENT="" AUTHOR="sub-agent" INCIDENT_ID=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --fp) FP="$2"; shift 2;;
+                --phase) PHASE="$2"; shift 2;;
+                --content) CONTENT="$2"; shift 2;;
+                --author) AUTHOR="$2"; shift 2;;
+                --incident-id) INCIDENT_ID="$2"; shift 2;;
+                *) echo "Unknown arg: $1"; exit 1;;
+            esac
+        done
+
+        if [ -z "$FP" ] || [ -z "$PHASE" ] || [ -z "$CONTENT" ]; then
+            echo "Required: --fp, --phase (triage|investigation|diagnosis|fix|verification|resolution), --content"
+            exit 1
+        fi
+
+        sqlite3 "$DB" "INSERT INTO incident_context (fingerprint, incident_id, author, phase, content) VALUES ('$FP', ${INCIDENT_ID:-NULL}, '$AUTHOR', '$PHASE', '$(echo "$CONTENT" | sed "s/'/''/g")');"
+        echo "Context saved: [$PHASE] for $FP"
+        ;;
+
+    timeline)
+        # Get the full investigation timeline for a fingerprint
+        FP=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --fp) FP="$2"; shift 2;;
+                *) shift;;
+            esac
+        done
+
+        if [ -z "$FP" ]; then
+            echo "Required: --fp <fingerprint>"
+            exit 1
+        fi
+
+        echo "=== Incident Timeline for $FP ==="
+        echo ""
+
+        # Incident log entries
+        echo "--- Incident Log ---"
+        sqlite3 -header -column "$DB" "SELECT id, created_at, alert_name, severity, verdict, action, cause, resolution FROM incidents WHERE fingerprint = '$FP' ORDER BY created_at;"
+
+        echo ""
+        echo "--- Investigation Context ---"
+        sqlite3 -separator '' "$DB" "SELECT '[' || created_at || '] [' || phase || '] (' || author || ') ' || content FROM incident_context WHERE fingerprint = '$FP' ORDER BY created_at;"
+        ;;
+
     resolve)
         # Mark an escalation as acknowledged/resolved
         ID="" RESOLUTION=""
@@ -169,6 +220,8 @@ case "$CMD" in
         echo "  fingerprint  Check a fingerprint (--fp)"
         echo "  patterns   Show recurring patterns ([--days])"
         echo "  briefing   Generate startup briefing ([--days])"
+        echo "  context    Save investigation context (--fp, --phase, --content, [--author])"
+        echo "  timeline   Full investigation timeline (--fp)"
         echo "  resolve    Mark escalation resolved (--id, --resolution)"
         echo ""
         echo "DB location: $DB"
