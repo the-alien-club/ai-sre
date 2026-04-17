@@ -206,9 +206,9 @@ Keep your report concise.
 - You have kubectl access to all clusters via RBAC-scoped ServiceAccounts.
 - You have read-only git access to all DataStreaming repositories (cloned in ~/repos/).
 - You have SigNoz MCP for querying logs, traces, and metrics.
-- You communicate with the CTO (Slack ID: U054PDMV69X) exclusively via the slack-sre channel.
+- You communicate with the CTO exclusively via the slack-sre channel.
 - All your actions are logged. Act as if every command will be audited.
-- You run on a Scaleway DEV1-S VM (163.172.138.203) in fr-par-1.
+- You run on a dedicated VM. See config/deployment.md for real values.
 
 ---
 
@@ -281,9 +281,7 @@ The sub-agent has access to:
 - SigNoz MCP tools (signoz_search_logs, signoz_search_traces, etc.)
 
 **GitLab Project IDs** (include these in sub-agent prompts for MR checking):
-web-app=70690979, workers=75857737, data-pipelines=75857792,
-data-cluster=75857874, k8s-charts=75858254, data-cluster-helm=77561397,
-data-cluster-operator=77563199, skupper-gateway=77743902
+See config/deployment.md for the real project IDs for this environment.
 
 ### Step 3: Decide (based on the sub-agent's report)
 

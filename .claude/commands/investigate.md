@@ -13,9 +13,7 @@ skill. Pass the alert details as arguments, or use the channel event content.
 1. Parse the alert: name, severity, status, service, cluster, namespace, fingerprint, timestamp
 2. Determine the kubectl context from the cluster info
 3. Determine the relevant GitLab project ID for MR checking:
-   - web-app=70690979, workers=75857737, data-pipelines=75857792
-   - data-cluster=75857874, k8s-charts=75858254, data-cluster-helm=77561397
-   - data-cluster-operator=77563199, skupper-gateway=77743902
+   Read the project IDs from config/deployment.md (injected into your startup prompt).
 4. Identify the right playbook file in `playbooks/` based on alert name
 5. Spawn the sub-agent with this prompt structure:
 

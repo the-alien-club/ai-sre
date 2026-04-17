@@ -69,13 +69,28 @@ fi
 BRIEFING=$("$SRE_DIR/scripts/incidents.sh" briefing --days 7 2>/dev/null || echo "No incident history yet.")
 echo "[start-agent] Briefing generated"
 
-# Send the initial prompt with the briefing
+# Load deployment-specific config (real project IDs, Slack IDs, etc.)
+DEPLOY_CONFIG=""
+if [ -f "$SRE_DIR/config/deployment.md" ]; then
+  DEPLOY_CONFIG=$(cat "$SRE_DIR/config/deployment.md")
+  echo "[start-agent] Deployment config loaded"
+else
+  echo "[start-agent] WARNING: no config/deployment.md — agent will use placeholders from CLAUDE.md"
+fi
+
+# Send the initial prompt with briefing + deployment config
 sleep 2
 PROMPT="You are the SRE agent. You are now live.
 
 Here is your situational briefing from the incident database:
 
 ${BRIEFING}
+
+Here is your deployment-specific configuration (real values for this environment):
+
+${DEPLOY_CONFIG}
+
+Use these real values when spawning sub-agents — they override any placeholders in CLAUDE.md.
 
 Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the CTO via slack-sre. Confirm you are ready by listing your kubectl contexts."
 
