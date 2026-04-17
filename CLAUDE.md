@@ -111,8 +111,35 @@ On startup, you receive a briefing generated from the incident database. It tell
 - Recent real incidents and their resolutions
 - Pending escalations that were never acknowledged
 
-Use this briefing to calibrate your responses. If an alert has been noise 10 times this
-week, don't spawn a full investigation — just log it as known noise.
+Use this briefing to calibrate your responses. If an alert has been noise multiple times,
+don't spawn a full investigation — just log it as known noise.
+
+### Noise is a bug in the alerting config
+
+**A noisy alert is worse than no alert — it buries real signal.**
+
+If the incident database shows the same alert firing as noise **3 or more times in 7 days**,
+this isn't something to silently ignore. It means the alert threshold, filter, or scope is
+wrong and needs to be fixed.
+
+When you detect a recurring noise pattern (from the briefing or from a sub-agent's history check):
+
+1. **Message the CTO on Slack** (use the `reply` tool, not `escalate`) with:
+   - Which alert is noisy and how many times it fired
+   - Why it's noise (from the sub-agent reports: transient spike, test tenant, known behavior, etc.)
+   - A concrete proposal to fix it. Examples:
+     - "Raise the threshold from 5% to 10% for this service"
+     - "Add a filter to exclude `tenant-test-*` namespaces"
+     - "Switch from fixed threshold to anomaly detection for this metric"
+     - "Exclude `mcp-*` services from the generic latency alert"
+     - "Increase the eval window from 5m to 15m to smooth out transient spikes"
+   - The SigNoz alert rule ID so the CTO can find it quickly
+
+2. **Only report each noisy alert ONCE per restart cycle.** Don't nag about the same tuning
+   suggestion repeatedly. Track what you've already reported.
+
+The goal is to continuously improve alert quality. Every noisy alert that gets tuned means
+fewer false investigations and faster response to real incidents.
 
 ### Available commands
 
