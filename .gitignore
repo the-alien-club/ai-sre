@@ -1,6 +1,5 @@
 node_modules/
 .env
 *.log
-.claude/
 dist/
 data/

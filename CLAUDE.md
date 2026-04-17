@@ -415,128 +415,55 @@ Just log internally: "Alert X resolved, no action was needed."
 
 ---
 
-## Alert-Specific Playbooks (reference for sub-agent prompts)
+## Alert Playbooks
 
-**These are NOT for you to execute. Copy the relevant playbook steps into your sub-agent
-prompt so the sub-agent knows what to investigate.**
+Playbooks live in `playbooks/` — sub-agents read the relevant one during investigation.
+The `/investigate` skill handles selecting the right playbook.
 
-### High Error Rate (critical)
-1. Identify which service: check `service` label
-2. Query recent traces: `signoz_search_traces` with `has_error = true AND response_status_code >= '500'`
-3. Check pod health: `kubectl get pods`, look for restarts or pending pods
-4. Check recent deployments: `kubectl rollout history deployment/<service>`
-5. **Check recent MRs**: query the GitLab API for recently merged MRs on the affected repo.
-   If an MR was merged in the last 30 min–1 hr, it's the prime suspect. Read the MR diff to confirm.
-6. If a single pod is erroring: restart it
-7. If all pods error AND recent MR found: escalate with MR link (needs rollback or fix-forward)
-8. If all pods error AND no recent MR: escalate (infrastructure or config issue)
+```
+playbooks/
+├── high-error-rate.md
+├── high-latency.md
+├── pod-crashlooping.md
+├── argocd-degraded.md
+├── database-errors.md
+├── tenant-inactive.md
+├── pvc-capacity.md
+├── pod-oom-risk.md
+├── pod-scheduling-failure.md
+├── workflow-failures.md
+├── skupper-latency.md
+└── data-api-failures.md
+```
 
-### Pod CrashLooping (critical)
-1. Get pod status: `kubectl describe pod`
-2. Check logs: `kubectl logs <pod> --previous` (get logs from crashed container)
-3. Check events: `kubectl get events` for OOM, image pull failures, etc.
-4. If OOMKilled: restart (it might recover). If it crashes again, escalate.
-5. If ImagePullBackOff: escalate (registry or image issue)
-6. If config/secret mount failure: escalate
-
-### ArgoCD App Degraded / Sync Failed (critical)
-1. Check app status: `kubectl get application <name> -n argocd -o yaml`
-2. Check sync status and health
-3. If stuck operation: clear it with `patch operation null`
-4. If out of sync: force refresh with `annotate refresh=hard`
-5. If sync failed: check `git log` in the relevant repo for bad commits. Escalate.
-6. NEVER delete the ArgoCD application
-
-### Database Errors (critical)
-1. Check which queries are failing: `signoz_search_traces` with PostgreSQL spans
-2. Check connection counts: are we maxing out the pool?
-3. Check pod logs for connection errors
-4. ALWAYS ESCALATE — never auto-fix database issues
-
-### Tenant Inactive (info)
-1. Check if namespace starts with `tenant-test-` → known issue, ignore
-2. If real tenant: check if data-api pods are running in the tenant namespace
-3. Check Skupper connectivity (if cross-cluster)
-4. If pods are down: restart
-5. If Skupper is broken: escalate
-
-### PVC Nearing Capacity (critical)
-1. Check actual usage: `kubectl exec <pod> -- df -h`
-2. Identify what's consuming space
-3. ALWAYS ESCALATE — can't auto-expand PVCs safely
-
-### Pod OOM Risk (critical)
-1. Check which pod: `kubectl top pods -n <namespace> --sort-by=memory`
-2. Check if it's mmap-based (Qdrant uses mmap — high working_set may be normal)
-3. Check memory limit: `kubectl describe pod` → resources.limits.memory
-4. If genuine OOM risk: restart the pod
-5. If it keeps hitting OOM: escalate (needs limit increase or optimization)
-
-### Pod Scheduling Failure (critical)
-1. Check events: `kubectl get events --field-selector reason=FailedScheduling`
-2. Check node capacity: `kubectl top nodes`, `kubectl describe nodes | grep -A5 Allocatable`
-3. ALWAYS ESCALATE — needs cluster scaling decision
-
-### Workflow Step Failures (warning)
-1. Check which workflow: `kubectl get workflows -n <namespace>`
-2. Check step logs: `kubectl logs <step-pod> -n <namespace>`
-3. If transient (network timeout, API 503): the workflow retry mechanism should handle it
-4. If persistent (code error, data issue): escalate
-
-### Skupper Network Latency (warning)
-1. Check Skupper router pod: `kubectl get pods -n infrastructure | grep skupper`
-2. Check if the port drift issue is happening:
-   `kubectl get endpointslice -n infrastructure | grep skupper` and compare ports
-3. If port drift: `kubectl rollout restart deployment/skupper-controller -n infrastructure`
-4. If not port drift: escalate
-
-### Data-API Request Failures (warning)
-1. Check data-api pod health in the tenant namespace
-2. Check logs: `kubectl logs -n <namespace> -l app=data-api --tail=100`
-3. If pod is unhealthy: restart
-4. If code-level error: escalate
+**Alert name → playbook mapping:**
+- High Error Rate → `high-error-rate.md`
+- High Latency / MCP Latency Anomaly → `high-latency.md`
+- Pod CrashLooping → `pod-crashlooping.md`
+- ArgoCD App Degraded / ArgoCD Sync Failed → `argocd-degraded.md`
+- Database Errors → `database-errors.md`
+- Tenant Inactive → `tenant-inactive.md`
+- PVC Nearing Capacity → `pvc-capacity.md`
+- Pod OOM Risk → `pod-oom-risk.md`
+- Pod Scheduling Failure → `pod-scheduling-failure.md`
+- Workflow Step Failures → `workflow-failures.md`
+- Skupper Network Latency → `skupper-latency.md`
+- Data-API Request Failures → `data-api-failures.md`
+- Proxy Timeout → `high-error-rate.md` (similar investigation)
+- MCP Tool Failures → `high-error-rate.md` (similar investigation)
+- Cluster Autoscaler Scale-Up Timed Out → `pod-scheduling-failure.md` (related)
+- ArgoCD App Out-of-Sync → `argocd-degraded.md`
+- Slow DB Queries → `database-errors.md`
+- Node Memory Pressure → `pod-oom-risk.md` (related)
 
 ---
 
-## Known Issues and Context
+## Known Issues (for quick-filter, not full investigation)
 
-### Skupper TCP Listener Port Drift
-- **Symptom**: Backend gets 503 "Connection refused" calling operator API
-- **Cause**: EndpointSlice port for Skupper Listener CRD is stale vs actual router tcpListener port
-- **Fix**: `kubectl --context platform-dev rollout restart deployment/skupper-controller -n infrastructure`
-
-### tenant-test-* Heartbeat 401s
-- Test tenant namespaces get 401 on heartbeat calls — pre-existing, invalid auth for test tenant
-- Always ignore these
-
-### Argo Workflows PVC /tmp
-- All workflow steps use a 2Gi PVC mounted at /tmp (volumeClaimTemplates)
-- Storage class: `sbs-default` (WaitForFirstConsumer) on Scaleway
-- If workflows fail with disk errors, check PVC binding
-
-### MCP Services 30s Root Spans
-- MCP Streamable HTTP creates 30s root spans due to Istio timeout
-- The MCP Latency Anomaly alert monitors outbound HTTP client calls separately
-- Don't confuse these with actual service latency
-
----
-
-## SigNoz MCP Tools Available
-
-- `signoz_search_logs` — search logs with filters
-- `signoz_search_traces` — search traces/spans
-- `signoz_query_metrics` — query metrics
-- `signoz_list_services` — list monitored services
-- `signoz_get_service_top_operations` — top operations for a service
-- `signoz_list_alerts` — list all alert rules
-- `signoz_get_alert` — get specific alert rule details
-- `signoz_get_alert_history` — get alert firing/resolved timeline
-- `signoz_aggregate_logs` — aggregate log data
-- `signoz_aggregate_traces` — aggregate trace data
-- `signoz_get_field_keys` — discover available fields
-- `signoz_get_field_values` — get values for a field
-
-Always use `resource` field context filters (service.name, k8s.namespace.name) for faster queries.
+- **tenant-test-* heartbeat 401s** — always ignore, pre-existing invalid auth
+- **MCP 30s root spans** — Istio timeout, not real latency. Separate MCP Latency Anomaly alert covers actual tool work.
+- **Skupper port drift** — 503s from backend to operator. Fix: restart skupper-controller. See `playbooks/skupper-latency.md`
+- **Argo PVCs** — workflow steps use 2Gi PVC at /tmp, `sbs-default` storage class
 
 ---
 
@@ -571,3 +498,17 @@ Always use `resource` field context filters (service.name, k8s.namespace.name) f
 ```bash
 cd ~/repos/<repo> && git pull --ff-only
 ```
+
+---
+
+## Available Skills
+
+Use these slash commands to invoke specific workflows without loading them into context permanently:
+
+| Skill | Purpose |
+|---|---|
+| `/investigate` | Spawn a sub-agent to investigate an alert (includes playbook selection, history check, MR check, incident logging) |
+| `/noise-report` | Generate alert tuning proposals for the CTO when recurring noise is detected |
+| `/daily-summary` | Generate end-of-day summary of all incidents and send to CTO |
+| `/check-history` | Query incident database for past occurrences of an alert |
+| `/log-incident` | Reference for logging an incident to SQLite |
