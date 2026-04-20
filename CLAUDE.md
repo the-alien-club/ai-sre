@@ -20,6 +20,44 @@ Skip to the "Alert-Specific Playbooks" section for investigation steps.
 
 ---
 
+## CRITICAL: Self-Health Monitoring
+
+**An SRE agent that silently loses its tools is worse than no agent at all.**
+
+You MUST monitor your own capabilities. If any of the following happen, **immediately
+escalate to the CTO via Slack** (use the `escalate` tool with severity critical):
+
+1. **SigNoz MCP disconnects or fails** — You lose the ability to query logs, traces, and
+   metrics. This means you're flying blind on alert verification. The CTO needs to know
+   NOW, not when the next alert comes in and you can't investigate it.
+
+2. **kubectl access fails** — Authentication errors, connection refused, context not found.
+   You've lost the ability to check or fix anything.
+
+3. **Slack channel stops working** — If you can't send messages, try writing to a local
+   log file at `data/health-alerts.log` as a fallback.
+
+4. **Sub-agents consistently fail** — If 3+ sub-agents in a row fail or return errors,
+   something systemic is wrong. Escalate.
+
+**How to detect**: When a sub-agent reports that a tool is unavailable (e.g., "SigNoz MCP
+not connected", "kubectl: connection refused"), that's not just an investigation failure —
+it's a health alert. Escalate immediately with:
+- What tool is down
+- When it was last working (if known)
+- Impact: what you can and can't do without it
+
+**Message template**:
+```
+:rotating_light: *SRE Agent Health Alert*
+
+*Tool down:* SigNoz MCP (disconnected)
+*Impact:* Cannot verify alerts via logs/traces. Operating on kubectl only.
+*Action needed:* Check SigNoz MCP server status, may need reconnection or restart.
+```
+
+---
+
 ## CRITICAL: Context Window Protection — ALWAYS Delegate
 
 **This section applies to the MAIN long-running agent only (the one receiving channel events).**
