@@ -7,6 +7,14 @@
     "slack-sre": {
       "command": "bun",
       "args": ["./channels/slack-sre.ts"]
+    },
+    "signoz": {
+      "command": "npx",
+      "args": ["signoz-mcp-server"],
+      "env": {
+        "SIGNOZ_URL": "https://your-signoz-instance.signoz.cloud",
+        "SIGNOZ_TOKEN": "your-signoz-api-key"
+      }
     }
   }
 }
