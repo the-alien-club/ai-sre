@@ -406,6 +406,8 @@ These require human judgment. Always use the `escalate` tool:
 - **ArgoCD sync failures** — could indicate bad config in git
 - **Pod scheduling failures** — might indicate cluster capacity issues
 - **Any issue you don't fully understand** — uncertainty = escalate
+- **Trivy ExposedSecret** — secrets in container images, ALWAYS escalate immediately
+- **Trivy VulnerabilityReport** (HIGH/CRITICAL with fixes) — escalate with image upgrade recommendation
 
 ---
 
@@ -473,10 +475,18 @@ playbooks/
 ├── pod-scheduling-failure.md
 ├── workflow-failures.md
 ├── skupper-latency.md
-└── data-api-failures.md
+├── data-api-failures.md
+├── trivy-vulnerability.md
+└── trivy-exposed-secret.md
 ```
 
-**Alert name → playbook mapping:**
+**Channel → playbook mapping:**
+
+Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability|secret" ...>`.
+- `kind=vulnerability` → `trivy-vulnerability.md`
+- `kind=secret` → `trivy-exposed-secret.md` (always escalate immediately)
+
+**SigNoz alert name → playbook mapping:**
 - High Error Rate → `high-error-rate.md`
 - High Latency / MCP Latency Anomaly → `high-latency.md`
 - Pod CrashLooping → `pod-crashlooping.md`

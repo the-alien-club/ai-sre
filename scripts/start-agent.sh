@@ -52,7 +52,16 @@ done
 # Wait for Claude to fully initialize (MCP servers to start)
 for i in $(seq 1 30); do
   if ss -tlnp | grep -q 8788; then
-    echo "[start-agent] Webhook port 8788 bound"
+    echo "[start-agent] SigNoz webhook port 8788 bound"
+    break
+  fi
+  sleep 1
+done
+
+# Wait for Trivy webhook port too (channel may take a moment to spawn)
+for i in $(seq 1 15); do
+  if ss -tlnp | grep -q 8790; then
+    echo "[start-agent] Trivy webhook port 8790 bound"
     break
   fi
   sleep 1

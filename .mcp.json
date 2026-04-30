@@ -8,6 +8,10 @@
       "command": "bun",
       "args": ["./channels/slack-sre.ts"]
     },
+    "trivy-webhook": {
+      "command": "bun",
+      "args": ["./channels/trivy-webhook.ts"]
+    },
     "signoz": {
       "command": "npx",
       "args": ["signoz-mcp-server"],

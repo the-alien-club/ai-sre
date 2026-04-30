@@ -46,6 +46,8 @@ module.exports = {
         ...dotenv,
         SIGNOZ_WEBHOOK_PORT: dotenv.SIGNOZ_WEBHOOK_PORT || "8788",
         SIGNOZ_WEBHOOK_HOST: dotenv.SIGNOZ_WEBHOOK_HOST || "0.0.0.0",
+        TRIVY_WEBHOOK_PORT: dotenv.TRIVY_WEBHOOK_PORT || "8790",
+        TRIVY_WEBHOOK_HOST: dotenv.TRIVY_WEBHOOK_HOST || "0.0.0.0",
         ESCALATION_INTERVAL_MS: dotenv.ESCALATION_INTERVAL_MS || "600000",
         DEV_ESCALATION_INTERVAL_MS: dotenv.DEV_ESCALATION_INTERVAL_MS || "3600000",
         NODE_ENV: "production",
