@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "gitlab-webhook": {
+      "command": "bun",
+      "args": ["./channels/gitlab-webhook.ts"]
+    },
+    "slack-qa": {
+      "command": "bun",
+      "args": ["./channels/slack-qa.ts"]
+    },
+    "signoz": {
+      "command": "npx",
+      "args": ["signoz-mcp-server"],
+      "env": {
+        "SIGNOZ_URL": "https://your-signoz-instance.signoz.cloud",
+        "SIGNOZ_TOKEN": "your-signoz-api-key"
+      }
+    }
+  }
+}

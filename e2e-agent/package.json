@@ -1,0 +1,24 @@
+{
+  "name": "e2e-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:gitlab": "bun run channels/gitlab-webhook.ts",
+    "dev:slack": "bun run channels/slack-qa.ts",
+    "test": "playwright test",
+    "test:regression": "playwright test tests/regression",
+    "test:headed": "playwright test --headed"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@playwright/test": "^1.49.0",
+    "@slack/bolt": "^4.3.0",
+    "@slack/web-api": "^7.9.1",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "@types/node": "^22.0.0"
+  }
+}
