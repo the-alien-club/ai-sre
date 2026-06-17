@@ -477,7 +477,11 @@ playbooks/
 ├── skupper-latency.md
 ├── data-api-failures.md
 ├── trivy-vulnerability.md
-└── trivy-exposed-secret.md
+├── trivy-exposed-secret.md
+├── scaleway-postgres.md      # Managed RDB: connections, replication lag, disk
+├── scaleway-redis.md         # Managed RKV memory pressure
+├── scaleway-sqs.md           # Managed MNQ queue backlog
+└── scaleway-load-balancer.md # LB backend status + connection saturation
 ```
 
 **Channel → playbook mapping:**
@@ -505,6 +509,13 @@ Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability|
 - ArgoCD App Out-of-Sync → `argocd-degraded.md`
 - Slow DB Queries → `database-errors.md`
 - Node Memory Pressure → `pod-oom-risk.md` (related)
+- Postgres Connections Near Limit → `scaleway-postgres.md`
+- Postgres Replication Lag → `scaleway-postgres.md`
+- Postgres Disk Above 85% → `scaleway-postgres.md`
+- Redis Memory Above 85% → `scaleway-redis.md`
+- SQS Oldest Message Age Above 5min → `scaleway-sqs.md`
+- Load Balancer Backend Down → `scaleway-load-balancer.md`
+- Load Balancer Connection Saturation Above 80% → `scaleway-load-balancer.md`
 
 ---
 
