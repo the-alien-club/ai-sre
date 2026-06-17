@@ -478,6 +478,7 @@ playbooks/
 ├── data-api-failures.md
 ├── trivy-vulnerability.md
 ├── trivy-exposed-secret.md
+├── falco.md
 ├── scaleway-postgres.md      # Managed RDB: connections, replication lag, disk
 ├── scaleway-redis.md         # Managed RKV memory pressure
 ├── scaleway-sqs.md           # Managed MNQ queue backlog
@@ -509,6 +510,10 @@ Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability|
 - ArgoCD App Out-of-Sync → `argocd-degraded.md`
 - Slow DB Queries → `database-errors.md`
 - Node Memory Pressure → `pod-oom-risk.md` (related)
+- Falco Critical Event → `falco.md`
+- Falco Suspicious Process → `falco.md`
+- Falco Anomaly Surge → `falco.md`
+- Any alert with "Falco" in the name → `falco.md` (treat all Falco events as security)
 - Postgres Connections Near Limit → `scaleway-postgres.md`
 - Postgres Replication Lag → `scaleway-postgres.md`
 - Postgres Disk Above 85% → `scaleway-postgres.md`
