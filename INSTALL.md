@@ -156,8 +156,9 @@ done
 The agent should NOT have cluster-admin access. Create a scoped ServiceAccount on each cluster.
 
 ```bash
-# From a machine with admin kubeconfigs, apply the RBAC manifest to each cluster:
-# (The RBAC YAML is in this repo — see below)
+# From a machine with admin kubeconfigs, apply the RBAC manifest to each cluster.
+# The manifest is k8s/rbac.yaml in this repo — it is the source of truth for the
+# agent's permissions. Edit it there, commit, then re-apply to all clusters.
 
 CLUSTERS=(
   "14c4e1e4-...:platform-dev"
@@ -171,15 +172,21 @@ for entry in "${CLUSTERS[@]}"; do
   ID="${entry%%:*}"; NAME="${entry##*:}"
   KUBECONFIG_PATH="/tmp/$NAME.yaml"
   scw k8s kubeconfig get "$ID" region=fr-par > "$KUBECONFIG_PATH"
-  KUBECONFIG="$KUBECONFIG_PATH" kubectl apply -f /tmp/sre-agent-rbac.yaml
+  KUBECONFIG="$KUBECONFIG_PATH" kubectl apply -f k8s/rbac.yaml
 done
 ```
 
-The RBAC manifest creates:
+The RBAC manifest ([k8s/rbac.yaml](k8s/rbac.yaml)) creates:
 - ServiceAccount `sre-agent` in `kube-system`
-- ClusterRole with: read all, patch deployments (rollout restart), delete pods + workflows
+- ClusterRole `sre-agent` — an **explicit read allowlist**, NOT "read all". It covers core
+  resources, workloads, HPAs, KEDA, Argo Workflows, ArgoCD Applications, batch, networking,
+  policy, storage classes, cert-manager, metrics, external-secrets, and Skupper. Secrets are
+  list-only (metadata, never values). Write access is limited to: patch deployments (rollout
+  restart), delete pods, delete workflows, patch ArgoCD Applications (refresh / clear stuck op).
+  If the agent reports "my ServiceAccount doesn't have RBAC to read X", the resource is missing
+  from the allowlist — add it to k8s/rbac.yaml and re-apply to all 5 clusters.
 - ClusterRoleBinding
-- Long-lived token Secret
+- Long-lived token Secret (`sre-agent-token`)
 
 Then generate scoped kubeconfigs using each SA token, merge them, and copy to the VM:
 
@@ -189,7 +196,6 @@ Then generate scoped kubeconfigs using each SA token, merge them, and copy to th
 scp merged.yaml sre-agent@$SRE_IP:~/.kube/config
 ```
 
-See the provisioning session logs for the full script.
 
 ## 6. Create the Slack app
 

@@ -1,0 +1,139 @@
+# SRE agent RBAC — source of truth for all 5 clusters.
+#
+# Apply to every cluster the agent monitors (see INSTALL.md §5):
+#   for ctx in platform-dev platform-prod data-cluster-dev \
+#              data-cluster-biorxiv data-cluster-alien-hosted; do
+#     kubectl --context "$ctx" apply -f k8s/rbac.yaml
+#   done
+#
+# Design: explicit read allowlist + three narrow write permissions
+# (patch deployments for rollout restarts, delete pods, delete workflows).
+# The agent runs with --dangerously-skip-permissions — this role IS the
+# safety net. Never add write verbs beyond the ones already here without
+# updating the FORBIDDEN list in CLAUDE.md.
+#
+# keda.sh and cert-manager.io are only installed on the platform clusters;
+# rules referencing absent API groups are inert on the data clusters.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-agent
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sre-agent-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: sre-agent
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-agent
+rules:
+  # Core resources — read
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - events
+      - configmaps
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - replicationcontrollers
+      - resourcequotas
+      - limitranges
+    verbs: ["get", "list", "watch"]
+  # Secrets: list only (names/metadata for diagnostics), never get (no values)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list"]
+  # Workloads — read
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  # WRITE: rollout restart
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["patch"]
+  # WRITE: restart stuck pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  # Argo Workflows — read
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows", "workflowtemplates", "cronworkflows"]
+    verbs: ["get", "list", "watch"]
+  # WRITE: clear stuck/failed pipeline workflows
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows"]
+    verbs: ["delete"]
+  # ArgoCD Applications — read + patch (hard refresh, clear stuck operation,
+  # toggle auto-sync). Delete is deliberately NOT granted (cascade deletion).
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Jobs — read
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  # Networking — read
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  # Autoscaling — read (HPAs, incl. KEDA-managed ones)
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  # KEDA — read (workers scale via ScaledObjects on the platform clusters)
+  - apiGroups: ["keda.sh"]
+    resources:
+      - scaledobjects
+      - scaledjobs
+      - triggerauthentications
+      - clustertriggerauthentications
+    verbs: ["get", "list", "watch"]
+  # Disruption budgets — read
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  # Storage classes — read
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # cert-manager — read (mTLS certificate diagnostics)
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
+    verbs: ["get", "list", "watch"]
+  # kubectl top
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  # External Secrets — read
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets", "secretstores", "clustersecretstores"]
+    verbs: ["get", "list", "watch"]
+  # Skupper — read
+  - apiGroups: ["skupper.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-agent
+subjects:
+  - kind: ServiceAccount
+    name: sre-agent
+    namespace: kube-system
