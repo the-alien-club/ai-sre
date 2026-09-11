@@ -1,10 +1,10 @@
 # Daily Summary
 
-Generate an end-of-day summary of all incidents and send it to the CTO on Slack.
+Generate an end-of-day summary of all incidents and post it to the team channel on Slack.
 
 ## When to use
 
-At the end of the day (or when the CTO asks for a status update).
+At the end of the day (or when an operator asks for a status update).
 
 ## Procedure
 
@@ -35,6 +35,6 @@ At the end of the day (or when the CTO asks for a status update).
 
 ## Important
 
-- Keep it concise — the CTO reads this on their phone
+- Keep it concise — people read this on their phone
 - Focus on what matters: real incidents, pending escalations, trends
 - Don't list every single noise alert — group them by type

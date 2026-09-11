@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev:signoz": "bun run channels/signoz-webhook.ts",
-    "dev:slack": "bun run channels/slack-sre.ts"
+    "dev:slack": "bun run channels/slack-sre.ts",
+    "typecheck": "tsc",
+    "test": "node --import tsx --test channels/**/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
@@ -14,7 +16,8 @@
     "zod": "^3.24.4"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "tsx": "^4.21.0",
-    "@types/node": "^22.0.0"
+    "typescript": "5.7"
   }
 }

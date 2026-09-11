@@ -269,7 +269,10 @@ const httpServer = createServer(async (req, res) => {
     }
   }
 
-  let payload: VulnerabilityReport | ExposedSecretReport;
+  // The operator posts several report kinds, so the body is genuinely unknown until
+  // its "kind" has been inspected — typing it as one of the two we handle would be a
+  // lie that narrows the ignore branch to `never`.
+  let payload: unknown;
   try {
     const body = await readBody(req);
     payload = JSON.parse(body);
@@ -278,22 +281,32 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  if (typeof payload !== "object" || payload === null) {
+    respond(res, 400, "payload is not an object");
+    return;
+  }
+
+  const kind =
+    "kind" in payload && typeof payload.kind === "string"
+      ? payload.kind
+      : undefined;
+
   // Route by kind
   let result: { content: string; meta: Record<string, string> } | null = null;
 
-  if (payload.kind === "VulnerabilityReport") {
+  if (kind === "VulnerabilityReport") {
     result = processVulnerabilityReport(payload as VulnerabilityReport);
-  } else if (payload.kind === "ExposedSecretReport") {
+  } else if (kind === "ExposedSecretReport") {
     result = processExposedSecretReport(payload as ExposedSecretReport);
   } else {
     // ConfigAuditReport, ClusterComplianceReport, etc. — silently ignore
-    respond(res, 200, JSON.stringify({ status: "ignored", kind: payload.kind ?? "unknown" }), "application/json");
+    respond(res, 200, JSON.stringify({ status: "ignored", kind: kind ?? "unknown" }), "application/json");
     return;
   }
 
   if (!result) {
     // No actionable findings (e.g. only LOW/MEDIUM vulns without fixes)
-    respond(res, 200, JSON.stringify({ status: "no_action", kind: payload.kind }), "application/json");
+    respond(res, 200, JSON.stringify({ status: "no_action", kind }), "application/json");
     return;
   }
 
@@ -302,7 +315,7 @@ const httpServer = createServer(async (req, res) => {
     params: { content: result.content, meta: result.meta },
   });
 
-  respond(res, 200, JSON.stringify({ status: "pushed", kind: payload.kind }), "application/json");
+  respond(res, 200, JSON.stringify({ status: "pushed", kind }), "application/json");
 });
 
 httpServer.listen(PORT, HOST, () => {

@@ -7,7 +7,7 @@ be treated as potential intrusions until proven otherwise.**
 ## Core principle
 
 **NEVER auto-fix Falco alerts.** Even "obvious" responses like killing the pod can destroy
-forensic evidence. Always escalate to the CTO with full context. The CTO decides whether to
+forensic evidence. Always escalate to the ops team with full context. The team decides whether to
 contain, investigate, or dismiss.
 
 ## Investigation steps
@@ -50,7 +50,7 @@ Before assuming malicious intent, rule out legitimate sources:
   curl -s "https://gitlab.com/api/v4/projects/<PROJECT_ID>/merge_requests?state=merged&per_page=5" \
     -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '.[].title'
   ```
-- **CTO debugging session** — if someone exec'd into a pod, the CTO probably knows.
+- **Operator debugging session** — if someone exec'd into a pod, an operator probably knows.
   Check the kubectl audit log if available, otherwise just ask.
 - **Known Argo workflow patterns** — Argo Workflow steps often run unusual commands legitimately.
   If the pod name starts with a workflow name (e.g. `entry-xyz-12345`), it's likely a workflow step.
@@ -85,13 +85,13 @@ Some Falco rules are higher signal than others:
 
 After investigation, recommend ONE of:
 
-- **Escalate immediately (default for HIGH signal)** — message to CTO with:
+- **Escalate immediately (default for HIGH signal)** — message to the ops team with:
   - Rule name and Falco output
   - Affected pod, namespace, image
   - Process command line and parent process
   - Whether the pod is still running
   - Anything you ruled out (e.g. "not a recent deployment, no MR in last 6h")
-  - Whether you recommend the CTO **contain** (kill pod, isolate node) or **investigate**
+  - Whether you recommend the team **contain** (kill pod, isolate node) or **investigate**
     (preserve evidence first)
 
 - **Escalate with context (MEDIUM signal)** — same as above but include the legitimate-source
@@ -99,7 +99,7 @@ After investigation, recommend ONE of:
 
 - **Tag as known noise** — only if the same Falco rule has fired as noise repeatedly for the
   same workload. Log via `incidents.sh log --verdict noise --action ignored` and propose alert
-  tuning to the CTO via `/noise-report` (e.g. "exclude workload-X from rule-Y", "raise priority
+  tuning to the ops team via `/noise-report` (e.g. "exclude workload-X from rule-Y", "raise priority
   threshold").
 
 ## What you must NEVER do
@@ -107,5 +107,5 @@ After investigation, recommend ONE of:
 - **Never `kubectl delete pod`** on a Falco alert — even for "auto-fix" thinking. Destroys evidence.
 - **Never `kubectl exec`** into the affected pod — your activity becomes another Falco event and contaminates the investigation.
 - **Never assume legitimate** without checking. Even "this is just CI" should be verified.
-- **Never wait silently** — if you can't reach the CTO, the agent's nag timer should keep
+- **Never wait silently** — if nobody answers, the agent's nag timer should keep
   escalating. Security alerts get the most aggressive nag interval (10 min for prod critical).

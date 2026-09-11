@@ -42,13 +42,13 @@ by the main agent for manual logging.
 | Action | When to use |
 |---|---|
 | `auto_fixed` | Agent fixed it autonomously (pod restart, workflow clear, etc.) |
-| `escalated` | Sent to CTO via Slack |
+| `escalated` | Posted to the team channel via Slack |
 | `ignored` | No action needed (noise, resolved, known issue) |
 | `monitoring` | Real but not actionable yet — watching for escalation |
 
 ## Marking escalations as resolved
 
-When the CTO confirms a fix for an escalated incident:
+When an operator confirms a fix for an escalated incident:
 ```bash
 ./scripts/incidents.sh resolve --id <incident_id> --resolution "What fixed it"
 ```

@@ -1,6 +1,6 @@
 # Noise Report
 
-Generate an alert tuning proposal for the CTO when recurring noise is detected.
+Generate an alert tuning proposal for the ops team when recurring noise is detected.
 
 ## When to use
 
@@ -19,7 +19,7 @@ has already been noise 3+ times in the last 7 days.
    - Test tenant noise → add namespace exclusion filter
    - Known service behavior → exclude the service or adjust threshold
    - Flapping (fires and resolves within minutes) → add a minimum duration / "for" clause
-4. Send ONE Slack message to the CTO (use the `reply` tool) with all proposals grouped together:
+4. Post ONE Slack message to the team channel (use the `reply` tool) with all proposals grouped together:
 
 ```
 :wrench: *Alert Tuning Report*

@@ -199,14 +199,34 @@ scp merged.yaml sre-agent@$SRE_IP:~/.kube/config
 
 ## 6. Create the Slack app
 
+The agent lives in a shared team channel, so it needs channel scopes — not just DM scopes.
+
 1. Go to https://api.slack.com/apps → **Create New App**
 2. **Socket Mode**: Enable (Settings → Socket Mode → toggle on)
 3. **App-Level Token**: Create one with `connections:write` scope → this is `SLACK_APP_TOKEN`
-4. **Bot Token Scopes** (OAuth & Permissions): `chat:write`, `im:read`, `im:write`, `im:history`
-5. **Event Subscriptions**: Enable → Subscribe to bot events → add `message.im`
+4. **Bot Token Scopes** (OAuth & Permissions):
+   `chat:write`, `chat:write.public`, `channels:history`, `channels:read`,
+   `channels:join`, `im:history`, `im:read`, `im:write`
+   (add `groups:history`, `groups:read` instead of the `channels:*` ones if the
+   team channel is private — a private channel also needs a manual `/invite`)
+5. **Event Subscriptions**: Enable → Subscribe to bot events → add `message.channels`
+   and `message.im`.
+   **Do not also add `app_mention`**: a mention already arrives as a `message.channels`
+   event, and subscribing to both makes the channel handle every mention twice.
 6. **App Home**: Enable Messages Tab + "Allow users to send Slash commands and messages"
 7. **Install to Workspace** → copy the Bot User OAuth Token → this is `SLACK_BOT_TOKEN`
-8. Find your Slack user ID (your profile → three dots → Copy member ID) → this is `CTO_SLACK_ID`
+
+> Changing scopes on an existing app requires a **reinstall**, which issues a **new
+> bot token**. Update `SLACK_BOT_TOKEN` in `.env` afterwards or the channel will fail
+> startup validation with `invalid_auth`.
+
+8. Collect the channel ID (channel → View channel details → bottom of the About tab)
+   → this is `SRE_SLACK_CHANNEL`
+9. Collect the Slack user ID of each operator (profile → three dots → Copy member ID)
+   → these make up `SRE_OPERATORS`
+
+The channel's startup validation joins a public channel automatically. For a private
+channel, invite the bot by hand: `/invite @claude_sre` in the channel.
 
 ## 7. Create the `.env` file
 
@@ -217,9 +237,13 @@ cp .env.example .env
 # SIGNOZ_WEBHOOK_TOKEN: generate with `openssl rand -hex 32`
 # SLACK_BOT_TOKEN: from step 6
 # SLACK_APP_TOKEN: from step 6
-# CTO_SLACK_ID: from step 6
+# SRE_SLACK_CHANNEL: from step 6 — the channel the agent lives in
+# SRE_OPERATORS: from step 6 — "U123:Leo,U456:Adrien,U789:Ghislain"
 # GITLAB_TOKEN: group access token with read_api scope (Reporter level)
 ```
+
+`SRE_SLACK_CHANNEL` and `SRE_OPERATORS` are required — the channel refuses to start
+without them rather than running against the wrong channel or with no allowlist.
 
 ### Creating the GitLab access token
 

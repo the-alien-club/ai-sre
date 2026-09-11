@@ -6,7 +6,7 @@ Generate a structured incident report when an incident is resolved and publish i
 
 After an incident is fully resolved — meaning:
 - The alert has stopped firing (or was a one-time event)
-- The fix has been verified (auto-fix confirmed, or CTO confirmed resolution)
+- The fix has been verified (auto-fix confirmed, or an operator confirmed resolution)
 - There's enough context in the investigation trail to write a meaningful report
 
 ## Procedure
@@ -120,7 +120,7 @@ During investigation, sub-agents should save context notes at each phase:
 
 # Resolution summary
 ./scripts/incidents.sh context --fp "<fingerprint>" --phase resolution \
-  --content "Root cause: MR !432 unbounded cache. Fixed by pod restart. MR needs revert or fix-forward. Escalated to CTO."
+  --content "Root cause: MR !432 unbounded cache. Fixed by pod restart. MR needs revert or fix-forward. Escalated to the ops team."
 ```
 
 The incident reporter reads all these notes to build the timeline and narrative.
