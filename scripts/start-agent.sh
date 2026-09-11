@@ -101,7 +101,7 @@ ${DEPLOY_CONFIG}
 
 Use these real values when spawning sub-agents — they override any placeholders in CLAUDE.md.
 
-Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the CTO via slack-sre. Confirm you are ready by listing your kubectl contexts."
+Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the ops team via slack-sre. Remember you are in a shared team channel, not a private DM — see \"Talking to the Ops Team\" in CLAUDE.md. Confirm you are ready by listing your kubectl contexts."
 
 tmux send-keys -t "$SESSION_NAME" "$PROMPT" Enter
 
