@@ -62,7 +62,7 @@ Report back:
 - Was a recent MR merged that could have caused this?
 - Recommended action (auto-fix / escalate / ignore)
 - If auto-fix: exact command to run
-- If escalate: summary for the CTO
+- If escalate: summary for the ops team
 Be concise.
 ```
 

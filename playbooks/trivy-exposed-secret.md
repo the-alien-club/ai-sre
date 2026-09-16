@@ -20,7 +20,7 @@ it may already be compromised.
    - Whether the image is currently deployed (multiplies urgency if yes)
    - The file path in the image
    - The git commit that introduced it (if found)
-   - **Two action items the CTO must do**:
+   - **Two action items an operator must do**:
      a. Rotate the secret if it's real (revoke + reissue)
      b. Rebuild the image without the secret (use Kubernetes Secrets / External Secrets instead)
 5. NEVER auto-fix — secret rotation requires human judgment.
