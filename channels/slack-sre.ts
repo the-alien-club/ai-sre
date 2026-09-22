@@ -297,6 +297,64 @@ function armReceiptAck(
 
 // -- MCP Channel Server -------------------------------------------------------
 
+// MUST render under 2048 characters. Claude Code truncates server instructions at that
+// limit and only says so in the MCP debug log, so anything past it is lost in silence.
+// This had already overrun by 103 characters, which cost exactly the operator_reply line
+// at the end — the one telling the agent to answer an operator replying in an escalation
+// thread. checkInstructionBudget() below refuses to start rather than let that recur.
+const CHANNEL_INSTRUCTIONS = `You talk to the ops team in a shared Slack channel (ID "${SRE_SLACK_CHANNEL}").
+
+Operators — the only people who can reach you or approve your tool use: ${OPERATOR_ROSTER}.
+
+Messages arrive as <channel source="slack_sre" sender sender_name channel thread_ts channel_type>.
+Address people by sender_name — you are talking to a team, not one person.
+
+A channel message reaches you only when addressed to you: an @-mention, or a reply in any
+thread you have posted in. DMs always reach you.
+
+Tools:
+- "reply" — omit "channel" to post in the team channel; pass the inbound thread_ts to stay in-thread.
+- "escalate" — posts to the team channel and pages every operator when severity is critical.
+- "resolve_escalation" — closes one out.
+
+Escalations nag in-thread every 10 min (critical prod) or 1 hour (dev/staging) until an
+operator replies, which stops the nagging. Say what broke, what you tried, what you need.
+
+Keep one alert in one thread: post the escalation, then reply in that thread as you learn
+more. Never open a new top-level message for something already in flight — this channel is
+shared with people who are not on the ops rotation.
+
+Three message types arrive automatically:
+- type="escalation_timeout" final_agent_nag="false": nobody replied. Note it and stand by — do NOT re-investigate.
+- type="escalation_timeout" final_agent_nag="true": the team is offline. Say so ONCE, then ignore further nags; the channel drops to Slack-only automatically.
+- type="operator_reply": an operator replied in an escalation thread. Continue the conversation.`;
+
+// Fail loudly if the instructions overrun. The overrun is invisible from the source —
+// SRE_OPERATORS is interpolated, so the roster's length is what decides whether the last
+// line survives. Refusing to start beats running with instructions the agent never sees.
+const MAX_INSTRUCTION_CHARS = 2048;
+
+if (CHANNEL_INSTRUCTIONS.length > MAX_INSTRUCTION_CHARS) {
+  console.error(
+    `[slack-sre] channel instructions are ${CHANNEL_INSTRUCTIONS.length} chars, ${MAX_INSTRUCTION_CHARS} max — ` +
+      `the last ${CHANNEL_INSTRUCTIONS.length - MAX_INSTRUCTION_CHARS} would be silently dropped, starting with: ` +
+      JSON.stringify(
+        CHANNEL_INSTRUCTIONS.slice(
+          MAX_INSTRUCTION_CHARS,
+          MAX_INSTRUCTION_CHARS + 80
+        )
+      )
+  );
+  console.error(
+    "[slack-sre] shorten the instructions template, or trim the SRE_OPERATORS display names."
+  );
+  process.exit(1);
+}
+
+console.error(
+  `[slack-sre] channel instructions: ${CHANNEL_INSTRUCTIONS.length}/${MAX_INSTRUCTION_CHARS} chars`
+);
+
 const mcp = new Server(
   { name: "slack-sre", version: "0.2.0" },
   {
@@ -307,36 +365,7 @@ const mcp = new Server(
       },
       tools: {},
     },
-    instructions: `You talk to the ops team in a shared Slack channel (ID "${SRE_SLACK_CHANNEL}").
-
-Operators (the only people who can reach you or approve your tool use): ${OPERATOR_ROSTER}.
-
-Messages arrive as <channel source="slack_sre" sender="..." sender_name="..." channel="..." thread_ts="..." channel_type="...">.
-Address people by their sender_name — you are talking to a team, not to one person.
-
-Channel messages only reach you when they are addressed to you (an @-mention of the bot,
-or a reply in any thread you have posted in). Direct messages always reach you.
-
-To reply, use the "reply" tool. Omit "channel" to post in the team channel; pass the
-thread_ts from the inbound tag to keep the conversation in-thread.
-To escalate an alert, use the "escalate" tool — it posts to the team channel and pages
-every operator when severity is critical.
-To close one out, use the "resolve_escalation" tool.
-
-Escalation behavior:
-- For critical prod alerts: the channel nags in-thread every 10 minutes until an operator replies
-- For dev/staging: nag interval is 1 hour
-- When any operator replies in the escalation thread, nagging stops automatically
-- Always include actionable context in escalation messages (what's broken, what you tried, what you need)
-
-Thread discipline: keep one alert in one thread. Post the escalation, then reply in that
-thread as you learn more — do not start a new top-level message per update. The channel is
-shared with people who are not on the ops rotation.
-
-Three special message types arrive automatically:
-- <channel source="slack_sre" type="escalation_timeout" final_agent_nag="false" ...>: nobody has replied. Note it and stand by — do NOT re-investigate.
-- <channel source="slack_sre" type="escalation_timeout" final_agent_nag="true" ...>: the team is offline. Acknowledge this ONCE ("team appears offline, Slack nags will continue every 2h, standing by silently"), then stop responding to further nags — the channel will switch to Slack-only mode automatically.
-- <channel source="slack_sre" type="operator_reply" ...>: an operator replied in an escalation thread. Continue the conversation.`,
+    instructions: CHANNEL_INSTRUCTIONS,
   }
 );
 
