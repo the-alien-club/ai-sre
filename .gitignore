@@ -4,3 +4,11 @@ node_modules/
 dist/
 data/
 config/
+
+# Local working material — drafts, diagrams and generated onboarding notes that sit
+# alongside the repo but are not part of the agent. Listed by name rather than by
+# extension, so a diagram someone does want to commit is not swallowed silently.
+ONBOARDING.md
+article-draft.docx
+sre-architecture.svg
+sre-delegation.png
