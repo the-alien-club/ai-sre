@@ -6,9 +6,13 @@
 // and a long-running agent that fills its context window dies and must restart.
 // So a channel message reaches the agent only when it is genuinely addressed to it.
 //
-// Kept pure and dependency-free so it can be reasoned about and tested in isolation.
+// This module classifies; it does not decide. Three of the four outcomes are settled
+// from the message alone, but "a reply in one of the agent's threads" needs to know who
+// has posted in that thread — a question only Slack can answer, and answering it costs a
+// round-trip. Returning the classification lets the caller pay that cost on the one
+// branch that needs it, and keeps this module pure, synchronous and testable.
 
-export interface InboundMessage {
+export interface ClassifiableMessage {
   /** True for direct messages — those are always addressed to the agent. */
   isDirectMessage: boolean;
   /** Raw message text, including any Slack mention tokens. */
@@ -17,28 +21,38 @@ export interface InboundMessage {
   botUserId: string;
   /** Parent thread timestamp, if this message is a threaded reply. */
   parentThreadTs: string | undefined;
-  /** Whether the given thread is one the agent itself started. */
-  isAgentThread: (threadTs: string) => boolean;
 }
 
+/** Why a message is (or might be) addressed to the agent. */
+export type MessageAddressing =
+  /** A DM. Always addressed. */
+  | { kind: "direct_message" }
+  /** Contains an @-mention of the bot. Always addressed. */
+  | { kind: "mention" }
+  /** A threaded reply — addressed only if the agent has posted in that thread. */
+  | { kind: "thread_reply"; threadTs: string }
+  /** Ordinary channel chatter. Never addressed. */
+  | { kind: "unaddressed" };
+
 /**
- * A message is addressed to the agent when it is a DM, when it @-mentions the bot,
- * or when it is a reply inside a thread the agent started (so escalation
- * conversations flow without re-mentioning the bot on every turn).
+ * Classify how — if at all — a message reaches the agent.
+ *
+ * Order matters: a DM outranks everything, and an explicit @-mention outranks the thread
+ * check so that mentioning the bot inside a stranger's thread still gets through without
+ * a Slack lookup.
  */
-export function isAddressedToAgent(message: InboundMessage): boolean {
-  if (message.isDirectMessage) return true;
+export function classifyAddressing(
+  message: ClassifiableMessage
+): MessageAddressing {
+  if (message.isDirectMessage) return { kind: "direct_message" };
 
-  if (mentionsBot(message.text, message.botUserId)) return true;
+  if (mentionsBot(message.text, message.botUserId)) return { kind: "mention" };
 
-  if (
-    message.parentThreadTs !== undefined &&
-    message.isAgentThread(message.parentThreadTs)
-  ) {
-    return true;
+  if (message.parentThreadTs !== undefined) {
+    return { kind: "thread_reply", threadTs: message.parentThreadTs };
   }
 
-  return false;
+  return { kind: "unaddressed" };
 }
 
 /** Whether the text contains an @-mention of the bot. */

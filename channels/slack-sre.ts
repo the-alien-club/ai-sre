@@ -14,7 +14,11 @@
 //   The team channel carries ordinary human conversation. The agent's context window
 //   is its lifeline, so a channel message is only forwarded to Claude when it is
 //   addressed to the agent: it @-mentions the bot, or it is a reply inside a thread
-//   the agent itself started. Everything else is dropped before it reaches the session.
+//   the agent has posted in. Everything else is dropped before it reaches the session.
+//
+//   Thread ownership is resolved from Slack, not from process memory — see
+//   thread-ownership.ts for why. Escalation bookkeeping is persisted to disk for the same
+//   reason: this process is restarted nightly and must not lose state it alone holds.
 //
 // Slack app requirements:
 //   Bot scopes:          chat:write, chat:write.public, channels:history, channels:read,
@@ -31,7 +35,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { App } from "@slack/bolt";
-import { isAddressedToAgent, stripBotMention } from "./message-gate.js";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { classifyAddressing, stripBotMention } from "./message-gate.js";
+import { createThreadOwnership } from "./thread-ownership.js";
+import { createEscalationStore, type Escalation } from "./escalation-store.js";
 
 // -- Configuration (env vars) -------------------------------------------------
 
@@ -89,6 +97,19 @@ const SLACK_ONLY_INTERVAL_MS = parseInt(
   process.env.SLACK_ONLY_INTERVAL_MS ?? String(2 * 60 * 60 * 1000), // 2 hours
   10
 );
+
+// How long an operator waits with no visible sign that their message landed before the
+// channel says so on the agent's behalf. The runbook requires the agent to delegate all
+// investigation to sub-agents, so a substantive question is silent for minutes by
+// construction — and from Slack that is indistinguishable from a dead bot. Set to 0 to
+// disable the acknowledgement entirely.
+const ACK_DELAY_MS = parseInt(process.env.ACK_DELAY_MS ?? "20000", 10);
+
+// Where bookkeeping that only this process knows about is persisted. Relative to the repo
+// root so it lands in the same data/ directory as incidents.db.
+const DATA_DIR =
+  process.env.SRE_DATA_DIR ??
+  join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
 
 /**
  * Parse the operator allowlist. Operators are the only people whose messages reach
@@ -149,61 +170,33 @@ const OPERATOR_ROSTER = [...OPERATORS.entries()]
   .join(", ");
 
 // -- Escalation tracking ------------------------------------------------------
-
-interface Escalation {
-  alertFingerprint: string;
-  alertName: string;
-  severity: string;
-  environment: string; // "dev", "staging", "prod"
-  slackThreadTs: string | undefined; // thread to nag in
-  slackChannel: string | undefined; // channel to nag in
-  escalatedAt: number; // timestamp of first escalation
-  lastNagAt: number; // timestamp of last nag
-  acknowledged: boolean; // an operator replied
-  acknowledgedBy: string | undefined; // display name of whoever acknowledged
-  nagCount: number;
-}
-
-const activeEscalations = new Map<string, Escalation>();
-
-// -- Agent thread tracking ----------------------------------------------------
 //
-// Threads the agent itself started. A channel reply inside one of these is treated
-// as addressed to the agent even without an explicit @-mention, so escalation
-// conversations flow naturally. Bounded in both size and age — this process runs
-// for weeks and an unbounded set would leak.
+// Persisted: an unacknowledged alert must keep nagging across the nightly restart, and
+// nothing outside this process knows it is still waiting.
 
-const agentThreads = new Map<string, number>(); // thread_ts -> last touched (ms)
-const MAX_TRACKED_THREADS = 500;
-const THREAD_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const escalationStore = createEscalationStore({
+  path: join(DATA_DIR, "slack-escalations.json"),
+});
 
-function trackAgentThread(threadTs: string | undefined): void {
-  if (!threadTs) return;
-
-  // Re-insert rather than overwrite: Map.set on an existing key keeps its original
-  // position, which would let a busy thread be evicted as the "oldest" one below.
-  agentThreads.delete(threadTs);
-  agentThreads.set(threadTs, Date.now());
-
-  // Map preserves insertion order — evict oldest entries when over the cap.
-  while (agentThreads.size > MAX_TRACKED_THREADS) {
-    const oldest = agentThreads.keys().next();
-    if (oldest.done) break;
-    agentThreads.delete(oldest.value);
-  }
+const activeEscalations = escalationStore.load();
+if (activeEscalations.size > 0) {
+  console.error(
+    `[slack-sre] restored ${activeEscalations.size} escalation(s) from disk`
+  );
 }
 
-function pruneAgentThreads(): void {
-  const cutoff = Date.now() - THREAD_TTL_MS;
-  for (const [threadTs, touchedAt] of agentThreads) {
-    if (touchedAt < cutoff) agentThreads.delete(threadTs);
-  }
+function persistEscalations(): void {
+  escalationStore.save(activeEscalations);
 }
 
 // -- Pending permission requests ----------------------------------------------
 //
 // Tracked so a verdict for an unknown or expired request gets an explicit answer
 // instead of silently doing nothing.
+//
+// Deliberately NOT persisted. A restart tears down the Claude session along with this
+// process, so every tool call blocked on a verdict dies with it. Restoring the map would
+// let an operator approve a request that nothing is waiting on.
 
 interface PendingPermission {
   toolName: string;
@@ -222,6 +215,23 @@ function prunePendingPermissions(): void {
 
 // -- Slack App (Socket Mode) --------------------------------------------------
 
+// Bolt's App constructor calls auth.test() itself to resolve the bot identity, and that
+// promise is not ours to await — an invalid or revoked token rejects it outside the
+// try/catch around validateSlackSetup below, and Node kills the process with a raw stack
+// trace. That is the single most likely startup failure, and it deserves the same
+// actionable message as every other one.
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    "[slack-sre] fatal: unhandled rejection —",
+    reason instanceof Error ? reason.message : String(reason)
+  );
+  console.error(
+    "[slack-sre] if this is a Slack API error, check SLACK_BOT_TOKEN and SLACK_APP_TOKEN " +
+      "are valid and that the app has not been reinstalled or revoked."
+  );
+  process.exit(1);
+});
+
 const slackApp = new App({
   token: SLACK_BOT_TOKEN,
   appToken: SLACK_APP_TOKEN,
@@ -231,7 +241,119 @@ const slackApp = new App({
 // Resolved during startup validation — needed to detect @-mentions of the bot.
 let BOT_USER_ID = "";
 
+// Answers "has the agent posted in this thread?" from Slack, with an in-memory cache.
+// Reads BOT_USER_ID lazily: startup validation resolves it after this object is built.
+const threadOwnership = createThreadOwnership({
+  client: slackApp.client,
+  botUserId: () => BOT_USER_ID,
+});
+
+// -- Receipt acknowledgement --------------------------------------------------
+//
+// Armed when a message is handed to the Claude session, cleared when the agent answers in
+// that thread. If it fires, the agent has been quiet long enough that an operator would
+// reasonably conclude nothing happened — so the channel says so on its behalf. Fast
+// answers never trigger it, which keeps a shared channel quiet.
+
+const pendingAcks = new Map<string, NodeJS.Timeout>(); // thread_ts -> timer
+
+function cancelReceiptAck(threadTs: string | undefined): void {
+  if (!threadTs) return;
+  const timer = pendingAcks.get(threadTs);
+  if (!timer) return;
+  clearTimeout(timer);
+  pendingAcks.delete(threadTs);
+}
+
+function armReceiptAck(
+  channel: string,
+  threadTs: string,
+  senderName: string
+): void {
+  if (ACK_DELAY_MS <= 0) return;
+
+  cancelReceiptAck(threadTs);
+
+  const timer = setTimeout(() => {
+    pendingAcks.delete(threadTs);
+    void slackApp.client.chat
+      .postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `:eyes: On it, ${senderName} — investigating. I'll answer in this thread.`,
+      })
+      .catch((err: unknown) => {
+        console.error(
+          `[slack-sre] failed to post receipt acknowledgement in ${threadTs}:`,
+          err instanceof Error ? err.message : String(err)
+        );
+      });
+  }, ACK_DELAY_MS);
+
+  // Never let a pending acknowledgement be the reason the process stays alive.
+  timer.unref();
+  pendingAcks.set(threadTs, timer);
+}
+
 // -- MCP Channel Server -------------------------------------------------------
+
+// MUST render under 2048 characters. Claude Code truncates server instructions at that
+// limit and only says so in the MCP debug log, so anything past it is lost in silence.
+// This had already overrun by 103 characters, which cost exactly the operator_reply line
+// at the end — the one telling the agent to answer an operator replying in an escalation
+// thread. checkInstructionBudget() below refuses to start rather than let that recur.
+const CHANNEL_INSTRUCTIONS = `You talk to the ops team in a shared Slack channel (ID "${SRE_SLACK_CHANNEL}").
+
+Operators — the only people who can reach you or approve your tool use: ${OPERATOR_ROSTER}.
+
+Messages arrive as <channel source="slack_sre" sender sender_name channel thread_ts channel_type>.
+Address people by sender_name — you are talking to a team, not one person.
+
+A channel message reaches you only when addressed to you: an @-mention, or a reply in any
+thread you have posted in. DMs always reach you.
+
+Tools:
+- "reply" — omit "channel" to post in the team channel; pass the inbound thread_ts to stay in-thread.
+- "escalate" — posts to the team channel and pages every operator when severity is critical.
+- "resolve_escalation" — closes one out.
+
+Escalations nag in-thread every 10 min (critical prod) or 1 hour (dev/staging) until an
+operator replies, which stops the nagging. Say what broke, what you tried, what you need.
+
+Keep one alert in one thread: post the escalation, then reply in that thread as you learn
+more. Never open a new top-level message for something already in flight — this channel is
+shared with people who are not on the ops rotation.
+
+Three message types arrive automatically:
+- type="escalation_timeout" final_agent_nag="false": nobody replied. Note it and stand by — do NOT re-investigate.
+- type="escalation_timeout" final_agent_nag="true": the team is offline. Say so ONCE, then ignore further nags; the channel drops to Slack-only automatically.
+- type="operator_reply": an operator replied in an escalation thread. Continue the conversation.`;
+
+// Fail loudly if the instructions overrun. The overrun is invisible from the source —
+// SRE_OPERATORS is interpolated, so the roster's length is what decides whether the last
+// line survives. Refusing to start beats running with instructions the agent never sees.
+const MAX_INSTRUCTION_CHARS = 2048;
+
+if (CHANNEL_INSTRUCTIONS.length > MAX_INSTRUCTION_CHARS) {
+  console.error(
+    `[slack-sre] channel instructions are ${CHANNEL_INSTRUCTIONS.length} chars, ${MAX_INSTRUCTION_CHARS} max — ` +
+      `the last ${CHANNEL_INSTRUCTIONS.length - MAX_INSTRUCTION_CHARS} would be silently dropped, starting with: ` +
+      JSON.stringify(
+        CHANNEL_INSTRUCTIONS.slice(
+          MAX_INSTRUCTION_CHARS,
+          MAX_INSTRUCTION_CHARS + 80
+        )
+      )
+  );
+  console.error(
+    "[slack-sre] shorten the instructions template, or trim the SRE_OPERATORS display names."
+  );
+  process.exit(1);
+}
+
+console.error(
+  `[slack-sre] channel instructions: ${CHANNEL_INSTRUCTIONS.length}/${MAX_INSTRUCTION_CHARS} chars`
+);
 
 const mcp = new Server(
   { name: "slack-sre", version: "0.2.0" },
@@ -243,36 +365,7 @@ const mcp = new Server(
       },
       tools: {},
     },
-    instructions: `You talk to the ops team in a shared Slack channel (ID "${SRE_SLACK_CHANNEL}").
-
-Operators (the only people who can reach you or approve your tool use): ${OPERATOR_ROSTER}.
-
-Messages arrive as <channel source="slack_sre" sender="..." sender_name="..." channel="..." thread_ts="..." channel_type="...">.
-Address people by their sender_name — you are talking to a team, not to one person.
-
-Channel messages only reach you when they are addressed to you (an @-mention of the bot,
-or a reply in a thread you started). Direct messages always reach you.
-
-To reply, use the "reply" tool. Omit "channel" to post in the team channel; pass the
-thread_ts from the inbound tag to keep the conversation in-thread.
-To escalate an alert, use the "escalate" tool — it posts to the team channel and pages
-every operator when severity is critical.
-To close one out, use the "resolve_escalation" tool.
-
-Escalation behavior:
-- For critical prod alerts: the channel nags in-thread every 10 minutes until an operator replies
-- For dev/staging: nag interval is 1 hour
-- When any operator replies in the escalation thread, nagging stops automatically
-- Always include actionable context in escalation messages (what's broken, what you tried, what you need)
-
-Thread discipline: keep one alert in one thread. Post the escalation, then reply in that
-thread as you learn more — do not start a new top-level message per update. The channel is
-shared with people who are not on the ops rotation.
-
-Three special message types arrive automatically:
-- <channel source="slack_sre" type="escalation_timeout" final_agent_nag="false" ...>: nobody has replied. Note it and stand by — do NOT re-investigate.
-- <channel source="slack_sre" type="escalation_timeout" final_agent_nag="true" ...>: the team is offline. Acknowledge this ONCE ("team appears offline, Slack nags will continue every 2h, standing by silently"), then stop responding to further nags — the channel will switch to Slack-only mode automatically.
-- <channel source="slack_sre" type="operator_reply" ...>: an operator replied in an escalation thread. Continue the conversation.`,
+    instructions: CHANNEL_INSTRUCTIONS,
   }
 );
 
@@ -392,7 +485,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       // Remember the thread so operator replies to it come back to us without
       // needing an explicit @-mention.
-      trackAgentThread(thread_ts ?? result.ts);
+      const conversationTs = thread_ts ?? result.ts;
+      threadOwnership.remember(conversationTs);
+
+      // The agent has spoken for itself — no need for the channel to do it.
+      cancelReceiptAck(conversationTs);
 
       return { content: [{ type: "text" as const, text: "sent" }] };
     } catch (err) {
@@ -441,7 +538,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         text: escalationText,
       });
 
-      trackAgentThread(result.ts);
+      threadOwnership.remember(result.ts);
 
       // Track the escalation for nagging
       const now = Date.now();
@@ -458,6 +555,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         acknowledgedBy: undefined,
         nagCount: 0,
       });
+      persistEscalations();
 
       return {
         content: [
@@ -511,6 +609,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           err
         );
         activeEscalations.delete(alert_fingerprint);
+        persistEscalations();
         return {
           content: [
             {
@@ -524,6 +623,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     activeEscalations.delete(alert_fingerprint);
+    persistEscalations();
 
     return {
       content: [{ type: "text" as const, text: "escalation resolved" }],
@@ -565,7 +665,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
         `Any operator: reply \`yes ${params.request_id}\` to approve or \`no ${params.request_id}\` to deny.`,
     });
 
-    trackAgentThread(result.ts);
+    threadOwnership.remember(result.ts);
     pendingPermissions.set(params.request_id, {
       toolName: params.tool_name,
       requestedAt: Date.now(),
@@ -665,11 +765,19 @@ slackApp.message(async ({ message }) => {
     const replyThreadTs = parentThreadTs ?? message.ts;
 
     if (!pendingPermissions.has(requestId)) {
-      // Don't leave the operator wondering whether it landed.
+      // Don't leave the operator wondering whether it landed. A restart is the common
+      // cause and is worth naming: the tool call that asked is gone with the session, so
+      // there is nothing left to approve and the agent will ask again if it still needs to.
+      console.error(
+        `[slack-sre] ${senderName} answered unknown permission request ${requestId}`
+      );
       await slackApp.client.chat.postMessage({
         channel: channelId ?? SRE_SLACK_CHANNEL,
         thread_ts: replyThreadTs,
-        text: `:grey_question: No pending permission request \`${requestId}\` — it may have already been answered or expired.`,
+        text:
+          `:grey_question: No pending permission request \`${requestId}\` — it was already answered, ` +
+          "expired, or the agent restarted since it asked. Nothing is waiting on this verdict; " +
+          "the agent will ask again if it still needs approval.",
       });
       return;
     }
@@ -694,14 +802,41 @@ slackApp.message(async ({ message }) => {
 
   // Channel gating — the agent's context window is its lifeline. A channel message
   // is only forwarded when it is addressed to the agent. See message-gate.ts.
-  const addressed = isAddressedToAgent({
+  const addressing = classifyAddressing({
     isDirectMessage,
     text,
     botUserId: BOT_USER_ID,
     parentThreadTs,
-    isAgentThread: (threadTs) => agentThreads.has(threadTs),
   });
-  if (!addressed) return;
+
+  let addressed: boolean;
+  switch (addressing.kind) {
+    case "direct_message":
+    case "mention":
+      addressed = true;
+      break;
+    case "thread_reply":
+      // Asked of Slack, not of process memory — a thread opened before the nightly
+      // restart must still reach the agent. See thread-ownership.ts.
+      addressed = await threadOwnership.owns(
+        channelId ?? SRE_SLACK_CHANNEL,
+        addressing.threadTs
+      );
+      break;
+    case "unaddressed":
+      addressed = false;
+      break;
+  }
+
+  if (!addressed) {
+    // Log it. A silent drop is indistinguishable from a broken agent, which is exactly how
+    // this went unnoticed for eleven days.
+    console.error(
+      `[slack-sre] dropped message from ${senderName} in ${channelId ?? "unknown channel"}` +
+        `${parentThreadTs ? ` (thread ${parentThreadTs})` : ""} — ${addressing.kind}, not addressed to the agent`
+    );
+    return;
+  }
 
   // A reply in an escalation thread counts as acknowledgement — stop nagging.
   let isEscalationReply = false;
@@ -712,6 +847,7 @@ slackApp.message(async ({ message }) => {
       if (!esc.acknowledged) {
         esc.acknowledged = true;
         esc.acknowledgedBy = senderName;
+        persistEscalations();
         console.error(
           `[slack-sre] ${senderName} acknowledged escalation for ${esc.alertName}`
         );
@@ -726,7 +862,15 @@ slackApp.message(async ({ message }) => {
   // Keep the conversation in one thread: track the thread this message belongs to
   // so follow-ups land back here without needing another @-mention.
   const conversationThreadTs = parentThreadTs ?? message.ts;
-  trackAgentThread(conversationThreadTs);
+  threadOwnership.remember(conversationThreadTs);
+
+  // The agent may spend minutes in sub-agents before it says anything. Promise the
+  // operator an answer if it stays quiet.
+  armReceiptAck(
+    channelId ?? SRE_SLACK_CHANNEL,
+    conversationThreadTs,
+    senderName
+  );
 
   const meta: Record<string, string> = {
     sender: senderId,
@@ -755,10 +899,11 @@ console.error(
 // -- Escalation nag timer -----------------------------------------------------
 
 setInterval(async () => {
-  pruneAgentThreads();
+  threadOwnership.prune();
   prunePendingPermissions();
 
   const now = Date.now();
+  let escalationsChanged = false;
 
   for (const [fingerprint, esc] of activeEscalations) {
     if (esc.acknowledged) continue;
@@ -776,6 +921,7 @@ setInterval(async () => {
 
     esc.lastNagAt = now;
     esc.nagCount++;
+    escalationsChanged = true;
 
     const minutesWaiting = Math.round((now - esc.escalatedAt) / (60 * 1000));
 
@@ -822,4 +968,8 @@ setInterval(async () => {
       });
     }
   }
+
+  // One write per sweep rather than one per escalation: the nag counters only have to
+  // survive a restart, and a restart cannot land mid-loop.
+  if (escalationsChanged) persistEscalations();
 }, 60_000); // check every minute
