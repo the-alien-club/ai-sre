@@ -158,11 +158,14 @@ test("stops at the first failed write and touches nothing after it", () => {
   assert.equal(log.filter((line) => line.startsWith("ssh root@vm set -e")).length, 0);
 });
 
-test("--dry-run prints the plan and runs nothing", () => {
+test("--dry-run runs only the read-only preflight and prints the writes", () => {
   const box = sandbox();
   const result = rollback(box, "--vm", "vm", "--yes", "--dry-run");
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(calls(box), []);
+  assert.deepEqual(calls(box), [
+    ...ALL_CONTEXTS.map(SA_CHECK),
+    "ssh root@vm id -u sre-agent >/dev/null && test -d /home/sre-agent/sre-agent",
+  ]);
   assert.match(result.stdout, /\+ kubectl --context data-cluster-alien-hosted apply -f \S+rbac-write\.yaml/);
   assert.match(result.stdout, /\+ ssh sre-agent@vm pm2 restart sre-agent/);
 });
@@ -205,4 +208,11 @@ test("the make target requires VM and CONFIRM", () => {
   const unconfirmed = spawnSync("make", ["-s", "rollback-write-access", "VM=vm"], { encoding: "utf8" });
   assert.notEqual(unconfirmed.status, 0);
   assert.match(unconfirmed.stdout + unconfirmed.stderr, /Required: CONFIRM=yes/);
+});
+
+test("--dry-run still fails on a wrong target", () => {
+  const box = sandbox({ failKubectlOn: "--context platform-prod get serviceaccount" });
+  const result = rollback(box, "--vm", "vm", "--yes", "--dry-run");
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(calls(box), [SA_CHECK("platform-dev"), SA_CHECK("platform-prod")]);
 });

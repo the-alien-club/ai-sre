@@ -15,7 +15,7 @@
 #
 #   --vm        agent VM hostname or IP (root@ and sre-agent@ are prepended)
 #   --contexts  kube contexts to restore; defaults to the 5 the agent monitors
-#   --dry-run   print every command instead of running it
+#   --dry-run   run the read-only preflight, print every write instead of running it
 #   --yes       required; this changes RBAC on production clusters
 #
 # Steps, in order, stopping at the first failure:
@@ -65,6 +65,13 @@ if ! git rev-parse -q --verify "refs/tags/$PRE_CUTOVER_TAG" >/dev/null; then
   exit 1
 fi
 
+# check: a read-only command, run even under --dry-run so a dry run proves the targets
+check() {
+  echo "? $*"
+  "$@"
+}
+
+# run: a write, printed instead of executed under --dry-run
 run() {
   echo "+ $*"
   [ "$DRY_RUN" = 1 ] || "$@"
@@ -86,9 +93,9 @@ done
 
 echo "=== 0/4 preflight (read-only) ==="
 for ctx in $CONTEXTS; do
-  run kubectl --context "$ctx" get serviceaccount sre-agent -n kube-system -o name
+  check kubectl --context "$ctx" get serviceaccount sre-agent -n kube-system -o name
 done
-run ssh "root@$VM" "id -u sre-agent >/dev/null && test -d $AGENT_DIR"
+check ssh "root@$VM" "id -u sre-agent >/dev/null && test -d $AGENT_DIR"
 
 echo "=== 1/4 RBAC: re-apply sre-agent-write ==="
 for ctx in $CONTEXTS; do
