@@ -14,6 +14,8 @@
 	# Access log, so every webhook delivery is auditable (who posted, when, which status).
 	# Caddy already writes Authorization as REDACTED; the channels also accept the secret in
 	# an X-Webhook-Token header, which Caddy would log verbatim, so that header is dropped.
+	# Query strings are redacted too: no sender should put a secret there, but if one does
+	# it must not land in the log.
 	log {
 		output file /var/log/caddy/sre-agent-access.log {
 			roll_size 10MiB
@@ -21,6 +23,7 @@
 		}
 		format filter {
 			request>headers>X-Webhook-Token delete
+			request>uri regexp \?.*$ ?REDACTED
 		}
 	}
 

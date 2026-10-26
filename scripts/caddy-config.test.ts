@@ -50,6 +50,6 @@ test("caddy accepts the config", { skip: !hasCaddy && "caddy not installed" }, (
 test("webhook deliveries are access-logged, without the secret", () => {
   assert.match(config, /log \{\s*output file \/var\/log\/caddy\/sre-agent-access\.log \{\s*roll_size \S+\s*roll_keep \d+\s*\}/);
   // Authorization is redacted by Caddy itself; X-Webhook-Token is not, so it must be dropped
-  assert.match(config, /format filter \{\s*request>headers>X-Webhook-Token delete\s*\}/);
+  assert.match(config, /format filter \{\s*request>headers>X-Webhook-Token delete\s*request>uri regexp \\\?\.\*\$ \?REDACTED\s*\}/);
   assert.doesNotMatch(config, /log_credentials/, "logging credentials must stay off");
 });
