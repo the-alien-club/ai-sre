@@ -543,7 +543,7 @@ playbooks/
 ├── trivy-exposed-secret.md
 ├── falco.md
 ├── scaleway-postgres.md      # Managed RDB: connections, replication lag, disk
-├── scaleway-redis.md         # Managed RKV memory pressure
+├── scaleway-redis.md         # Managed RKV: memory pressure, unreachable (redis-demos is prod)
 ├── scaleway-sqs.md           # Managed MNQ queue backlog
 └── scaleway-load-balancer.md # LB backend status + connection saturation
 ```
@@ -581,6 +581,7 @@ Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability|
 - Postgres Replication Lag → `scaleway-postgres.md`
 - Postgres Disk Above 85% → `scaleway-postgres.md`
 - Redis Memory Above 85% → `scaleway-redis.md`
+- Redis connection errors on any alert (`ECONNRESET` / `Error 104` / `UF,URX` to the Redis host) → `scaleway-redis.md` (unreachable section)
 - SQS Oldest Message Age Above 5min → `scaleway-sqs.md`
 - Load Balancer Backend Down → `scaleway-load-balancer.md`
 - Load Balancer Connection Saturation Above 80% → `scaleway-load-balancer.md`
