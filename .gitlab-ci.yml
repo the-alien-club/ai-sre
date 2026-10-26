@@ -1,0 +1,45 @@
+# GitLab CI/CD for the SRE agent (claude-sre)
+#
+# The agent has no image or chart to build: it is deployed to its VM by file copy. CI
+# exists to prove the parts that guard it: the tests, the shell scripts it runs as and on
+# behalf of operators, the Caddy TLS front door, and that no secret lands in git.
+
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - project: 'alias3/datastreaming/ci-scripts'
+    ref: main
+    file:
+      - '/templates/stages.gitlab-ci.yml'
+      - '/templates/jobs/node-test.gitlab-ci.yml'
+
+# Shared Node test job (npm test + typecheck). The tests also drive the real shell
+# scripts, so they need sqlite3 (incidents.sh), visudo (sudoers drop-in), make (rollback
+# target), ss (port wait) and git (rollback sandbox), which node:*-slim does not ship.
+node-test:
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends sqlite3 sudo make iproute2 git
+    - !reference [.node-test-base, before_script]
+
+shellcheck:
+  stage: test
+  image: koalaman/shellcheck-alpine:v0.10.0
+  script:
+    # Warning severity and above. The info-level SC1091 notes that start-agent.sh sources
+    # .env, which is deliberately absent from the repo.
+    - shellcheck -x --severity=warning scripts/*.sh scripts/lib/*.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# caddy-config.test.ts skips `caddy validate` where caddy is not installed, so this job is
+# what actually proves the Caddyfile loads.
+caddy-validate:
+  stage: test
+  image: caddy:2.10.2
+  variables:
+    SRE_AGENT_HOSTNAME: sre-agent.example.invalid
+  script:
+    - caddy validate --config provision/caddy/Caddyfile --adapter caddyfile
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
