@@ -11,6 +11,22 @@
 # Install: see INSTALL.md §8b. Validate: caddy validate --config Caddyfile
 
 {$SRE_AGENT_HOSTNAME} {
+	# Access log, so every webhook delivery is auditable (who posted, when, which status).
+	# Caddy already writes Authorization as REDACTED; the channels also accept the secret in
+	# an X-Webhook-Token header, which Caddy would log verbatim, so that header is dropped.
+	# Query strings are redacted too: no sender should put a secret there, but if one does
+	# it must not land in the log.
+	log {
+		output file /var/log/caddy/sre-agent-access.log {
+			roll_size 10MiB
+			roll_keep 10
+		}
+		format filter {
+			request>headers>X-Webhook-Token delete
+			request>uri regexp \?.*$ ?REDACTED
+		}
+	}
+
 	# Body limits match the channels' own (request-body.ts): an alert payload is small, a
 	# Trivy VulnerabilityReport for a large image runs to several MB
 	handle /alert {
