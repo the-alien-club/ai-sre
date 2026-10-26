@@ -16,8 +16,8 @@
       "command": "npx",
       "args": ["signoz-mcp-server"],
       "env": {
-        "SIGNOZ_URL": "https://your-signoz-instance.signoz.cloud",
-        "SIGNOZ_TOKEN": "your-signoz-api-key"
+        "SIGNOZ_URL": "${SIGNOZ_URL}",
+        "SIGNOZ_TOKEN": "${SIGNOZ_TOKEN}"
       }
     }
   }

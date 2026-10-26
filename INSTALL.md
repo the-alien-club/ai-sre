@@ -234,7 +234,10 @@ channel, invite the bot by hand: `/invite @claude_sre` in the channel.
 cd ~/sre-agent
 cp .env.example .env
 # Edit with real values:
-# SIGNOZ_WEBHOOK_TOKEN: generate with `openssl rand -hex 32`
+# SIGNOZ_WEBHOOK_TOKEN: generate with `openssl rand -hex 32` (required, the channel will not start without it)
+# TRIVY_WEBHOOK_TOKEN: generate with `openssl rand -hex 32` (required, same rule)
+# SIGNOZ_URL / SIGNOZ_TOKEN: SigNoz cloud URL and API key for the SigNoz MCP server.
+#   .mcp.json references them as ${SIGNOZ_URL} / ${SIGNOZ_TOKEN}; do not edit .mcp.json.
 # SLACK_BOT_TOKEN: from step 6
 # SLACK_APP_TOKEN: from step 6
 # SRE_SLACK_CHANNEL: from step 6 — the channel the agent lives in
