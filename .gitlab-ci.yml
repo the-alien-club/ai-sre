@@ -2,7 +2,8 @@
 #
 # The agent has no image or chart to build: it is deployed to its VM by file copy. CI
 # exists to prove the parts that guard it: the tests, the shell scripts it runs as and on
-# behalf of operators, the Caddy TLS front door, and that no secret lands in git.
+# behalf of operators, the Caddy TLS front door, that no secret lands in git, and that
+# every MR bumps the version (VERSIONING.md).
 
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
@@ -10,6 +11,7 @@ include:
     ref: main
     file:
       - '/templates/stages.gitlab-ci.yml'
+      - '/templates/jobs/version-bump.gitlab-ci.yml'
       - '/templates/jobs/node-test.gitlab-ci.yml'
 
 # Shared Node test job (npm test + typecheck). The tests also drive the real shell
