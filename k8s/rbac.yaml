@@ -1,16 +1,21 @@
-# SRE agent RBAC — source of truth for all 5 clusters.
+# SRE agent RBAC, read side — source of truth for all 5 clusters.
 #
-# Apply to every cluster the agent monitors (see INSTALL.md §5):
+# The agent's permissions are split in two files:
+#   rbac.yaml        this file: the ServiceAccount and an explicit read allowlist
+#   rbac-write.yaml  the four narrow write permissions behind the agent's safe ops
+#                    (rollout restart, delete pod, delete workflow, ArgoCD refresh)
+#
+# Until the Rundeck executor takes over the safe ops, apply BOTH, write side first, so
+# the agent never runs without the permissions it has today (see INSTALL.md §5):
 #   for ctx in platform-dev platform-prod data-cluster-dev \
 #              data-cluster-biorxiv data-cluster-alien-hosted; do
+#     kubectl --context "$ctx" apply -f k8s/rbac-write.yaml
 #     kubectl --context "$ctx" apply -f k8s/rbac.yaml
 #   done
 #
-# Design: explicit read allowlist + three narrow write permissions
-# (patch deployments for rollout restarts, delete pods, delete workflows).
-# The agent runs with --dangerously-skip-permissions — this role IS the
-# safety net. Never add write verbs beyond the ones already here without
-# updating the FORBIDDEN list in CLAUDE.md.
+# The agent runs with --dangerously-skip-permissions — these roles ARE the safety net.
+# This file stays read-only: write verbs belong in rbac-write.yaml, and adding one there
+# means updating the FORBIDDEN list in CLAUDE.md.
 #
 # keda.sh and cert-manager.io are only installed on the platform clusters;
 # rules referencing absent API groups are inert on the data clusters.
@@ -59,27 +64,15 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
     verbs: ["get", "list", "watch"]
-  # WRITE: rollout restart
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["patch"]
-  # WRITE: restart stuck pods
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["delete"]
   # Argo Workflows — read
   - apiGroups: ["argoproj.io"]
     resources: ["workflows", "workflowtemplates", "cronworkflows"]
     verbs: ["get", "list", "watch"]
-  # WRITE: clear stuck/failed pipeline workflows
-  - apiGroups: ["argoproj.io"]
-    resources: ["workflows"]
-    verbs: ["delete"]
-  # ArgoCD Applications — read + patch (hard refresh, clear stuck operation,
-  # toggle auto-sync). Delete is deliberately NOT granted (cascade deletion).
+  # ArgoCD Applications — read. Patch lives in rbac-write.yaml; delete is never
+  # granted anywhere (cascade deletion).
   - apiGroups: ["argoproj.io"]
     resources: ["applications"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch"]
   # Jobs — read
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]

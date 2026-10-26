@@ -26,11 +26,14 @@ scw instance server action server-id=<server-id> action=poweron zone=fr-par-1
 ## 2. Create the `sre-agent` user
 
 ```bash
+scp provision/sudoers.d/sre-agent root@$SRE_IP:/tmp/sre-agent.sudoers
 ssh root@$SRE_IP
 
 useradd -m -s /bin/bash sre-agent
 usermod -aG sudo sre-agent
-echo "sre-agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sre-agent
+visudo -c -f /tmp/sre-agent.sudoers
+install -m 0440 -o root -g root /tmp/sre-agent.sudoers /etc/sudoers.d/sre-agent
+rm /tmp/sre-agent.sudoers
 
 mkdir -p /home/sre-agent/.ssh
 cp /root/.ssh/authorized_keys /home/sre-agent/.ssh/
@@ -156,9 +159,10 @@ done
 The agent should NOT have cluster-admin access. Create a scoped ServiceAccount on each cluster.
 
 ```bash
-# From a machine with admin kubeconfigs, apply the RBAC manifest to each cluster.
-# The manifest is k8s/rbac.yaml in this repo — it is the source of truth for the
-# agent's permissions. Edit it there, commit, then re-apply to all clusters.
+# From a machine with admin kubeconfigs, apply the RBAC manifests to each cluster.
+# k8s/rbac.yaml (read) and k8s/rbac-write.yaml (safe-op writes) in this repo are the
+# source of truth for the agent's permissions. Edit them there, commit, then re-apply
+# to all clusters. Apply the write side first so the agent never loses its safe ops.
 
 CLUSTERS=(
   "14c4e1e4-...:platform-dev"
@@ -172,21 +176,27 @@ for entry in "${CLUSTERS[@]}"; do
   ID="${entry%%:*}"; NAME="${entry##*:}"
   KUBECONFIG_PATH="/tmp/$NAME.yaml"
   scw k8s kubeconfig get "$ID" region=fr-par > "$KUBECONFIG_PATH"
+  KUBECONFIG="$KUBECONFIG_PATH" kubectl apply -f k8s/rbac-write.yaml
   KUBECONFIG="$KUBECONFIG_PATH" kubectl apply -f k8s/rbac.yaml
 done
 ```
 
-The RBAC manifest ([k8s/rbac.yaml](k8s/rbac.yaml)) creates:
+The read manifest ([k8s/rbac.yaml](k8s/rbac.yaml)) creates:
 - ServiceAccount `sre-agent` in `kube-system`
 - ClusterRole `sre-agent` — an **explicit read allowlist**, NOT "read all". It covers core
   resources, workloads, HPAs, KEDA, Argo Workflows, ArgoCD Applications, batch, networking,
   policy, storage classes, cert-manager, metrics, external-secrets, and Skupper. Secrets are
-  list-only (metadata, never values). Write access is limited to: patch deployments (rollout
-  restart), delete pods, delete workflows, patch ArgoCD Applications (refresh / clear stuck op).
+  list-only (metadata, never values). It grants no write verbs.
   If the agent reports "my ServiceAccount doesn't have RBAC to read X", the resource is missing
   from the allowlist — add it to k8s/rbac.yaml and re-apply to all 5 clusters.
 - ClusterRoleBinding
 - Long-lived token Secret (`sre-agent-token`)
+
+The write manifest ([k8s/rbac-write.yaml](k8s/rbac-write.yaml)) creates ClusterRole and
+ClusterRoleBinding `sre-agent-write`, limited to: patch deployments (rollout restart), delete
+pods, delete workflows, patch ArgoCD Applications (refresh / clear stuck op). It is kept
+separate so it can be withdrawn once the Rundeck executor runs the safe ops, and restored with
+`make rollback-write-access`.
 
 Then generate scoped kubeconfigs using each SA token, merge them, and copy to the VM:
 

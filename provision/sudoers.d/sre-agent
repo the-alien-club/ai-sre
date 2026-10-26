@@ -1,0 +1,9 @@
+# sre-agent sudo rights, as live on the agent VM (captured 2026-10-26).
+#
+# Kept as code so the cutover to the Rundeck executor can remove it and the rollback can
+# put it back exactly. The account is also in the `sudo` group (INSTALL.md §2), which
+# grants the same rights with a password; the cutover removes both.
+#
+# Install: install -m 0440 -o root -g root provision/sudoers.d/sre-agent /etc/sudoers.d/sre-agent
+# Check:   visudo -c -f /etc/sudoers.d/sre-agent
+sre-agent ALL=(ALL) NOPASSWD:ALL
