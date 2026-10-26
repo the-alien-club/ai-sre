@@ -98,7 +98,13 @@ Use these real values when spawning sub-agents — they override any placeholder
 
 Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the ops team via slack-sre. Remember you are in a shared team channel, not a private DM — see \"Talking to the Ops Team\" in CLAUDE.md. Confirm you are ready by listing your kubectl contexts."
 
-tmux send-keys -t "$SESSION_NAME" "$PROMPT" Enter
+# The agent is useful without its briefing (alerts and Slack still flow), so a prompt that
+# will not submit is reported loudly rather than killing the session and its triage.
+# shellcheck source=scripts/lib/submit-prompt.sh
+source "$SRE_DIR/scripts/lib/submit-prompt.sh"
+if ! submit_prompt "$SESSION_NAME" "$PROMPT"; then
+  echo "[start-agent] ERROR: the agent is running WITHOUT its briefing and deployment config; submit it by hand: tmux send-keys -t $SESSION_NAME Enter" >&2
+fi
 
 echo "[start-agent] Agent started with briefing, monitoring tmux session"
 
