@@ -4,7 +4,8 @@
 # The cutover withdraws the agent's safe-op permissions (the sre-agent-write binding),
 # its sudo rights, and the "run the fix yourself" section of CLAUDE.md, once the Rundeck
 # executor runs those fixes. If the executor fails afterwards, this puts all three back
-# exactly as captured in git, then restarts the agent.
+# exactly as they were at the `pre-cutover` tag, then restarts the agent. Every restored
+# file is read from the tag, never from the working tree, so local edits cannot leak in.
 #
 # Run by an operator from their own machine, with admin kubeconfigs for every context
 # and root SSH to the agent VM. Never by the agent: it would be granting itself access.
@@ -18,10 +19,12 @@
 #   --yes       required; this changes RBAC on production clusters
 #
 # Steps, in order, stopping at the first failure:
+#   0. preflight, read-only: every context must hold the agent's ServiceAccount and the
+#      VM must host the agent, so a wrong context or host fails before anything changes
 #   1. re-apply k8s/rbac-write.yaml to every context
 #   2. reinstall provision/sudoers.d/sre-agent on the VM (validated with visudo) and
 #      re-add the account to the sudo group
-#   3. deploy CLAUDE.md as tagged `pre-cutover` to the VM
+#   3. deploy CLAUDE.md to the VM
 #   4. restart the agent under pm2
 
 set -euo pipefail
@@ -67,23 +70,43 @@ run() {
   [ "$DRY_RUN" = 1 ] || "$@"
 }
 
+# run_with_input <file> <command...>: same as run, with <file> on stdin
+run_with_input() {
+  local input="$1"; shift
+  echo "+ $* < $(basename "$input")"
+  [ "$DRY_RUN" = 1 ] || "$@" < "$input"
+}
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+for file in k8s/rbac-write.yaml provision/sudoers.d/sre-agent CLAUDE.md; do
+  mkdir -p "$WORK/$(dirname "$file")"
+  git show "$PRE_CUTOVER_TAG:$file" > "$WORK/$file"
+done
+
+echo "=== 0/4 preflight (read-only) ==="
+for ctx in $CONTEXTS; do
+  run kubectl --context "$ctx" get serviceaccount sre-agent -n kube-system -o name
+done
+run ssh "root@$VM" "id -u sre-agent >/dev/null && test -d $AGENT_DIR"
+
 echo "=== 1/4 RBAC: re-apply sre-agent-write ==="
 for ctx in $CONTEXTS; do
-  run kubectl --context "$ctx" apply -f k8s/rbac-write.yaml
+  run kubectl --context "$ctx" apply -f "$WORK/k8s/rbac-write.yaml"
 done
 
 echo "=== 2/4 sudo: reinstall the drop-in ==="
-run scp provision/sudoers.d/sre-agent "root@$VM:/tmp/sre-agent.sudoers"
-run ssh "root@$VM" "visudo -c -f /tmp/sre-agent.sudoers \
-  && install -m 0440 -o root -g root /tmp/sre-agent.sudoers /etc/sudoers.d/sre-agent \
-  && rm /tmp/sre-agent.sudoers \
-  && usermod -aG sudo sre-agent"
+# Streamed into a fresh mktemp file on the VM: a fixed /tmp path could be pre-planted
+# by the agent's own account between the copy and the install.
+run_with_input "$WORK/provision/sudoers.d/sre-agent" ssh "root@$VM" 'set -e
+f="$(mktemp)"; trap '"'"'rm -f "$f"'"'"' EXIT
+cat > "$f"
+visudo -c -f "$f"
+install -m 0440 -o root -g root "$f" /etc/sudoers.d/sre-agent
+usermod -aG sudo sre-agent'
 
 echo "=== 3/4 CLAUDE.md: restore the $PRE_CUTOVER_TAG version ==="
-CLAUDE_MD="$(mktemp)"
-trap 'rm -f "$CLAUDE_MD"' EXIT
-git show "$PRE_CUTOVER_TAG:CLAUDE.md" > "$CLAUDE_MD"
-run scp "$CLAUDE_MD" "sre-agent@$VM:$AGENT_DIR/CLAUDE.md"
+run scp "$WORK/CLAUDE.md" "sre-agent@$VM:$AGENT_DIR/CLAUDE.md"
 
 echo "=== 4/4 restart the agent ==="
 run ssh "sre-agent@$VM" "pm2 restart sre-agent"
