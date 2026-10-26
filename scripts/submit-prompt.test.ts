@@ -26,6 +26,8 @@ interface Options {
   failCapture?: boolean;
   noUi?: boolean;
   noLand?: boolean;
+  showOther?: boolean;
+  showLiteral?: boolean;
 }
 
 function run(prompt: string, options: Options = {}, attempts = 3, fn = "submit_prompt") {
@@ -47,6 +49,8 @@ function run(prompt: string, options: Options = {}, attempts = 3, fn = "submit_p
     ...(options.failCapture ? { STUB_FAIL_CAPTURE: "1" } : {}),
     ...(options.noUi ? { STUB_NO_UI: "1" } : {}),
     ...(options.noLand ? { STUB_NO_LAND: "1" } : {}),
+    ...(options.showOther ? { STUB_SHOW_OTHER: "1" } : {}),
+    ...(options.showLiteral ? { STUB_SHOW_LITERAL: "1" } : {}),
   };
   const args = fn === "submit_prompt" ? `sre-agent "$PROMPT" ${attempts}` : `sre-agent "$PROMPT"`;
   const result = spawnSync("bash", ["-c", `source scripts/lib/submit-prompt.sh && ${fn} ${args}`], { env, encoding: "utf8" });
@@ -109,6 +113,19 @@ test("fails when the prompt never lands in the input box, without sending Enter"
   assert.equal(result.status, 1);
   assert.match(result.stderr, /never appeared in the input box/);
   assert.equal(result.enters, 0);
+});
+
+test("a short prompt shown as typed (not collapsed) counts as landed", () => {
+  const result = run("ready check", { showLiteral: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.enters, 1);
+});
+
+test("unrelated text in the input box is not mistaken for the prompt", () => {
+  const result = run(PROMPT, { showOther: true });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /never appeared in the input box/);
+  assert.equal(result.enters, 0, "Enter must not submit someone else's text");
 });
 
 test("submit_startup_prompt reports a failure loudly and does not fail the start", () => {

@@ -39,6 +39,17 @@ input_box_text() {
   printf '%s' "$text" | tr -d '[:space:]'
 }
 
+# prompt_landed <box> <prompt>: whether the input box holds this prompt. Claude Code shows
+# a short prompt as typed and collapses a long one into "[Pasted text #1 +48 lines]"
+# (as seen on the VM), so either the prompt's first line or that placeholder counts;
+# any other content, such as text someone else typed, does not.
+prompt_landed() {
+  local box first_line
+  box="$(input_box_text "$1")"
+  first_line="$(printf '%s\n' "$2" | head -n 1 | tr -d '[:space:]')"
+  [[ -n "$first_line" && "$box" == *"$first_line"* ]] || [[ "$box" == *"[Pastedtext#"* ]]
+}
+
 # submit_prompt <tmux-session> <prompt> [attempts]
 submit_prompt() {
   local session="$1" prompt="$2" attempts="${3:-5}" pause="${SUBMIT_PROMPT_PAUSE:-2}" box attempt
@@ -55,9 +66,9 @@ submit_prompt() {
       echo "[start-agent] no Claude Code input box recognised in tmux session ${session}" >&2
       return 1
     fi
-    [ -n "$(input_box_text "$box")" ] && break
+    prompt_landed "$box" "$prompt" && break
   done
-  if [ -z "$(input_box_text "$box")" ]; then
+  if ! prompt_landed "$box" "$prompt"; then
     echo "[start-agent] the startup prompt never appeared in the input box" >&2
     return 1
   fi

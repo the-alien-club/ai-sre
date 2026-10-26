@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Stub tmux for submit-prompt.test.ts. Parses its flags like tmux, logs send-keys calls to
 # $STUB_LOG, and renders a Claude Code input box that holds the typed prompt until
-# $STUB_ENTERS_NEEDED Enters arrive. STUB_FAIL_SEND, STUB_FAIL_CAPTURE, STUB_NO_UI and
-# STUB_NO_LAND make it fail the way a real session can.
+# $STUB_ENTERS_NEEDED Enters arrive, shown as Claude Code's paste placeholder, or as the
+# typed first line with STUB_SHOW_LITERAL. STUB_FAIL_SEND, STUB_FAIL_CAPTURE, STUB_NO_UI,
+# STUB_NO_LAND and STUB_SHOW_OTHER make it fail the way a real session can. Unknown flags
+# are rejected, as real tmux does, so a missing `--` shows up in the tests.
 command="$1"; shift
 target=""; literal=""; keys=()
 while [ $# -gt 0 ]; do
@@ -11,6 +13,7 @@ while [ $# -gt 0 ]; do
     -p) shift;;
     -l) literal=1; shift;;
     --) shift; keys+=("$@"); break;;
+    -*) echo "unknown flag: $1" >&2; exit 2;;
     *) keys+=("$1"); shift;;
   esac
 done
@@ -20,6 +23,7 @@ case "$command" in
     [ -n "$STUB_FAIL_SEND" ] && { echo "send-keys failed" >&2; exit 1; }
     if [ -n "$literal" ]; then
       printf 'type:%s\n' "${keys[0]}" >> "$STUB_LOG"
+      printf '%s' "${keys[0]}" > "$STUB_DIR/typed"
       [ -n "$STUB_NO_LAND" ] || : > "$STUB_DIR/landed"
     else
       printf 'key:%s\n' "${keys[0]}" >> "$STUB_LOG"
@@ -31,7 +35,13 @@ case "$command" in
     if [ -n "$STUB_NO_UI" ]; then echo "something else entirely"; exit 0; fi
     echo "────────────────────────────────"
     if [ -f "$STUB_DIR/landed" ] && [ "$(cat "$STUB_DIR/enters")" -lt "$STUB_ENTERS_NEEDED" ]; then
-      printf '❯ [Pasted text #1 +48 lines]Lab API for recent MRs:\n  - web-app=70690979\n'
+      if [ -n "$STUB_SHOW_OTHER" ]; then
+        printf '❯ someone else was typing here\n'
+      elif [ -n "$STUB_SHOW_LITERAL" ]; then
+        printf '❯ %s\n' "$(head -n 1 "$STUB_DIR/typed")"
+      else
+        printf '❯ [Pasted text #1 +48 lines]Lab API for recent MRs:\n  - web-app=70690979\n'
+      fi
     else
       printf '❯ \n'
     fi
