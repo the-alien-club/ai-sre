@@ -15,12 +15,13 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration (env vars, with sensible defaults) -------------------------
 
 const PORT = parseInt(process.env.SIGNOZ_WEBHOOK_PORT ?? "8788", 10);
 const HOST = process.env.SIGNOZ_WEBHOOK_HOST ?? "0.0.0.0"; // needs to be reachable from SigNoz cloud
-const AUTH_TOKEN = process.env.SIGNOZ_WEBHOOK_TOKEN ?? ""; // shared secret, checked in Authorization header
+const AUTH_TOKEN = requireWebhookToken(process.env, "SIGNOZ_WEBHOOK_TOKEN"); // shared secret, required
 
 // -- Types for Alertmanager-compatible webhook payload ------------------------
 
@@ -180,27 +181,10 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Auth check (if token is configured)
-  // Supports: Bearer token, Basic auth (password = token), or X-Webhook-Token header
-  // SigNoz uses Basic auth via http_config.basic_auth (password field)
-  if (AUTH_TOKEN) {
-    const authHeader = (req.headers.authorization ?? "") as string;
-    let token = "";
-
-    if (authHeader.startsWith("Bearer ")) {
-      token = authHeader.slice(7);
-    } else if (authHeader.startsWith("Basic ")) {
-      const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
-      // Format: "username:password" — password is our token
-      token = decoded.includes(":") ? decoded.split(":").slice(1).join(":") : decoded;
-    } else {
-      token = (req.headers["x-webhook-token"] as string) ?? "";
-    }
-
-    if (token !== AUTH_TOKEN) {
-      respond(res, 401, "unauthorized");
-      return;
-    }
+  // SigNoz sends the secret as the basic-auth password; see webhook-auth.ts
+  if (!isAuthorized(extractPresentedToken(req.headers), AUTH_TOKEN)) {
+    respond(res, 401, "unauthorized");
+    return;
   }
 
   // Parse the webhook payload
@@ -244,8 +228,5 @@ const httpServer = createServer(async (req, res) => {
 
 httpServer.listen(PORT, HOST, () => {
   // Log to stderr (stdout is reserved for MCP stdio transport)
-  console.error(
-    `[signoz-webhook] listening on ${HOST}:${PORT}/alert` +
-      (AUTH_TOKEN ? " (auth enabled)" : " (WARNING: no auth token set)")
-  );
+  console.error(`[signoz-webhook] listening on ${HOST}:${PORT}/alert (auth enabled)`);
 });
