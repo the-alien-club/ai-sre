@@ -13,7 +13,8 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
+import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration ------------------------------------------------------------
@@ -21,6 +22,8 @@ import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webh
 const PORT = parseInt(process.env.TRIVY_WEBHOOK_PORT ?? "8790", 10);
 const HOST = process.env.TRIVY_WEBHOOK_HOST ?? "127.0.0.1"; // loopback: reached through Caddy TLS
 const AUTH_TOKEN = requireWebhookToken(process.env, "TRIVY_WEBHOOK_TOKEN");
+// A VulnerabilityReport for a large image lists every CVE and runs to several MB
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 // Vulnerabilities below this severity are ignored
 const VULN_SEVERITY_THRESHOLD = ["CRITICAL", "HIGH"];
@@ -128,15 +131,6 @@ When you receive these:
 await mcp.connect(new StdioServerTransport());
 
 // -- HTTP helpers -------------------------------------------------------------
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
-    req.on("error", reject);
-  });
-}
 
 function respond(res: ServerResponse, status: number, body: string, contentType = "text/plain") {
   res.writeHead(status, { "Content-Type": contentType });
@@ -262,9 +256,13 @@ const httpServer = createServer(async (req, res) => {
   // lie that narrows the ignore branch to `never`.
   let payload: unknown;
   try {
-    const body = await readBody(req);
+    const body = await readBodyWithLimit(req, MAX_BODY_BYTES);
     payload = JSON.parse(body);
-  } catch {
+  } catch (error) {
+    if (error instanceof RequestBodyTooLarge) {
+      respond(res, 413, "payload too large");
+      return;
+    }
     respond(res, 400, "invalid json");
     return;
   }

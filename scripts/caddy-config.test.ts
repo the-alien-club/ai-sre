@@ -23,12 +23,20 @@ test("the site address is the SRE_AGENT_HOSTNAME variable, not a literal host", 
 });
 
 test("only /alert and /trivy are forwarded, both to loopback", () => {
-  const proxied = [...config.matchAll(/handle (\S+) \{\s*reverse_proxy (\S+)/g)].map((m) => [m[1], m[2]]);
+  const proxied = [...config.matchAll(/handle (\S+) \{[^}]*\}\s*reverse_proxy (\S+)/g)].map((m) => [m[1], m[2]]);
   assert.deepEqual(proxied, [
     ["/alert", "127.0.0.1:{$SIGNOZ_WEBHOOK_PORT:8788}"],
     ["/trivy", "127.0.0.1:{$TRIVY_WEBHOOK_PORT:8790}"],
   ]);
   assert.match(config, /handle \{\s*respond 404/);
+});
+
+test("each proxied path caps the request body", () => {
+  const limits = [...config.matchAll(/handle (\S+) \{\s*request_body \{\s*max_size (\S+)/g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(limits, [
+    ["/alert", "1MB"],
+    ["/trivy", "16MB"],
+  ]);
 });
 
 test("caddy accepts the config", { skip: !hasCaddy && "caddy not installed" }, () => {
