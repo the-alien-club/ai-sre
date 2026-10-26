@@ -34,7 +34,7 @@ tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
 
 # Auto-accept the dev channels prompt
 # Poll tmux pane until we see the prompt, then send Enter
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   sleep 1
   PANE=$(tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null || true)
   if echo "$PANE" | grep -q "I am using this for local development"; then
@@ -49,23 +49,18 @@ for i in $(seq 1 30); do
   fi
 done
 
-# Wait for Claude to fully initialize (MCP servers to start)
-for i in $(seq 1 30); do
-  if ss -tlnp | grep -q 8788; then
-    echo "[start-agent] SigNoz webhook port 8788 bound"
-    break
-  fi
-  sleep 1
-done
-
-# Wait for Trivy webhook port too (channel may take a moment to spawn)
-for i in $(seq 1 15); do
-  if ss -tlnp | grep -q 8790; then
-    echo "[start-agent] Trivy webhook port 8790 bound"
-    break
-  fi
-  sleep 1
-done
+# Wait for the webhook channels to bind. A channel that never binds (missing secret,
+# crash on start) means the agent would go live with no alert ingestion, which is worse
+# than not starting: stop the session and exit non-zero so pm2 restarts and the failure
+# shows up in its logs instead of passing silently.
+# shellcheck source=scripts/lib/wait-for-port.sh
+source "$SRE_DIR/scripts/lib/wait-for-port.sh"
+if ! wait_for_port "SigNoz webhook" "${SIGNOZ_WEBHOOK_PORT:-8788}" 30 \
+  || ! wait_for_port "Trivy webhook" "${TRIVY_WEBHOOK_PORT:-8790}" 15; then
+  tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+  echo "[start-agent] a webhook channel did not start; check the channel's stderr in the tmux log" >&2
+  exit 1
+fi
 
 # Initialize incident database if needed
 mkdir -p "$SRE_DIR/data"
