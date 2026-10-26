@@ -13,13 +13,18 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
+import { requireLoopbackHost } from "./bind-address.js";
+import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
+import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration ------------------------------------------------------------
 
 const PORT = parseInt(process.env.TRIVY_WEBHOOK_PORT ?? "8790", 10);
-const HOST = process.env.TRIVY_WEBHOOK_HOST ?? "0.0.0.0";
-const AUTH_TOKEN = process.env.TRIVY_WEBHOOK_TOKEN ?? "";
+const HOST = requireLoopbackHost(process.env, "TRIVY_WEBHOOK_HOST"); // reached only through Caddy TLS
+const AUTH_TOKEN = requireWebhookToken(process.env, "TRIVY_WEBHOOK_TOKEN");
+// A VulnerabilityReport for a large image lists every CVE and runs to several MB
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 // Vulnerabilities below this severity are ignored
 const VULN_SEVERITY_THRESHOLD = ["CRITICAL", "HIGH"];
@@ -127,15 +132,6 @@ When you receive these:
 await mcp.connect(new StdioServerTransport());
 
 // -- HTTP helpers -------------------------------------------------------------
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
-    req.on("error", reject);
-  });
-}
 
 function respond(res: ServerResponse, status: number, body: string, contentType = "text/plain") {
   res.writeHead(status, { "Content-Type": contentType });
@@ -251,22 +247,9 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Auth check (Bearer or Basic)
-  if (AUTH_TOKEN) {
-    const authHeader = (req.headers.authorization ?? "") as string;
-    let token = "";
-    if (authHeader.startsWith("Bearer ")) {
-      token = authHeader.slice(7);
-    } else if (authHeader.startsWith("Basic ")) {
-      const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
-      token = decoded.includes(":") ? decoded.split(":").slice(1).join(":") : decoded;
-    } else {
-      token = (req.headers["x-webhook-token"] as string) ?? "";
-    }
-    if (token !== AUTH_TOKEN) {
-      respond(res, 401, "unauthorized");
-      return;
-    }
+  if (!isAuthorized(extractPresentedToken(req.headers), AUTH_TOKEN)) {
+    respond(res, 401, "unauthorized");
+    return;
   }
 
   // The operator posts several report kinds, so the body is genuinely unknown until
@@ -274,9 +257,13 @@ const httpServer = createServer(async (req, res) => {
   // lie that narrows the ignore branch to `never`.
   let payload: unknown;
   try {
-    const body = await readBody(req);
+    const body = await readBodyWithLimit(req, MAX_BODY_BYTES);
     payload = JSON.parse(body);
-  } catch {
+  } catch (error) {
+    if (error instanceof RequestBodyTooLarge) {
+      respond(res, 413, "payload too large");
+      return;
+    }
     respond(res, 400, "invalid json");
     return;
   }
@@ -319,8 +306,5 @@ const httpServer = createServer(async (req, res) => {
 });
 
 httpServer.listen(PORT, HOST, () => {
-  console.error(
-    `[trivy-webhook] listening on ${HOST}:${PORT}/trivy` +
-      (AUTH_TOKEN ? " (auth enabled)" : " (WARNING: no auth token set)")
-  );
+  console.error(`[trivy-webhook] listening on ${HOST}:${PORT}/trivy (auth enabled)`);
 });

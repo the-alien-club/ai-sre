@@ -14,13 +14,18 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
+import { requireLoopbackHost } from "./bind-address.js";
+import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
+import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration (env vars, with sensible defaults) -------------------------
 
 const PORT = parseInt(process.env.SIGNOZ_WEBHOOK_PORT ?? "8788", 10);
-const HOST = process.env.SIGNOZ_WEBHOOK_HOST ?? "0.0.0.0"; // needs to be reachable from SigNoz cloud
-const AUTH_TOKEN = process.env.SIGNOZ_WEBHOOK_TOKEN ?? ""; // shared secret, checked in Authorization header
+const HOST = requireLoopbackHost(process.env, "SIGNOZ_WEBHOOK_HOST"); // reached only through Caddy TLS
+const AUTH_TOKEN = requireWebhookToken(process.env, "SIGNOZ_WEBHOOK_TOKEN"); // shared secret, required
+// An Alertmanager payload carries a handful of alerts; 1 MiB is far beyond any real one
+const MAX_BODY_BYTES = 1024 * 1024;
 
 // -- Types for Alertmanager-compatible webhook payload ------------------------
 
@@ -149,15 +154,6 @@ function extractMeta(alert: AlertmanagerAlert, groupStatus: string): Record<stri
 
 // -- HTTP helpers for Node.js -------------------------------------------------
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
-    req.on("error", reject);
-  });
-}
-
 function respond(res: ServerResponse, status: number, body: string, contentType = "text/plain") {
   res.writeHead(status, { "Content-Type": contentType });
   res.end(body);
@@ -180,35 +176,22 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Auth check (if token is configured)
-  // Supports: Bearer token, Basic auth (password = token), or X-Webhook-Token header
-  // SigNoz uses Basic auth via http_config.basic_auth (password field)
-  if (AUTH_TOKEN) {
-    const authHeader = (req.headers.authorization ?? "") as string;
-    let token = "";
-
-    if (authHeader.startsWith("Bearer ")) {
-      token = authHeader.slice(7);
-    } else if (authHeader.startsWith("Basic ")) {
-      const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
-      // Format: "username:password" — password is our token
-      token = decoded.includes(":") ? decoded.split(":").slice(1).join(":") : decoded;
-    } else {
-      token = (req.headers["x-webhook-token"] as string) ?? "";
-    }
-
-    if (token !== AUTH_TOKEN) {
-      respond(res, 401, "unauthorized");
-      return;
-    }
+  // SigNoz sends the secret as the basic-auth password; see webhook-auth.ts
+  if (!isAuthorized(extractPresentedToken(req.headers), AUTH_TOKEN)) {
+    respond(res, 401, "unauthorized");
+    return;
   }
 
   // Parse the webhook payload
   let payload: AlertmanagerPayload;
   try {
-    const body = await readBody(req);
+    const body = await readBodyWithLimit(req, MAX_BODY_BYTES);
     payload = JSON.parse(body) as AlertmanagerPayload;
-  } catch {
+  } catch (error) {
+    if (error instanceof RequestBodyTooLarge) {
+      respond(res, 413, "payload too large");
+      return;
+    }
     respond(res, 400, "invalid json");
     return;
   }
@@ -244,8 +227,5 @@ const httpServer = createServer(async (req, res) => {
 
 httpServer.listen(PORT, HOST, () => {
   // Log to stderr (stdout is reserved for MCP stdio transport)
-  console.error(
-    `[signoz-webhook] listening on ${HOST}:${PORT}/alert` +
-      (AUTH_TOKEN ? " (auth enabled)" : " (WARNING: no auth token set)")
-  );
+  console.error(`[signoz-webhook] listening on ${HOST}:${PORT}/alert (auth enabled)`);
 });

@@ -14,7 +14,38 @@
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DB="$SCRIPT_DIR/../data/incidents.db"
+# INCIDENTS_DB exists so the tests can point at a scratch database; production uses the default
+DB="${INCIDENTS_DB:-$SCRIPT_DIR/../data/incidents.db}"
+
+# Every value reaching SQL goes through one of these two helpers, never string interpolation.
+# Arguments come from alert labels and sub-agent output, so they are attacker-influenced:
+# a fingerprint or cluster name containing a quote used to be able to rewrite the query.
+
+# Encode text as a hex blob literal cast back to TEXT. The literal can only contain
+# [0-9a-f], so no input can terminate it, whatever quotes or semicolons it carries.
+sql_text() {
+    printf "CAST(X'%s' AS TEXT)" "$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')"
+}
+
+# Validate a non-negative integer argument; anything else is a usage error, not a default.
+# At most 9 digits: every count, id and day window fits, and SQLite never sees an
+# integer large enough to overflow or turn into a float.
+sql_int() {
+    local name="$1" value="$2"
+    if [[ ! "$value" =~ ^[0-9]{1,9}$ ]]; then
+        echo "Invalid $name: expected a non-negative integer of at most 9 digits, got '$value'" >&2
+        exit 1
+    fi
+    printf '%s' "$value"
+}
+
+# Run SQL read from stdin against the database. The statement never travels as a
+# command-line argument: hex-encoded values double its size, and a long cause or note
+# would otherwise hit the kernel's argument length limit ("Argument list too long").
+# -bail makes any SQL error a non-zero exit.
+sql_run() {
+    sqlite3 -bail "$@" "$DB"
+}
 
 # Ensure DB exists
 mkdir -p "$(dirname "$DB")"
@@ -55,7 +86,12 @@ case "$CMD" in
             exit 1
         fi
 
-        sqlite3 "$DB" "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ('$(echo "$ALERT" | sed "s/'/''/g")', '${FP}', '${SEVERITY}', '${STATUS:-firing}', '${CLUSTER}', '${NAMESPACE}', '${SERVICE}', '${VERDICT}', '${ACTION}', '$(echo "$CAUSE" | sed "s/'/''/g")', '$(echo "$RESOLUTION" | sed "s/'/''/g")', '${RELATED_MR}', '$(echo "$NOTES" | sed "s/'/''/g")', ${DURATION:-NULL});"
+        DURATION_SQL="NULL"
+        if [ -n "$DURATION" ]; then
+            DURATION_SQL="$(sql_int --duration "$DURATION")" || exit 1
+        fi
+
+        sql_run <<< "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ($(sql_text "$ALERT"), $(sql_text "$FP"), $(sql_text "$SEVERITY"), $(sql_text "${STATUS:-firing}"), $(sql_text "$CLUSTER"), $(sql_text "$NAMESPACE"), $(sql_text "$SERVICE"), $(sql_text "$VERDICT"), $(sql_text "$ACTION"), $(sql_text "$CAUSE"), $(sql_text "$RESOLUTION"), $(sql_text "$RELATED_MR"), $(sql_text "$NOTES"), ${DURATION_SQL});" || exit 1
 
         echo "Incident logged: $ALERT ($VERDICT → $ACTION)"
         ;;
@@ -72,10 +108,11 @@ case "$CMD" in
             esac
         done
 
-        WHERE="alert_name = '$(echo "$ALERT" | sed "s/'/''/g")' AND created_at > datetime('now', '-${DAYS} days')"
-        [ -n "$CLUSTER" ] && WHERE="$WHERE AND cluster = '$CLUSTER'"
+        DAYS="$(sql_int --days "$DAYS")" || exit 1
+        WHERE="alert_name = $(sql_text "$ALERT") AND created_at > datetime('now', '-${DAYS} days')"
+        [ -n "$CLUSTER" ] && WHERE="$WHERE AND cluster = $(sql_text "$CLUSTER")"
 
-        sqlite3 -header -column "$DB" "SELECT created_at, verdict, action, cause, resolution FROM incidents WHERE $WHERE ORDER BY created_at DESC LIMIT 10;"
+        sql_run -header -column <<< "SELECT created_at, verdict, action, cause, resolution FROM incidents WHERE $WHERE ORDER BY created_at DESC LIMIT 10;"
         ;;
 
     fingerprint)
@@ -88,39 +125,41 @@ case "$CMD" in
             esac
         done
 
-        sqlite3 -header -column "$DB" "SELECT created_at, alert_name, verdict, action, cause FROM incidents WHERE fingerprint = '$FP' ORDER BY created_at DESC LIMIT 5;"
+        sql_run -header -column <<< "SELECT created_at, alert_name, verdict, action, cause FROM incidents WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at DESC LIMIT 5;"
         ;;
 
     patterns)
         # Show recurring patterns from the last N days
         DAYS=7
         [ "${1:-}" = "--days" ] && DAYS="$2"
+        DAYS="$(sql_int --days "$DAYS")" || exit 1
 
         echo "=== Recurring Alerts (last ${DAYS} days) ==="
-        sqlite3 -header -column "$DB" "SELECT alert_name, cluster, service, COUNT(*) as fires, SUM(CASE WHEN verdict IN ('noise','false_positive','known_issue') THEN 1 ELSE 0 END) as noise, SUM(CASE WHEN verdict = 'real' THEN 1 ELSE 0 END) as real, SUM(CASE WHEN action = 'escalated' THEN 1 ELSE 0 END) as escalated, MAX(created_at) as last_seen FROM incidents WHERE created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, cluster, service HAVING COUNT(*) > 1 ORDER BY fires DESC;"
+        sql_run -header -column <<< "SELECT alert_name, cluster, service, COUNT(*) as fires, SUM(CASE WHEN verdict IN ('noise','false_positive','known_issue') THEN 1 ELSE 0 END) as noise, SUM(CASE WHEN verdict = 'real' THEN 1 ELSE 0 END) as real, SUM(CASE WHEN action = 'escalated' THEN 1 ELSE 0 END) as escalated, MAX(created_at) as last_seen FROM incidents WHERE created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, cluster, service HAVING COUNT(*) > 1 ORDER BY fires DESC;"
 
         echo ""
         echo "=== Pending Escalations ==="
-        sqlite3 -header -column "$DB" "SELECT id, created_at, alert_name, cluster, cause FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days') ORDER BY created_at DESC;"
+        sql_run -header -column <<< "SELECT id, created_at, alert_name, cluster, cause FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days') ORDER BY created_at DESC;"
         ;;
 
     briefing)
         # Generate a startup briefing for the main agent
         DAYS=7
         [ "${1:-}" = "--days" ] && DAYS="$2"
+        DAYS="$(sql_int --days "$DAYS")" || exit 1
 
-        TOTAL=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE created_at > datetime('now', '-${DAYS} days');")
-        NOISE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days');")
-        REAL=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE verdict = 'real' AND created_at > datetime('now', '-${DAYS} days');")
-        FIXED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE action = 'auto_fixed' AND created_at > datetime('now', '-${DAYS} days');")
-        ESCALATED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE action = 'escalated' AND created_at > datetime('now', '-${DAYS} days');")
+        TOTAL=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE created_at > datetime('now', '-${DAYS} days');")
+        NOISE=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days');")
+        REAL=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE verdict = 'real' AND created_at > datetime('now', '-${DAYS} days');")
+        FIXED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE action = 'auto_fixed' AND created_at > datetime('now', '-${DAYS} days');")
+        ESCALATED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE action = 'escalated' AND created_at > datetime('now', '-${DAYS} days');")
 
         echo "=== SRE Briefing — Last ${DAYS} Days ==="
         echo "Total: ${TOTAL} alerts processed | ${NOISE} noise | ${REAL} real | ${FIXED} auto-fixed | ${ESCALATED} escalated"
         echo ""
 
         # Recurring noise
-        RECURRING=$(sqlite3 -separator ' | ' "$DB" "SELECT alert_name || ' on ' || COALESCE(service, cluster, '?'), COUNT(*) || 'x' FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, service, cluster HAVING COUNT(*) >= 3 ORDER BY COUNT(*) DESC;")
+        RECURRING=$(sql_run -separator ' | ' <<< "SELECT alert_name || ' on ' || COALESCE(service, cluster, '?'), COUNT(*) || 'x' FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, service, cluster HAVING COUNT(*) >= 3 ORDER BY COUNT(*) DESC;")
         if [ -n "$RECURRING" ]; then
             echo "Recurring noise (consider tuning):"
             echo "$RECURRING" | while read -r line; do echo "  - $line"; done
@@ -128,7 +167,7 @@ case "$CMD" in
         fi
 
         # Recent real incidents
-        REAL_INCIDENTS=$(sqlite3 -separator '' "$DB" "SELECT '[' || date(created_at) || '] ' || alert_name || ' on ' || COALESCE(service, cluster, '?') || ' — ' || action || CASE WHEN cause IS NOT NULL AND cause != '' THEN ': ' || cause ELSE '' END FROM incidents WHERE verdict = 'real' AND created_at > datetime('now', '-${DAYS} days') ORDER BY created_at DESC LIMIT 10;")
+        REAL_INCIDENTS=$(sql_run -separator '' <<< "SELECT '[' || date(created_at) || '] ' || alert_name || ' on ' || COALESCE(service, cluster, '?') || ' — ' || action || CASE WHEN cause IS NOT NULL AND cause != '' THEN ': ' || cause ELSE '' END FROM incidents WHERE verdict = 'real' AND created_at > datetime('now', '-${DAYS} days') ORDER BY created_at DESC LIMIT 10;")
         if [ -n "$REAL_INCIDENTS" ]; then
             echo "Recent real incidents:"
             echo "$REAL_INCIDENTS" | while read -r line; do echo "  - $line"; done
@@ -136,14 +175,18 @@ case "$CMD" in
         fi
 
         # Pending escalations
-        PENDING=$(sqlite3 -separator '' "$DB" "SELECT '[' || date(created_at) || '] ' || alert_name || ' on ' || COALESCE(cluster, '?') || ' — ' || COALESCE(cause, 'unknown cause') FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days') ORDER BY created_at DESC;")
+        PENDING=$(sql_run -separator '' <<< "SELECT '[' || date(created_at) || '] ' || alert_name || ' on ' || COALESCE(cluster, '?') || ' — ' || COALESCE(cause, 'unknown cause') FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days') ORDER BY created_at DESC;")
         if [ -n "$PENDING" ]; then
             echo "Pending escalations (unacknowledged):"
             echo "$PENDING" | while read -r line; do echo "  - $line"; done
             echo ""
         fi
 
-        [ "$TOTAL" = "0" ] && echo "No incidents recorded yet. Fresh start."
+        # An if, not `[ ... ] && echo`: as the last command that form made briefing exit 1
+        # whenever incidents existed, and start-agent.sh then appended its failure fallback
+        if [ "$TOTAL" = "0" ]; then
+            echo "No incidents recorded yet. Fresh start."
+        fi
         ;;
 
     context)
@@ -165,7 +208,12 @@ case "$CMD" in
             exit 1
         fi
 
-        sqlite3 "$DB" "INSERT INTO incident_context (fingerprint, incident_id, author, phase, content) VALUES ('$FP', ${INCIDENT_ID:-NULL}, '$AUTHOR', '$PHASE', '$(echo "$CONTENT" | sed "s/'/''/g")');"
+        INCIDENT_ID_SQL="NULL"
+        if [ -n "$INCIDENT_ID" ]; then
+            INCIDENT_ID_SQL="$(sql_int --incident-id "$INCIDENT_ID")" || exit 1
+        fi
+
+        sql_run <<< "INSERT INTO incident_context (fingerprint, incident_id, author, phase, content) VALUES ($(sql_text "$FP"), ${INCIDENT_ID_SQL}, $(sql_text "$AUTHOR"), $(sql_text "$PHASE"), $(sql_text "$CONTENT"));" || exit 1
         echo "Context saved: [$PHASE] for $FP"
         ;;
 
@@ -189,11 +237,11 @@ case "$CMD" in
 
         # Incident log entries
         echo "--- Incident Log ---"
-        sqlite3 -header -column "$DB" "SELECT id, created_at, alert_name, severity, verdict, action, cause, resolution FROM incidents WHERE fingerprint = '$FP' ORDER BY created_at;"
+        sql_run -header -column <<< "SELECT id, created_at, alert_name, severity, verdict, action, cause, resolution FROM incidents WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at;"
 
         echo ""
         echo "--- Investigation Context ---"
-        sqlite3 -separator '' "$DB" "SELECT '[' || created_at || '] [' || phase || '] (' || author || ') ' || content FROM incident_context WHERE fingerprint = '$FP' ORDER BY created_at;"
+        sql_run -separator '' <<< "SELECT '[' || created_at || '] [' || phase || '] (' || author || ') ' || content FROM incident_context WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at;"
         ;;
 
     resolve)
@@ -207,7 +255,17 @@ case "$CMD" in
             esac
         done
 
-        sqlite3 "$DB" "UPDATE incidents SET escalation_acknowledged = 1, resolution = '$(echo "$RESOLUTION" | sed "s/'/''/g")' WHERE id = $ID;"
+        if [ -z "$ID" ]; then
+            echo "Required: --id"
+            exit 1
+        fi
+        ID="$(sql_int --id "$ID")" || exit 1
+
+        UPDATED="$(sql_run <<< "UPDATE incidents SET escalation_acknowledged = 1, resolution = $(sql_text "$RESOLUTION") WHERE id = ${ID}; SELECT changes();")" || exit 1
+        if [ "$UPDATED" != "1" ]; then
+            echo "No incident with id $ID; nothing resolved" >&2
+            exit 1
+        fi
         echo "Incident $ID marked as resolved."
         ;;
 

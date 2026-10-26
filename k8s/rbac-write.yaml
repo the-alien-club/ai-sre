@@ -1,0 +1,46 @@
+# SRE agent RBAC, write side — the four narrow permissions behind the agent's safe ops.
+#
+# Split out of rbac.yaml so the write access can be granted and withdrawn on its own:
+#   - today: applied alongside rbac.yaml (write side first), so the agent keeps the
+#     auto-fixes listed under "Safe Operations" in CLAUDE.md
+#   - cutover: once every safe op runs through the Rundeck executor and its checks pass,
+#     this binding is deleted and the agent is left read-only
+#   - rollback: `make rollback-write-access` re-applies this file
+#
+# Every rule here must match an entry in CLAUDE.md "Safe Operations", and nothing that
+# CLAUDE.md lists as FORBIDDEN may ever be granted (no delete on applications,
+# namespaces, PVCs or secrets; no create).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-agent-write
+rules:
+  # Rollout restart (kubectl rollout restart patches the pod template annotation)
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["patch"]
+  # Restart a single stuck pod (its controller recreates it)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  # Clear a stuck or failed pipeline workflow
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows"]
+    verbs: ["delete"]
+  # ArgoCD: hard refresh, clear a stuck operation, toggle auto-sync
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-agent-write
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-agent-write
+subjects:
+  - kind: ServiceAccount
+    name: sre-agent
+    namespace: kube-system

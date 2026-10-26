@@ -1,13 +1,13 @@
 {
   "name": "sre-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev:signoz": "bun run channels/signoz-webhook.ts",
     "dev:slack": "bun run channels/slack-sre.ts",
     "typecheck": "tsc",
-    "test": "node --import tsx --test channels/**/*.test.ts"
+    "test": "node --import tsx --test channels/**/*.test.ts scripts/**/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
@@ -18,6 +18,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.21.0",
-    "typescript": "5.7"
+    "typescript": "5.7",
+    "yaml": "^2.8.1"
   }
 }

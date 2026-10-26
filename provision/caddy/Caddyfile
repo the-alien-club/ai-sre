@@ -1,0 +1,32 @@
+# TLS front door for the webhook channels.
+#
+# SigNoz and the Trivy operator used to post to http://<bare IP>:8788 and :8790, so the
+# webhook secret and every alert payload crossed the internet in cleartext. Caddy
+# terminates TLS for SRE_AGENT_HOSTNAME with an automatically renewed certificate and
+# forwards to the channels, which bind to loopback by default.
+#
+# The hostname is an environment variable so this file does not hard-code a deployment.
+# Production: SRE_AGENT_HOSTNAME=sre-agent.internal.alien.club (A record to the VM).
+#
+# Install: see INSTALL.md §8b. Validate: caddy validate --config Caddyfile
+
+{$SRE_AGENT_HOSTNAME} {
+	# Body limits match the channels' own (request-body.ts): an alert payload is small, a
+	# Trivy VulnerabilityReport for a large image runs to several MB
+	handle /alert {
+		request_body {
+			max_size 1MiB
+		}
+		reverse_proxy 127.0.0.1:{$SIGNOZ_WEBHOOK_PORT:8788}
+	}
+	handle /trivy {
+		request_body {
+			max_size 16MiB
+		}
+		reverse_proxy 127.0.0.1:{$TRIVY_WEBHOOK_PORT:8790}
+	}
+	# The channels' own /health stays on loopback; nothing else is exposed
+	handle {
+		respond 404
+	}
+}

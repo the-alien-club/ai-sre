@@ -26,11 +26,14 @@ scw instance server action server-id=<server-id> action=poweron zone=fr-par-1
 ## 2. Create the `sre-agent` user
 
 ```bash
+scp provision/sudoers.d/sre-agent root@$SRE_IP:/tmp/sre-agent.sudoers
 ssh root@$SRE_IP
 
 useradd -m -s /bin/bash sre-agent
 usermod -aG sudo sre-agent
-echo "sre-agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sre-agent
+visudo -c -f /tmp/sre-agent.sudoers
+install -m 0440 -o root -g root /tmp/sre-agent.sudoers /etc/sudoers.d/sre-agent
+rm /tmp/sre-agent.sudoers
 
 mkdir -p /home/sre-agent/.ssh
 cp /root/.ssh/authorized_keys /home/sre-agent/.ssh/
@@ -156,9 +159,10 @@ done
 The agent should NOT have cluster-admin access. Create a scoped ServiceAccount on each cluster.
 
 ```bash
-# From a machine with admin kubeconfigs, apply the RBAC manifest to each cluster.
-# The manifest is k8s/rbac.yaml in this repo — it is the source of truth for the
-# agent's permissions. Edit it there, commit, then re-apply to all clusters.
+# From a machine with admin kubeconfigs, apply the RBAC manifests to each cluster.
+# k8s/rbac.yaml (read) and k8s/rbac-write.yaml (safe-op writes) in this repo are the
+# source of truth for the agent's permissions. Edit them there, commit, then re-apply
+# to all clusters. Apply the write side first so the agent never loses its safe ops.
 
 CLUSTERS=(
   "14c4e1e4-...:platform-dev"
@@ -172,21 +176,27 @@ for entry in "${CLUSTERS[@]}"; do
   ID="${entry%%:*}"; NAME="${entry##*:}"
   KUBECONFIG_PATH="/tmp/$NAME.yaml"
   scw k8s kubeconfig get "$ID" region=fr-par > "$KUBECONFIG_PATH"
+  KUBECONFIG="$KUBECONFIG_PATH" kubectl apply -f k8s/rbac-write.yaml
   KUBECONFIG="$KUBECONFIG_PATH" kubectl apply -f k8s/rbac.yaml
 done
 ```
 
-The RBAC manifest ([k8s/rbac.yaml](k8s/rbac.yaml)) creates:
+The read manifest ([k8s/rbac.yaml](k8s/rbac.yaml)) creates:
 - ServiceAccount `sre-agent` in `kube-system`
 - ClusterRole `sre-agent` — an **explicit read allowlist**, NOT "read all". It covers core
   resources, workloads, HPAs, KEDA, Argo Workflows, ArgoCD Applications, batch, networking,
   policy, storage classes, cert-manager, metrics, external-secrets, and Skupper. Secrets are
-  list-only (metadata, never values). Write access is limited to: patch deployments (rollout
-  restart), delete pods, delete workflows, patch ArgoCD Applications (refresh / clear stuck op).
+  list-only (metadata, never values). It grants no write verbs.
   If the agent reports "my ServiceAccount doesn't have RBAC to read X", the resource is missing
   from the allowlist — add it to k8s/rbac.yaml and re-apply to all 5 clusters.
 - ClusterRoleBinding
 - Long-lived token Secret (`sre-agent-token`)
+
+The write manifest ([k8s/rbac-write.yaml](k8s/rbac-write.yaml)) creates ClusterRole and
+ClusterRoleBinding `sre-agent-write`, limited to: patch deployments (rollout restart), delete
+pods, delete workflows, patch ArgoCD Applications (refresh / clear stuck op). It is kept
+separate so it can be withdrawn once the Rundeck executor runs the safe ops, and restored with
+`make rollback-write-access`.
 
 Then generate scoped kubeconfigs using each SA token, merge them, and copy to the VM:
 
@@ -234,7 +244,10 @@ channel, invite the bot by hand: `/invite @claude_sre` in the channel.
 cd ~/sre-agent
 cp .env.example .env
 # Edit with real values:
-# SIGNOZ_WEBHOOK_TOKEN: generate with `openssl rand -hex 32`
+# SIGNOZ_WEBHOOK_TOKEN: generate with `openssl rand -hex 32` (required, the channel will not start without it)
+# TRIVY_WEBHOOK_TOKEN: generate with `openssl rand -hex 32` (required, same rule)
+# SIGNOZ_URL / SIGNOZ_TOKEN: SigNoz cloud URL and API key for the SigNoz MCP server.
+#   .mcp.json references them as ${SIGNOZ_URL} / ${SIGNOZ_TOKEN}; do not edit .mcp.json.
 # SLACK_BOT_TOKEN: from step 6
 # SLACK_APP_TOKEN: from step 6
 # SRE_SLACK_CHANNEL: from step 6 — the channel the agent lives in
@@ -308,6 +321,49 @@ claude auth login
 # Follow the OAuth flow in browser
 ```
 
+## 9b. Put TLS in front of the webhooks (Caddy)
+
+The webhook channels must not be reachable in cleartext: the shared secret and every
+alert payload travel in each request. Caddy terminates TLS for the agent's hostname and
+forwards `/alert` and `/trivy` to the channels, which listen on loopback only.
+
+```bash
+# DNS first: an A record for the hostname pointing at the VM (prod: sre-agent.internal.alien.club)
+export SRE_AGENT_HOSTNAME=sre-agent.internal.alien.club
+
+# Install Caddy from its official apt repository
+sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update -qq && sudo apt-get install -y -qq caddy
+
+# Config from this repo; the hostname comes from the service environment
+sudo install -m 0644 provision/caddy/Caddyfile /etc/caddy/Caddyfile
+sudo mkdir -p /etc/systemd/system/caddy.service.d
+printf '[Service]\nEnvironment=SRE_AGENT_HOSTNAME=%s\n' "$SRE_AGENT_HOSTNAME" \
+  | sudo tee /etc/systemd/system/caddy.service.d/hostname.conf
+sudo systemctl daemon-reload && sudo systemctl restart caddy
+SRE_AGENT_HOSTNAME=$SRE_AGENT_HOSTNAME caddy validate --config /etc/caddy/Caddyfile
+```
+
+The channels bind to loopback by default (`SIGNOZ_WEBHOOK_HOST` / `TRIVY_WEBHOOK_HOST`
+default to `127.0.0.1`), so once the agent restarts they are reachable only through Caddy.
+They **refuse to start** if either variable is set to anything other than `127.0.0.1`,
+`::1` or `localhost`, including an empty value, and `start-agent.sh` then exits non-zero.
+
+**Migrating an existing VM:** a `.env` copied from the old example sets
+`SIGNOZ_WEBHOOK_HOST=0.0.0.0` and `TRIVY_WEBHOOK_HOST=0.0.0.0` explicitly. Before deploying
+this version, change both to `127.0.0.1` or delete the two lines:
+
+```bash
+sed -i -E 's/^(SIGNOZ|TRIVY)_WEBHOOK_HOST=.*/\1_WEBHOOK_HOST=127.0.0.1/' ~/sre-agent/.env
+grep -E '^(SIGNOZ|TRIVY)_WEBHOOK_HOST=' ~/sre-agent/.env
+```
+
+In the Scaleway security group, allow 80 (ACME challenge) and 443 inbound, and remove
+8788 and 8790. Point SigNoz at `https://$SRE_AGENT_HOSTNAME/alert` (§10) and the Trivy
+operator at `https://$SRE_AGENT_HOSTNAME/trivy`.
+
 ## 10. Create SigNoz webhook channel
 
 ```bash
@@ -323,7 +379,7 @@ curl -s "$SIGNOZ_URL/api/v1/channels" \
     "name": "SRE Agent",
     "webhook_configs": [{
       "send_resolved": true,
-      "url": "http://'"$SRE_IP"':8788/alert",
+      "url": "https://'"$SRE_AGENT_HOSTNAME"'/alert",
       "http_config": {
         "basic_auth": {
           "password": "'"$WEBHOOK_TOKEN"'"
@@ -370,7 +426,7 @@ ss -tlnp | grep 8788
 tmux capture-pane -t sre-agent -p | tail -20
 
 # Send a test alert
-curl -s -X POST "http://$SRE_IP:8788/alert" \
+curl -s -X POST "https://$SRE_AGENT_HOSTNAME/alert" \
   -H "Content-Type: application/json" \
   -H "Authorization: Basic $(printf ':%s' "$WEBHOOK_TOKEN" | base64 -w0)" \
   -d '{"status":"firing","receiver":"test","alerts":[{"status":"firing","labels":{"alertname":"Test","severity":"info"},"annotations":{"summary":"install verification"},"startsAt":"2026-01-01T00:00:00Z","endsAt":"0001-01-01T00:00:00Z","fingerprint":"install-test"}],"groupLabels":{},"commonLabels":{},"commonAnnotations":{},"version":"4"}'
