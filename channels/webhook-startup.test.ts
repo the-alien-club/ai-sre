@@ -29,3 +29,19 @@ for (const { script, variable } of CHANNELS) {
     assert.doesNotMatch(result.stderr, /listening on/);
   });
 }
+
+for (const { script, variable } of CHANNELS) {
+  const hostVariable = variable.replace("_TOKEN", "_HOST");
+  for (const host of ["0.0.0.0", ""]) {
+    test(`${script} refuses to start with ${hostVariable}=${JSON.stringify(host)}`, () => {
+      const result = spawnSync(process.execPath, ["--import", "tsx", script], {
+        env: { ...process.env, [variable]: "a-configured-secret", [hostVariable]: host },
+        encoding: "utf8",
+        timeout: 15_000,
+      });
+      assert.notEqual(result.status, 0, "channel must exit non-zero");
+      assert.match(result.stderr, /is not a loopback address/);
+      assert.doesNotMatch(result.stderr, /listening on/);
+    });
+  }
+}

@@ -15,13 +15,14 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer, type ServerResponse } from "node:http";
+import { requireLoopbackHost } from "./bind-address.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration (env vars, with sensible defaults) -------------------------
 
 const PORT = parseInt(process.env.SIGNOZ_WEBHOOK_PORT ?? "8788", 10);
-const HOST = process.env.SIGNOZ_WEBHOOK_HOST ?? "127.0.0.1"; // loopback: SigNoz reaches it through Caddy TLS
+const HOST = requireLoopbackHost(process.env, "SIGNOZ_WEBHOOK_HOST"); // reached only through Caddy TLS
 const AUTH_TOKEN = requireWebhookToken(process.env, "SIGNOZ_WEBHOOK_TOKEN"); // shared secret, required
 // An Alertmanager payload carries a handful of alerts; 1 MiB is far beyond any real one
 const MAX_BODY_BYTES = 1024 * 1024;

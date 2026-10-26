@@ -348,7 +348,17 @@ SRE_AGENT_HOSTNAME=$SRE_AGENT_HOSTNAME caddy validate --config /etc/caddy/Caddyf
 
 The channels bind to loopback by default (`SIGNOZ_WEBHOOK_HOST` / `TRIVY_WEBHOOK_HOST`
 default to `127.0.0.1`), so once the agent restarts they are reachable only through Caddy.
-Do not set either to a public address.
+They **refuse to start** if either variable is set to anything other than `127.0.0.1`,
+`::1` or `localhost`, including an empty value, and `start-agent.sh` then exits non-zero.
+
+**Migrating an existing VM:** a `.env` copied from the old example sets
+`SIGNOZ_WEBHOOK_HOST=0.0.0.0` and `TRIVY_WEBHOOK_HOST=0.0.0.0` explicitly. Before deploying
+this version, change both to `127.0.0.1` or delete the two lines:
+
+```bash
+sed -i -E 's/^(SIGNOZ|TRIVY)_WEBHOOK_HOST=.*/\1_WEBHOOK_HOST=127.0.0.1/' ~/sre-agent/.env
+grep -E '^(SIGNOZ|TRIVY)_WEBHOOK_HOST=' ~/sre-agent/.env
+```
 
 In the Scaleway security group, allow 80 (ACME challenge) and 443 inbound, and remove
 8788 and 8790. Point SigNoz at `https://$SRE_AGENT_HOSTNAME/alert` (§10) and the Trivy

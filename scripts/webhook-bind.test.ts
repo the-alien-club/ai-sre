@@ -24,12 +24,12 @@ test("the pm2 config defaults both channels to loopback", () => {
   }
 });
 
-test("each channel defaults to loopback when the variable is unset", () => {
+test("each channel enforces the loopback policy on its bind host", () => {
   for (const [script, variable] of [
     ["channels/signoz-webhook.ts", "SIGNOZ_WEBHOOK_HOST"],
     ["channels/trivy-webhook.ts", "TRIVY_WEBHOOK_HOST"],
   ]) {
-    assert.match(readFileSync(script, "utf8"), new RegExp(`process\\.env\\.${variable} \\?\\? "127\\.0\\.0\\.1"`));
+    assert.match(readFileSync(script, "utf8"), new RegExp(`requireLoopbackHost\\(process\\.env, "${variable}"\\)`));
   }
 });
 

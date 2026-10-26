@@ -14,13 +14,14 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer, type ServerResponse } from "node:http";
+import { requireLoopbackHost } from "./bind-address.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration ------------------------------------------------------------
 
 const PORT = parseInt(process.env.TRIVY_WEBHOOK_PORT ?? "8790", 10);
-const HOST = process.env.TRIVY_WEBHOOK_HOST ?? "127.0.0.1"; // loopback: reached through Caddy TLS
+const HOST = requireLoopbackHost(process.env, "TRIVY_WEBHOOK_HOST"); // reached only through Caddy TLS
 const AUTH_TOKEN = requireWebhookToken(process.env, "TRIVY_WEBHOOK_TOKEN");
 // A VulnerabilityReport for a large image lists every CVE and runs to several MB
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
