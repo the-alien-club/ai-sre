@@ -30,7 +30,7 @@ tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
 # Start Claude Code in a tmux session
 tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
-  "cd $SRE_DIR && claude --dangerously-skip-permissions --dangerously-load-development-channels server:signoz-webhook server:slack-sre"
+  "cd $SRE_DIR && claude --dangerously-skip-permissions --dangerously-load-development-channels server:signoz-webhook server:slack-sre server:trivy-webhook"
 
 # Auto-accept the dev channels prompt
 # Poll tmux pane until we see the prompt, then send Enter
