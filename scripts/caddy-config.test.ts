@@ -34,8 +34,8 @@ test("only /alert and /trivy are forwarded, both to loopback", () => {
 test("each proxied path caps the request body", () => {
   const limits = [...config.matchAll(/handle (\S+) \{\s*request_body \{\s*max_size (\S+)/g)].map((m) => [m[1], m[2]]);
   assert.deepEqual(limits, [
-    ["/alert", "1MB"],
-    ["/trivy", "16MB"],
+    ["/alert", "1MiB"],
+    ["/trivy", "16MiB"],
   ]);
 });
 

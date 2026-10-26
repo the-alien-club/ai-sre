@@ -15,13 +15,13 @@
 	# Trivy VulnerabilityReport for a large image runs to several MB
 	handle /alert {
 		request_body {
-			max_size 1MB
+			max_size 1MiB
 		}
 		reverse_proxy 127.0.0.1:{$SIGNOZ_WEBHOOK_PORT:8788}
 	}
 	handle /trivy {
 		request_body {
-			max_size 16MB
+			max_size 16MiB
 		}
 		reverse_proxy 127.0.0.1:{$TRIVY_WEBHOOK_PORT:8790}
 	}
