@@ -20,7 +20,7 @@ import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webh
 // -- Configuration (env vars, with sensible defaults) -------------------------
 
 const PORT = parseInt(process.env.SIGNOZ_WEBHOOK_PORT ?? "8788", 10);
-const HOST = process.env.SIGNOZ_WEBHOOK_HOST ?? "0.0.0.0"; // needs to be reachable from SigNoz cloud
+const HOST = process.env.SIGNOZ_WEBHOOK_HOST ?? "127.0.0.1"; // loopback: SigNoz reaches it through Caddy TLS
 const AUTH_TOKEN = requireWebhookToken(process.env, "SIGNOZ_WEBHOOK_TOKEN"); // shared secret, required
 
 // -- Types for Alertmanager-compatible webhook payload ------------------------

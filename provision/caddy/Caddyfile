@@ -3,8 +3,7 @@
 # SigNoz and the Trivy operator used to post to http://<bare IP>:8788 and :8790, so the
 # webhook secret and every alert payload crossed the internet in cleartext. Caddy
 # terminates TLS for SRE_AGENT_HOSTNAME with an automatically renewed certificate and
-# forwards to the channels, which then bind to loopback only (SIGNOZ_WEBHOOK_HOST and
-# TRIVY_WEBHOOK_HOST=127.0.0.1 in .env).
+# forwards to the channels, which bind to loopback by default.
 #
 # The hostname is an environment variable so this file does not hard-code a deployment.
 # Production: SRE_AGENT_HOSTNAME=sre-agent.internal.alien.club (A record to the VM).

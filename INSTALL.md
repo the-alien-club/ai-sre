@@ -346,12 +346,9 @@ sudo systemctl daemon-reload && sudo systemctl restart caddy
 SRE_AGENT_HOSTNAME=$SRE_AGENT_HOSTNAME caddy validate --config /etc/caddy/Caddyfile
 ```
 
-Then bind the channels to loopback in `.env` and restart the agent:
-
-```bash
-SIGNOZ_WEBHOOK_HOST=127.0.0.1
-TRIVY_WEBHOOK_HOST=127.0.0.1
-```
+The channels bind to loopback by default (`SIGNOZ_WEBHOOK_HOST` / `TRIVY_WEBHOOK_HOST`
+default to `127.0.0.1`), so once the agent restarts they are reachable only through Caddy.
+Do not set either to a public address.
 
 In the Scaleway security group, allow 80 (ACME challenge) and 443 inbound, and remove
 8788 and 8790. Point SigNoz at `https://$SRE_AGENT_HOSTNAME/alert` (§10) and the Trivy

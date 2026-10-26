@@ -19,7 +19,7 @@ import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webh
 // -- Configuration ------------------------------------------------------------
 
 const PORT = parseInt(process.env.TRIVY_WEBHOOK_PORT ?? "8790", 10);
-const HOST = process.env.TRIVY_WEBHOOK_HOST ?? "0.0.0.0";
+const HOST = process.env.TRIVY_WEBHOOK_HOST ?? "127.0.0.1"; // loopback: reached through Caddy TLS
 const AUTH_TOKEN = requireWebhookToken(process.env, "TRIVY_WEBHOOK_TOKEN");
 
 // Vulnerabilities below this severity are ignored
