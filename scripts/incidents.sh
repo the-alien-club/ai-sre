@@ -14,7 +14,28 @@
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DB="$SCRIPT_DIR/../data/incidents.db"
+# INCIDENTS_DB exists so the tests can point at a scratch database; production uses the default
+DB="${INCIDENTS_DB:-$SCRIPT_DIR/../data/incidents.db}"
+
+# Every value reaching SQL goes through one of these two helpers, never string interpolation.
+# Arguments come from alert labels and sub-agent output, so they are attacker-influenced:
+# a fingerprint or cluster name containing a quote used to be able to rewrite the query.
+
+# Encode text as a hex blob literal cast back to TEXT. The literal can only contain
+# [0-9a-f], so no input can terminate it, whatever quotes or semicolons it carries.
+sql_text() {
+    printf "CAST(X'%s' AS TEXT)" "$(printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n')"
+}
+
+# Validate a non-negative integer argument; anything else is a usage error, not a default.
+sql_int() {
+    local name="$1" value="$2"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "Invalid $name: expected a non-negative integer, got '$value'" >&2
+        exit 1
+    fi
+    printf '%s' "$value"
+}
 
 # Ensure DB exists
 mkdir -p "$(dirname "$DB")"
@@ -55,7 +76,12 @@ case "$CMD" in
             exit 1
         fi
 
-        sqlite3 "$DB" "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ('$(echo "$ALERT" | sed "s/'/''/g")', '${FP}', '${SEVERITY}', '${STATUS:-firing}', '${CLUSTER}', '${NAMESPACE}', '${SERVICE}', '${VERDICT}', '${ACTION}', '$(echo "$CAUSE" | sed "s/'/''/g")', '$(echo "$RESOLUTION" | sed "s/'/''/g")', '${RELATED_MR}', '$(echo "$NOTES" | sed "s/'/''/g")', ${DURATION:-NULL});"
+        DURATION_SQL="NULL"
+        if [ -n "$DURATION" ]; then
+            DURATION_SQL="$(sql_int --duration "$DURATION")" || exit 1
+        fi
+
+        sqlite3 "$DB" "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ($(sql_text "$ALERT"), $(sql_text "$FP"), $(sql_text "$SEVERITY"), $(sql_text "${STATUS:-firing}"), $(sql_text "$CLUSTER"), $(sql_text "$NAMESPACE"), $(sql_text "$SERVICE"), $(sql_text "$VERDICT"), $(sql_text "$ACTION"), $(sql_text "$CAUSE"), $(sql_text "$RESOLUTION"), $(sql_text "$RELATED_MR"), $(sql_text "$NOTES"), ${DURATION_SQL});" || exit 1
 
         echo "Incident logged: $ALERT ($VERDICT → $ACTION)"
         ;;
@@ -72,8 +98,9 @@ case "$CMD" in
             esac
         done
 
-        WHERE="alert_name = '$(echo "$ALERT" | sed "s/'/''/g")' AND created_at > datetime('now', '-${DAYS} days')"
-        [ -n "$CLUSTER" ] && WHERE="$WHERE AND cluster = '$CLUSTER'"
+        DAYS="$(sql_int --days "$DAYS")" || exit 1
+        WHERE="alert_name = $(sql_text "$ALERT") AND created_at > datetime('now', '-${DAYS} days')"
+        [ -n "$CLUSTER" ] && WHERE="$WHERE AND cluster = $(sql_text "$CLUSTER")"
 
         sqlite3 -header -column "$DB" "SELECT created_at, verdict, action, cause, resolution FROM incidents WHERE $WHERE ORDER BY created_at DESC LIMIT 10;"
         ;;
@@ -88,13 +115,14 @@ case "$CMD" in
             esac
         done
 
-        sqlite3 -header -column "$DB" "SELECT created_at, alert_name, verdict, action, cause FROM incidents WHERE fingerprint = '$FP' ORDER BY created_at DESC LIMIT 5;"
+        sqlite3 -header -column "$DB" "SELECT created_at, alert_name, verdict, action, cause FROM incidents WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at DESC LIMIT 5;"
         ;;
 
     patterns)
         # Show recurring patterns from the last N days
         DAYS=7
         [ "${1:-}" = "--days" ] && DAYS="$2"
+        DAYS="$(sql_int --days "$DAYS")" || exit 1
 
         echo "=== Recurring Alerts (last ${DAYS} days) ==="
         sqlite3 -header -column "$DB" "SELECT alert_name, cluster, service, COUNT(*) as fires, SUM(CASE WHEN verdict IN ('noise','false_positive','known_issue') THEN 1 ELSE 0 END) as noise, SUM(CASE WHEN verdict = 'real' THEN 1 ELSE 0 END) as real, SUM(CASE WHEN action = 'escalated' THEN 1 ELSE 0 END) as escalated, MAX(created_at) as last_seen FROM incidents WHERE created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, cluster, service HAVING COUNT(*) > 1 ORDER BY fires DESC;"
@@ -108,6 +136,7 @@ case "$CMD" in
         # Generate a startup briefing for the main agent
         DAYS=7
         [ "${1:-}" = "--days" ] && DAYS="$2"
+        DAYS="$(sql_int --days "$DAYS")" || exit 1
 
         TOTAL=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE created_at > datetime('now', '-${DAYS} days');")
         NOISE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days');")
@@ -165,7 +194,12 @@ case "$CMD" in
             exit 1
         fi
 
-        sqlite3 "$DB" "INSERT INTO incident_context (fingerprint, incident_id, author, phase, content) VALUES ('$FP', ${INCIDENT_ID:-NULL}, '$AUTHOR', '$PHASE', '$(echo "$CONTENT" | sed "s/'/''/g")');"
+        INCIDENT_ID_SQL="NULL"
+        if [ -n "$INCIDENT_ID" ]; then
+            INCIDENT_ID_SQL="$(sql_int --incident-id "$INCIDENT_ID")" || exit 1
+        fi
+
+        sqlite3 "$DB" "INSERT INTO incident_context (fingerprint, incident_id, author, phase, content) VALUES ($(sql_text "$FP"), ${INCIDENT_ID_SQL}, $(sql_text "$AUTHOR"), $(sql_text "$PHASE"), $(sql_text "$CONTENT"));" || exit 1
         echo "Context saved: [$PHASE] for $FP"
         ;;
 
@@ -189,11 +223,11 @@ case "$CMD" in
 
         # Incident log entries
         echo "--- Incident Log ---"
-        sqlite3 -header -column "$DB" "SELECT id, created_at, alert_name, severity, verdict, action, cause, resolution FROM incidents WHERE fingerprint = '$FP' ORDER BY created_at;"
+        sqlite3 -header -column "$DB" "SELECT id, created_at, alert_name, severity, verdict, action, cause, resolution FROM incidents WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at;"
 
         echo ""
         echo "--- Investigation Context ---"
-        sqlite3 -separator '' "$DB" "SELECT '[' || created_at || '] [' || phase || '] (' || author || ') ' || content FROM incident_context WHERE fingerprint = '$FP' ORDER BY created_at;"
+        sqlite3 -separator '' "$DB" "SELECT '[' || created_at || '] [' || phase || '] (' || author || ') ' || content FROM incident_context WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at;"
         ;;
 
     resolve)
@@ -207,7 +241,13 @@ case "$CMD" in
             esac
         done
 
-        sqlite3 "$DB" "UPDATE incidents SET escalation_acknowledged = 1, resolution = '$(echo "$RESOLUTION" | sed "s/'/''/g")' WHERE id = $ID;"
+        if [ -z "$ID" ]; then
+            echo "Required: --id"
+            exit 1
+        fi
+        ID="$(sql_int --id "$ID")" || exit 1
+
+        sqlite3 "$DB" "UPDATE incidents SET escalation_acknowledged = 1, resolution = $(sql_text "$RESOLUTION") WHERE id = ${ID};" || exit 1
         echo "Incident $ID marked as resolved."
         ;;
 
