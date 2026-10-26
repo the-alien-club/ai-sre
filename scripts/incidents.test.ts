@@ -118,6 +118,7 @@ test("numeric arguments must be integers", () => {
     assert.notEqual(out.status, 0, `expected rejection for ${args.join(" ")}`);
     assert.match(out.stderr, /expected a non-negative integer/);
   }
+  assert.notEqual(run(db, "check", "--alert", "x", "--days", "1234567890").status, 0, "10 digits exceeds the bound");
   assert.equal(logIncident(db, { "--duration": "abc" }).status === 0, false);
   assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "1");
 });
@@ -128,6 +129,27 @@ test("resolve marks only the given incident", () => {
   logIncident(db, { "--fingerprint": "fp-2" });
   assert.equal(run(db, "resolve", "--id", "1", "--resolution", "MR 'x' reverted").status, 0);
   assert.equal(query(db, "SELECT id, escalation_acknowledged, resolution FROM incidents ORDER BY id;"), "1|1|MR 'x' reverted\n2|0|");
+});
+
+test("resolve on an unknown id is an error, not a false success", () => {
+  const db = scratchDb();
+  logIncident(db);
+  const result = run(db, "resolve", "--id", "42", "--resolution", "x");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /No incident with id 42/);
+  assert.equal(query(db, "SELECT escalation_acknowledged FROM incidents;"), "0");
+});
+
+test("a large cause and notes are stored, not rejected by the argument limit", () => {
+  // A single argument is capped at 128KB by the kernel, so ~100KB is the largest value a
+  // caller can pass. Hex-encoded into the SQL it doubles to ~200KB, which as a sqlite3
+  // argument failed with "Argument list too long"; on stdin it has no limit.
+  const db = scratchDb();
+  const cause = "c".repeat(100_000);
+  const notes = "n'".repeat(50_000);
+  const result = logIncident(db, { "--cause": cause, "--notes": notes });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(query(db, "SELECT length(cause), length(notes) FROM incidents;"), "100000|100000");
 });
 
 test("resolve without an id is a usage error", () => {
