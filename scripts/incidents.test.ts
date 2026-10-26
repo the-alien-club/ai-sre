@@ -157,6 +157,22 @@ test("resolve without an id is a usage error", () => {
   assert.notEqual(run(db, "resolve", "--resolution", "x").status, 0);
 });
 
+test("briefing succeeds when incidents exist", () => {
+  // It used to exit 1 here, so start-agent.sh appended its failure fallback to a real briefing
+  const db = scratchDb();
+  logIncident(db);
+  const result = run(db, "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Total: 1 alerts processed/);
+  assert.doesNotMatch(result.stdout, /No incidents recorded yet/);
+});
+
+test("briefing on an empty database says so and succeeds", () => {
+  const result = run(scratchDb(), "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No incidents recorded yet/);
+});
+
 test("briefing and patterns still run with defaults", () => {
   const db = scratchDb();
   logIncident(db);

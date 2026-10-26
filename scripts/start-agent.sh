@@ -70,7 +70,7 @@ if [ ! -f "$SRE_DIR/data/incidents.db" ]; then
 fi
 
 # Generate startup briefing
-BRIEFING=$("$SRE_DIR/scripts/incidents.sh" briefing --days 7 2>/dev/null || echo "No incident history yet.")
+BRIEFING=$("$SRE_DIR/scripts/incidents.sh" briefing --days 7 2>/dev/null || echo "Incident briefing unavailable: incidents.sh briefing failed, check data/incidents.db.")
 echo "[start-agent] Briefing generated"
 
 # Load deployment-specific config (real project IDs, Slack IDs, etc.)

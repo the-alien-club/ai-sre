@@ -182,7 +182,11 @@ case "$CMD" in
             echo ""
         fi
 
-        [ "$TOTAL" = "0" ] && echo "No incidents recorded yet. Fresh start."
+        # An if, not `[ ... ] && echo`: as the last command that form made briefing exit 1
+        # whenever incidents existed, and start-agent.sh then appended its failure fallback
+        if [ "$TOTAL" = "0" ]; then
+            echo "No incidents recorded yet. Fresh start."
+        fi
         ;;
 
     context)
