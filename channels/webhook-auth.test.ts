@@ -66,3 +66,18 @@ test("an absent or empty secret is rejected", () => {
   assert.equal(isAuthorized(undefined, SECRET), false);
   assert.equal(isAuthorized("", SECRET), false);
 });
+
+test("the auth scheme is matched case-insensitively", () => {
+  assert.equal(extractPresentedToken({ authorization: `bearer ${SECRET}` }), SECRET);
+  assert.equal(extractPresentedToken({ authorization: basic("signoz", SECRET).replace("Basic", "BASIC") }), SECRET);
+});
+
+test("whitespace around the presented secret is ignored", () => {
+  assert.equal(extractPresentedToken({ authorization: `Bearer   ${SECRET}  ` }), SECRET);
+  assert.equal(extractPresentedToken({ "x-webhook-token": ` ${SECRET}\n` }), SECRET);
+  assert.equal(isAuthorized(extractPresentedToken({ authorization: basic("signoz", `${SECRET} `) }), SECRET), true);
+});
+
+test("a blank presented secret is still rejected after trimming", () => {
+  assert.equal(isAuthorized(extractPresentedToken({ authorization: "Bearer    " }), SECRET), false);
+});

@@ -38,19 +38,22 @@ export function requireWebhookToken(env: NodeJS.ProcessEnv, name: string): strin
  */
 export function extractPresentedToken(headers: IncomingHttpHeaders): string | undefined {
   const authorization = headers.authorization ?? "";
+  // Auth schemes are case-insensitive (RFC 9110 §11.1); surrounding whitespace is not part of a secret
+  const [scheme, ...rest] = authorization.trim().split(/\s+/);
+  const credentials = rest.join(" ");
 
-  if (authorization.startsWith("Bearer ")) {
-    return authorization.slice("Bearer ".length);
+  if (scheme?.toLowerCase() === "bearer") {
+    return credentials.trim();
   }
 
-  if (authorization.startsWith("Basic ")) {
-    const decoded = Buffer.from(authorization.slice("Basic ".length), "base64").toString();
+  if (scheme?.toLowerCase() === "basic") {
+    const decoded = Buffer.from(credentials, "base64").toString();
     const separator = decoded.indexOf(":");
-    return separator === -1 ? decoded : decoded.slice(separator + 1);
+    return (separator === -1 ? decoded : decoded.slice(separator + 1)).trim();
   }
 
   const header = headers["x-webhook-token"];
-  return Array.isArray(header) ? header[0] : header;
+  return (Array.isArray(header) ? header[0] : header)?.trim();
 }
 
 /**
