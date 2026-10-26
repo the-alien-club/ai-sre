@@ -2,83 +2,123 @@
 //
 // The startup prompt carries the agent's briefing and deployment config. Sent as
 // `send-keys "$PROMPT" Enter`, Claude Code took it for a paste, swallowed the Enter, and the
-// prompt sat unsubmitted for the agent's whole life (SDS-992). These tests drive
-// submit_prompt against a stub tmux whose input box keeps the pasted text until it has
-// received a given number of separate Enter keystrokes.
+// prompt sat unsubmitted for the agent's whole life (SDS-992). The fix must prove the prompt
+// was sent, never assume it, so most of these tests are about failures being reported as
+// failures.
+//
+// The stub tmux (fixtures/tmux-stub.sh) parses its flags and renders the input box the way
+// Claude Code does (taken from the live pane on the agent VM): between two horizontal rules,
+// starting with "❯" and a no-break space. Environment variables make it fail in each of the
+// ways a real session can.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-/** A stub tmux: logs send-keys calls and shows the prompt pasted until `entersNeeded` Enters arrive. */
-function stubTmux(entersNeeded: number) {
+const STUB = "scripts/fixtures/tmux-stub.sh";
+
+interface Options {
+  entersNeeded?: number;
+  failSend?: boolean;
+  failCapture?: boolean;
+  noUi?: boolean;
+  noLand?: boolean;
+}
+
+function run(prompt: string, options: Options = {}, attempts = 3, fn = "submit_prompt") {
   const dir = mkdtempSync(join(tmpdir(), "sre-submit-"));
   const log = join(dir, "tmux.log");
-  const enters = join(dir, "enters");
   writeFileSync(log, "");
-  writeFileSync(enters, "0");
-  writeFileSync(
-    join(dir, "tmux"),
-    `#!/usr/bin/env bash
-if [ "$1" = send-keys ]; then
-  if [ "$4" = -l ]; then echo "type:$5" >> "${log}"; else echo "key:$4" >> "${log}"; fi
-  [ "$4" = Enter ] && echo $(( $(cat "${enters}") + 1 )) > "${enters}"
-  exit 0
-fi
-if [ "$1" = capture-pane ]; then
-  echo "  Listening for channel messages"
-  if [ "$(cat "${enters}")" -lt ${entersNeeded} ]; then echo "❯ [Pasted text #1 +48 lines]"; else echo "❯ "; fi
-  exit 0
-fi
-exit 1
-`,
-  );
+  writeFileSync(join(dir, "enters"), "0");
+  copyFileSync(STUB, join(dir, "tmux"));
   chmodSync(join(dir, "tmux"), 0o755);
-  return { dir, log };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    PROMPT: prompt,
+    SUBMIT_PROMPT_PAUSE: "0",
+    STUB_DIR: dir,
+    STUB_LOG: log,
+    STUB_ENTERS_NEEDED: String(options.entersNeeded ?? 1),
+    ...(options.failSend ? { STUB_FAIL_SEND: "1" } : {}),
+    ...(options.failCapture ? { STUB_FAIL_CAPTURE: "1" } : {}),
+    ...(options.noUi ? { STUB_NO_UI: "1" } : {}),
+    ...(options.noLand ? { STUB_NO_LAND: "1" } : {}),
+  };
+  const args = fn === "submit_prompt" ? `sre-agent "$PROMPT" ${attempts}` : `sre-agent "$PROMPT"`;
+  const result = spawnSync("bash", ["-c", `source scripts/lib/submit-prompt.sh && ${fn} ${args}`], { env, encoding: "utf8" });
+  const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
+  return { ...result, calls, enters: calls.filter((call) => call === "key:Enter").length };
 }
 
-function submit(stub: { dir: string }, prompt: string, attempts = 5) {
-  return spawnSync(
-    "bash",
-    ["-c", `source scripts/lib/submit-prompt.sh && submit_prompt sre-agent "$PROMPT" ${attempts}`],
-    { env: { ...process.env, PATH: `${stub.dir}:${process.env.PATH}`, PROMPT: prompt, SUBMIT_PROMPT_PAUSE: "0" }, encoding: "utf8" },
-  );
-}
+const PROMPT = "You are the SRE agent.\n\nHere is your briefing:\n- line one";
 
-const PROMPT = "You are the SRE agent.\n\nHere is your briefing:\n- line one\n- line two";
-
-test("types the prompt literally, then sends Enter on its own", () => {
-  const stub = stubTmux(1);
-  const result = submit(stub, PROMPT);
+test("types the prompt literally, sees it land, then submits with a separate Enter", () => {
+  const result = run(PROMPT);
   assert.equal(result.status, 0, result.stderr);
-  const calls = readFileSync(stub.log, "utf8").trim().split("\n");
-  assert.equal(calls[0], `type:${PROMPT.split("\n")[0]}`, "prompt must be sent with -l, not as keys");
-  assert.ok(calls.slice(1).includes("key:Enter"));
-  assert.ok(!calls[0].includes("Enter"), "Enter must not travel with the prompt text");
+  assert.equal(result.calls[0], `type:${PROMPT.split("\n")[0]}`);
+  assert.equal(result.enters, 1);
   assert.match(result.stdout, /submitted \(attempt 1\)/);
 });
 
-test("retries Enter while the input box still holds the pasted prompt", () => {
-  const stub = stubTmux(3);
-  const result = submit(stub, PROMPT);
+test("retries Enter while the input box still holds the prompt", () => {
+  const result = run(PROMPT, { entersNeeded: 3 });
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.enters, 3);
   assert.match(result.stdout, /submitted \(attempt 3\)/);
-  assert.equal(readFileSync(stub.log, "utf8").match(/key:Enter/g)?.length, 3);
 });
 
-test("fails, loudly, when the prompt never submits", () => {
-  const stub = stubTmux(99);
-  const result = submit(stub, PROMPT, 2);
+test("a prompt starting with '-' is typed, not parsed as a flag", () => {
+  const result = run("-starts with a dash");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.calls[0], "type:-starts with a dash");
+});
+
+test("fails when the prompt never submits", () => {
+  const result = run(PROMPT, { entersNeeded: 99 }, 2);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /still unsubmitted after 2 attempts/);
-  assert.equal(readFileSync(stub.log, "utf8").match(/key:Enter/g)?.length, 2);
 });
 
-test("start-agent.sh submits through submit_prompt and reports a failure", () => {
+test("fails when typing into tmux fails, without sending Enter", () => {
+  const result = run(PROMPT, { failSend: true });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /could not type the startup prompt/);
+  assert.doesNotMatch(result.stdout, /submitted/);
+});
+
+test("fails when the pane cannot be captured", () => {
+  const result = run(PROMPT, { failCapture: true });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /no Claude Code input box recognised/);
+  assert.equal(result.enters, 0);
+});
+
+test("fails when no Claude Code input box is recognised in the pane", () => {
+  const result = run(PROMPT, { noUi: true });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /no Claude Code input box recognised/);
+  assert.equal(result.enters, 0);
+});
+
+test("fails when the prompt never lands in the input box, without sending Enter", () => {
+  const result = run(PROMPT, { noLand: true });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /never appeared in the input box/);
+  assert.equal(result.enters, 0);
+});
+
+test("submit_startup_prompt reports a failure loudly and does not fail the start", () => {
+  const result = run(PROMPT, { failCapture: true }, 3, "submit_startup_prompt");
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /ERROR: the agent is running WITHOUT its briefing/);
+});
+
+test("start-agent.sh submits through submit_startup_prompt only", () => {
   const launcher = readFileSync("scripts/start-agent.sh", "utf8");
-  assert.doesNotMatch(launcher, /send-keys -t "\$SESSION_NAME" "\$PROMPT" Enter/);
-  assert.match(launcher, /if ! submit_prompt "\$SESSION_NAME" "\$PROMPT"; then\n\s+echo "\[start-agent\] ERROR: the agent is running WITHOUT its briefing/);
+  assert.match(launcher, /^submit_startup_prompt "\$SESSION_NAME" "\$PROMPT"$/m);
+  assert.doesNotMatch(launcher, /send-keys[^\n]*\$PROMPT/);
 });
