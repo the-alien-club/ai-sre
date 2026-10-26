@@ -321,6 +321,42 @@ claude auth login
 # Follow the OAuth flow in browser
 ```
 
+## 9b. Put TLS in front of the webhooks (Caddy)
+
+The webhook channels must not be reachable in cleartext: the shared secret and every
+alert payload travel in each request. Caddy terminates TLS for the agent's hostname and
+forwards `/alert` and `/trivy` to the channels, which listen on loopback only.
+
+```bash
+# DNS first: an A record for the hostname pointing at the VM (prod: sre-agent.internal.alien.club)
+export SRE_AGENT_HOSTNAME=sre-agent.internal.alien.club
+
+# Install Caddy from its official apt repository
+sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update -qq && sudo apt-get install -y -qq caddy
+
+# Config from this repo; the hostname comes from the service environment
+sudo install -m 0644 provision/caddy/Caddyfile /etc/caddy/Caddyfile
+sudo mkdir -p /etc/systemd/system/caddy.service.d
+printf '[Service]\nEnvironment=SRE_AGENT_HOSTNAME=%s\n' "$SRE_AGENT_HOSTNAME" \
+  | sudo tee /etc/systemd/system/caddy.service.d/hostname.conf
+sudo systemctl daemon-reload && sudo systemctl restart caddy
+SRE_AGENT_HOSTNAME=$SRE_AGENT_HOSTNAME caddy validate --config /etc/caddy/Caddyfile
+```
+
+Then bind the channels to loopback in `.env` and restart the agent:
+
+```bash
+SIGNOZ_WEBHOOK_HOST=127.0.0.1
+TRIVY_WEBHOOK_HOST=127.0.0.1
+```
+
+In the Scaleway security group, allow 80 (ACME challenge) and 443 inbound, and remove
+8788 and 8790. Point SigNoz at `https://$SRE_AGENT_HOSTNAME/alert` (§10) and the Trivy
+operator at `https://$SRE_AGENT_HOSTNAME/trivy`.
+
 ## 10. Create SigNoz webhook channel
 
 ```bash
@@ -336,7 +372,7 @@ curl -s "$SIGNOZ_URL/api/v1/channels" \
     "name": "SRE Agent",
     "webhook_configs": [{
       "send_resolved": true,
-      "url": "http://'"$SRE_IP"':8788/alert",
+      "url": "https://'"$SRE_AGENT_HOSTNAME"'/alert",
       "http_config": {
         "basic_auth": {
           "password": "'"$WEBHOOK_TOKEN"'"
@@ -383,7 +419,7 @@ ss -tlnp | grep 8788
 tmux capture-pane -t sre-agent -p | tail -20
 
 # Send a test alert
-curl -s -X POST "http://$SRE_IP:8788/alert" \
+curl -s -X POST "https://$SRE_AGENT_HOSTNAME/alert" \
   -H "Content-Type: application/json" \
   -H "Authorization: Basic $(printf ':%s' "$WEBHOOK_TOKEN" | base64 -w0)" \
   -d '{"status":"firing","receiver":"test","alerts":[{"status":"firing","labels":{"alertname":"Test","severity":"info"},"annotations":{"summary":"install verification"},"startsAt":"2026-01-01T00:00:00Z","endsAt":"0001-01-01T00:00:00Z","fingerprint":"install-test"}],"groupLabels":{},"commonLabels":{},"commonAnnotations":{},"version":"4"}'
