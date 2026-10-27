@@ -22,13 +22,21 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebClient } from "@slack/web-api";
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { requireLoopbackHost } from "./bind-address.js";
 import { createJiraClient, readJiraConfig } from "./jira-client.js";
 import { operatorMentions, parseOperators } from "./operators.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
+import {
+  describeIssues,
+  ExposedSecretReportPayload,
+  VulnerabilityReportPayload,
+  workloadOf,
+  type ExposedSecretReport,
+  type VulnerabilityReport,
+} from "./trivy-payload.js";
 import { buildDigest } from "./trivy-digest.js";
 import {
   actionableSecrets,
@@ -112,52 +120,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-// -- Trivy CRD payload types --------------------------------------------------
-
-interface TrivyVulnerability {
-  vulnerabilityID: string;
-  resource: string;
-  installedVersion: string;
-  fixedVersion?: string;
-  severity: string;
-}
-
-interface TrivyArtifactPayload {
-  repository: string;
-  tag?: string;
-  digest?: string;
-}
-
-interface ReportMetadata {
-  name: string;
-  namespace?: string;
-  labels?: Record<string, string>;
-}
-
-interface VulnerabilityReport {
-  kind: "VulnerabilityReport";
-  metadata: ReportMetadata;
-  report: { artifact: TrivyArtifactPayload; vulnerabilities?: TrivyVulnerability[] };
-}
-
-interface ExposedSecret {
-  ruleID: string;
-  category: string;
-  severity: string;
-  title: string;
-  target: string;
-}
-
-interface ExposedSecretReport {
-  kind: "ExposedSecretReport";
-  metadata: ReportMetadata;
-  report: { artifact: TrivyArtifactPayload; secrets?: ExposedSecret[] };
-}
-
-function workloadOf(metadata: ReportMetadata): string {
-  return metadata.labels?.["trivy-operator.resource.name"] ?? metadata.name;
-}
-
 // -- MCP Channel Server -------------------------------------------------------
 
 const mcp = new Server(
@@ -208,7 +170,7 @@ function handleVulnerabilityReport(res: ServerResponse, report: VulnerabilityRep
       artifact: report.report.artifact,
       namespace: report.metadata.namespace ?? "unknown",
       workload: workloadOf(report.metadata),
-      vulnerabilities: report.report.vulnerabilities ?? [],
+      vulnerabilities: report.report.vulnerabilities,
     },
     Date.now()
   );
@@ -219,7 +181,7 @@ function handleVulnerabilityReport(res: ServerResponse, report: VulnerabilityRep
 
 async function handleExposedSecretReport(res: ServerResponse, report: ExposedSecretReport): Promise<void> {
   const kind = report.kind;
-  const secrets = actionableSecrets(report.report.secrets ?? []);
+  const secrets = actionableSecrets(report.report.secrets);
   if (secrets.length === 0) {
     // Nothing left once known false positives are dropped
     respond(res, 200, { status: "no_action", kind });
@@ -299,7 +261,16 @@ async function handleExposedSecretReport(res: ServerResponse, report: ExposedSec
 
 // -- HTTP Server --------------------------------------------------------------
 
-const httpServer = createServer(async (req, res) => {
+const httpServer = createServer((req, res) => {
+  // The last line of defence: whatever a handler throws is logged and answered, never left
+  // as an unhandled rejection in the process that pages for secrets
+  handleRequest(req, res).catch((err: unknown) => {
+    console.error(`[trivy-webhook] request failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+    if (!res.headersSent) respond(res, 500, { status: "internal_error" });
+  });
+});
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
   if (req.method === "GET" && url.pathname === "/health") {
@@ -338,15 +309,25 @@ const httpServer = createServer(async (req, res) => {
 
   const kind = "kind" in payload && typeof payload.kind === "string" ? payload.kind : "unknown";
 
-  if (kind === "VulnerabilityReport") {
-    handleVulnerabilityReport(res, payload as VulnerabilityReport);
-  } else if (kind === "ExposedSecretReport") {
-    await handleExposedSecretReport(res, payload as ExposedSecretReport);
-  } else {
+  if (kind !== "VulnerabilityReport" && kind !== "ExposedSecretReport") {
     // ConfigAuditReport, ClusterComplianceReport, etc.
     respond(res, 200, { status: "ignored", kind });
+    return;
   }
-});
+
+  const parsed =
+    kind === "VulnerabilityReport" ? VulnerabilityReportPayload.safeParse(payload) : ExposedSecretReportPayload.safeParse(payload);
+
+  if (!parsed.success) {
+    const reason = describeIssues(parsed.error);
+    console.error(`[trivy-webhook] rejected a malformed ${kind}: ${reason}`);
+    respond(res, 400, { status: "invalid_report", kind, reason });
+    return;
+  }
+
+  if (parsed.data.kind === "VulnerabilityReport") handleVulnerabilityReport(res, parsed.data);
+  else await handleExposedSecretReport(res, parsed.data);
+}
 
 httpServer.listen(PORT, HOST, () => {
   console.error(`[trivy-webhook] listening on ${HOST}:${PORT}/trivy (auth enabled), digest at ${DIGEST_HOUR_UTC}:00 UTC`);
