@@ -366,6 +366,12 @@ export function createTrivyStore(options: TrivyStoreOptions): TrivyStore {
         return quarantine(`is not valid JSON (${errorMessage(err)})`);
       }
 
+      const migrated = migrateVersion1(parsed);
+      if (migrated) {
+        log(`[trivy-findings] migrated ${path} from version 1: kept the digest date and ${Object.keys(migrated.secretsSeen).length} known secret(s)`);
+        return migrated;
+      }
+
       if (!isState(parsed)) return quarantine(`is not a version ${STATE_VERSION} Trivy state`);
 
       const images: Record<string, ImageFinding> = {};
@@ -390,6 +396,27 @@ export function createTrivyStore(options: TrivyStoreOptions): TrivyStore {
       }
     },
   };
+}
+
+/**
+ * Version 1 (0.3.2) kept `secretsSeen` as fingerprint -> first-reported time, with the same
+ * fingerprint format as secretFingerprint(), and its images in a shape without severity
+ * counts. Its known secrets and digest date are carried over, so deploying over it neither
+ * re-pages a secret nor sends a second digest the same day. Its images are rebuilt from the
+ * next rescans.
+ */
+function migrateVersion1(value: unknown): TrivyState | null {
+  if (!isRecord(value) || "version" in value || !isRecord(value.secretsSeen) || typeof value.lastDigestAt !== "number") {
+    return null;
+  }
+
+  const secretsSeen: Record<string, SecretSighting> = {};
+  for (const [fingerprint, seenAt] of Object.entries(value.secretsSeen)) {
+    if (typeof seenAt !== "number") return null;
+    secretsSeen[fingerprint] = { reportedAt: seenAt, lastSeenAt: seenAt };
+  }
+
+  return { ...emptyState(), secretsSeen, lastDigestAt: value.lastDigestAt };
 }
 
 function removeTemp(tempPath: string): void {

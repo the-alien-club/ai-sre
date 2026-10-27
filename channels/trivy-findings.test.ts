@@ -230,9 +230,27 @@ test("a missing file is a first run", () => {
   assert.deepEqual(logs, []);
 });
 
+test("a version 1 file keeps its known secrets and digest date, so nothing re-pages or re-digests", () => {
+  const { path, store, logs } = scratchStore();
+  const artifact = { repository: "ns-data-streaming/mcp-data-cluster", tag: "0.1.20", digest: "sha256:aaa" };
+  const secrets = [{ ruleID: "aws-access-key-id", target: "/app/config/settings.py" }];
+  // As 0.3.2 wrote it: same fingerprint format, a bare timestamp per secret
+  writeFileSync(
+    path,
+    JSON.stringify({ images: { "x:1@sha256:a": { image: "x:1" } }, secretsSeen: { [secretFingerprint(artifact, secrets)]: NOW - DAY }, lastDigestAt: NOW }),
+    "utf8"
+  );
+
+  const state = store.load();
+  assert.equal(state.lastDigestAt, NOW);
+  assert.deepEqual(state.images, {});
+  assert.equal(isSecretReported(state, secretFingerprint(artifact, secrets), NOW), true);
+  assert.match(logs.join("\n"), /migrated .* from version 1: kept the digest date and 1 known secret/);
+});
+
 for (const [name, content] of [
   ["corrupt", "{not json"],
-  ["outdated (version 1)", JSON.stringify({ images: {}, secretsSeen: {}, lastDigestAt: 0 })],
+  ["unrecognised", JSON.stringify({ version: 9, images: {} })],
 ]) {
   test(`a ${name} file is moved aside, logged, and never overwritten`, () => {
     const { dir, path, store, logs } = scratchStore();
