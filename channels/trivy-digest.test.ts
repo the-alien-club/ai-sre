@@ -145,6 +145,19 @@ test("a thread failure after the summary is a partial post, not a retryable fail
   });
 });
 
+test("a timed-out summary counts as possibly visible, a refused one as not posted", async () => {
+  const digest = bigDigest();
+  const timingOut: SlackPoster = { post: async () => Promise.reject(new OperationTimeoutError("slack chat.postMessage", 20)) };
+  await assert.rejects(postDigest(timingOut, digest), (err: unknown) => {
+    assert.ok(err instanceof DigestPartiallyPostedError);
+    assert.equal(err.summaryTs, null);
+    return true;
+  });
+
+  const refusing: SlackPoster = { post: async () => Promise.reject(new Error("invalid_auth")) };
+  await assert.rejects(postDigest(refusing, digest), (err: unknown) => !(err instanceof DigestPartiallyPostedError));
+});
+
 test("the Slack poster is bounded and treats a missing ts as a failure", async () => {
   const hung: ChatPoster = { chat: { postMessage: () => new Promise(() => {}) } };
   await assert.rejects(createSlackPoster(hung, "C1", 20).post("x"), OperationTimeoutError);

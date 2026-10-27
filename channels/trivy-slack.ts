@@ -7,7 +7,7 @@
 
 import { chunkLines, escapeSlackText } from "./slack-text.js";
 import type { DigestMessages } from "./trivy-digest.js";
-import { withTimeout } from "./with-timeout.js";
+import { OperationTimeoutError, withTimeout } from "./with-timeout.js";
 
 /** The slice of @slack/web-api's WebClient this module needs. Narrow, so tests can stub it. */
 export interface ChatPoster {
@@ -33,13 +33,15 @@ const MENTION = /<[@!]/;
 
 export class DigestPartiallyPostedError extends Error {
   constructor(
-    readonly summaryTs: string,
+    readonly summaryTs: string | null, // null: the summary post timed out, it may or may not be visible
     readonly postedChunks: number,
     readonly totalChunks: number,
     cause: unknown
   ) {
     super(
-      `digest summary posted (ts ${summaryTs}) but only ${postedChunks}/${totalChunks} thread message(s): ` +
+      (summaryTs === null
+        ? `digest summary post timed out and may be visible; ${totalChunks} thread message(s) not posted: `
+        : `digest summary posted (ts ${summaryTs}) but only ${postedChunks}/${totalChunks} thread message(s): `) +
         (cause instanceof Error ? cause.message : String(cause))
     );
     this.name = "DigestPartiallyPostedError";
@@ -63,7 +65,7 @@ export function createSlackPoster(client: ChatPoster, channel: string, timeoutMs
 /**
  * Posts the digest summary, then its per-image lines in the summary's thread.
  * @throws Error if any digest text would mention someone, before anything is posted.
- * @throws DigestPartiallyPostedError when the summary went out but a thread message did not,
+ * @throws DigestPartiallyPostedError when the summary went out (or timed out) but a thread message did not,
  *   so the caller can tell "nothing visible" (retry) from "visible but incomplete" (do not).
  */
 export async function postDigest(poster: SlackPoster, digest: DigestMessages): Promise<string> {
@@ -73,7 +75,15 @@ export async function postDigest(poster: SlackPoster, digest: DigestMessages): P
     if (MENTION.test(text)) throw new Error("refusing to post a Trivy digest that contains a mention");
   }
 
-  const ts = await poster.post(digest.summary);
+  let ts: string;
+  try {
+    ts = await poster.post(digest.summary);
+  } catch (err) {
+    // Slack may have accepted a post that timed out here: posting it again a minute later
+    // would put two digests in the channel, so it counts as visible but incomplete
+    if (err instanceof OperationTimeoutError) throw new DigestPartiallyPostedError(null, 0, chunks.length, err);
+    throw err;
+  }
 
   for (let i = 0; i < chunks.length; i++) {
     try {
