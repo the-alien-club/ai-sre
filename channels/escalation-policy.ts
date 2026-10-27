@@ -6,11 +6,15 @@
 // channel instructions say so, and this makes it hold even if the agent escalates anyway,
 // or a Trivy escalation persisted before this change is restored from disk.
 
-const TRIVY = /^trivy[-_ ]|\btrivy\b/i;
+// The fingerprints the Trivy channel hands out (trivy-secret-*) and the ones the agent built
+// from them for the 2026-10 escalations (trivy-vuln-*). Matched on the fingerprint only: an
+// alert NAMED after Trivy, such as the trivy-operator pod crashlooping, is an outage of
+// secret detection and must still page.
+const TRIVY_FINGERPRINT = /^trivy-/i;
 
-/** Whether an escalation is about a Trivy finding, by its fingerprint or its alert name. */
-export function isTrivyEscalation(alertFingerprint: string, alertName: string): boolean {
-  return TRIVY.test(alertFingerprint) || TRIVY.test(alertName);
+/** Whether an escalation is about a Trivy finding. */
+export function isTrivyEscalation(alertFingerprint: string): boolean {
+  return TRIVY_FINGERPRINT.test(alertFingerprint);
 }
 
 /** The escalate tool's answer to a Trivy escalation, as an error the agent can act on. */

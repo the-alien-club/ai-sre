@@ -475,7 +475,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
 
     // Trivy findings are posted, and paged at most once, by the Trivy channel itself
-    if (isTrivyEscalation(alert_fingerprint, alert_name)) {
+    if (isTrivyEscalation(alert_fingerprint)) {
       console.error(`[slack-sre] refused a Trivy escalation from the agent: ${alert_fingerprint} (${alert_name})`);
       return {
         content: [{ type: "text" as const, text: TRIVY_ESCALATION_REFUSED }],
@@ -880,7 +880,7 @@ setInterval(async () => {
   for (const [fingerprint, esc] of activeEscalations) {
     if (esc.acknowledged) continue;
     // Restored from before the Trivy channel posted its own findings: never nag about one
-    if (isTrivyEscalation(fingerprint, esc.alertName)) continue;
+    if (isTrivyEscalation(fingerprint)) continue;
 
     // Once MAX_AGENT_NAGS is reached, only Slack-nag at a slower cadence.
     // Stop pushing events into Claude's session to preserve context window.
