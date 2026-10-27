@@ -40,6 +40,13 @@ import { fileURLToPath } from "node:url";
 import { classifyAddressing, stripBotMention } from "./message-gate.js";
 import { createThreadOwnership } from "./thread-ownership.js";
 import { createEscalationStore, type Escalation } from "./escalation-store.js";
+import { isTrivyEscalation, TRIVY_ESCALATION_REFUSED } from "./escalation-policy.js";
+import {
+  operatorMentions,
+  operatorRoster,
+  parseOperators,
+  type OperatorRoster,
+} from "./operators.js";
 
 // -- Configuration (env vars) -------------------------------------------------
 
@@ -111,47 +118,7 @@ const DATA_DIR =
   process.env.SRE_DATA_DIR ??
   join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
 
-/**
- * Parse the operator allowlist. Operators are the only people whose messages reach
- * the agent, and the only people who may approve or deny permission requests.
- *
- * Format: "<slack_user_id>:<display_name>" entries, comma-separated. The display name
- * is carried so the agent can address people by name without needing the users:read
- * scope or a lookup round-trip.
- */
-function parseOperators(raw: string): Map<string, string> {
-  const operators = new Map<string, string>();
-
-  for (const entry of raw.split(",")) {
-    const trimmed = entry.trim();
-    if (!trimmed) continue;
-
-    const separator = trimmed.indexOf(":");
-    if (separator === -1) {
-      throw new Error(
-        `SRE_OPERATORS entry "${trimmed}" is malformed — expected "<slack_user_id>:<display_name>"`
-      );
-    }
-
-    const userId = trimmed.slice(0, separator).trim();
-    const displayName = trimmed.slice(separator + 1).trim();
-    if (!userId || !displayName) {
-      throw new Error(
-        `SRE_OPERATORS entry "${trimmed}" is malformed — both user ID and display name are required`
-      );
-    }
-
-    operators.set(userId, displayName);
-  }
-
-  if (operators.size === 0) {
-    throw new Error("SRE_OPERATORS is empty — at least one operator is required");
-  }
-
-  return operators;
-}
-
-let OPERATORS: Map<string, string>;
+let OPERATORS: OperatorRoster;
 try {
   OPERATORS = parseOperators(SRE_OPERATORS_RAW);
 } catch (err) {
@@ -162,12 +129,8 @@ try {
 }
 
 // Mention string used to page the team on critical escalations.
-const OPERATOR_MENTIONS = [...OPERATORS.keys()]
-  .map((id) => `<@${id}>`)
-  .join(" ");
-const OPERATOR_ROSTER = [...OPERATORS.entries()]
-  .map(([id, name]) => `${name} (${id})`)
-  .join(", ");
+const OPERATOR_MENTIONS = operatorMentions(OPERATORS);
+const OPERATOR_ROSTER = operatorRoster(OPERATORS);
 
 // -- Escalation tracking ------------------------------------------------------
 //
@@ -510,6 +473,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         environment: string;
         message: string;
       };
+
+    // Trivy findings are posted, and paged at most once, by the Trivy channel itself
+    if (isTrivyEscalation(alert_fingerprint)) {
+      console.error(`[slack-sre] refused a Trivy escalation from the agent: ${alert_fingerprint} (${alert_name})`);
+      return {
+        content: [{ type: "text" as const, text: TRIVY_ESCALATION_REFUSED }],
+        isError: true,
+      };
+    }
 
     try {
       // Build escalation message with severity-appropriate urgency
@@ -907,6 +879,8 @@ setInterval(async () => {
 
   for (const [fingerprint, esc] of activeEscalations) {
     if (esc.acknowledged) continue;
+    // Restored from before the Trivy channel posted its own findings: never nag about one
+    if (isTrivyEscalation(fingerprint)) continue;
 
     // Once MAX_AGENT_NAGS is reached, only Slack-nag at a slower cadence.
     // Stop pushing events into Claude's session to preserve context window.

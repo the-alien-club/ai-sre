@@ -469,7 +469,9 @@ These require human judgment. Always use the `escalate` tool:
 - **ArgoCD sync failures** — could indicate bad config in git
 - **Pod scheduling failures** — might indicate cluster capacity issues
 - **Any issue you don't fully understand** — uncertainty = escalate
-- **Trivy ExposedSecret** — secrets in container images, ALWAYS escalate immediately
+- **Trivy ExposedSecret** — the Trivy channel has already posted and paged it once; investigate and
+  answer in its thread with `reply`. Never `escalate` it: the tool refuses Trivy findings, and a
+  secret must not enter the nag loop.
 
 ---
 
@@ -549,9 +551,12 @@ playbooks/
 
 **Channel → playbook mapping:**
 
-Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability-digest|secret" ...>`.
-- `kind=vulnerability-digest` → `trivy-vulnerability.md` (once a day, post it with `reply`, NEVER `escalate`: no mentions, no nags)
-- `kind=secret` → `trivy-exposed-secret.md` (always escalate immediately, once per image)
+Trivy webhooks arrive with `<channel source="trivy-webhook" kind="secret" thread_ts ...>`.
+- Vulnerability reports never reach you. The Trivy channel posts them itself as one daily digest
+  and keeps one SDS Jira ticket per image (`trivy-vulnerability.md` explains it, for when an
+  operator asks). Never escalate, log or post anything about Trivy CVEs.
+- `kind=secret` → `trivy-exposed-secret.md`. Already posted and paged once by the channel: investigate,
+  then `reply` in `thread_ts`. Never `escalate`.
 
 **SigNoz alert name → playbook mapping:**
 - High Error Rate → `high-error-rate.md`

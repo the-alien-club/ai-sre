@@ -4,6 +4,11 @@ Triggered when Trivy detects a secret (API key, token, credential) baked into a 
 **This is always urgent regardless of the image's deployment status** — if the secret is real,
 it may already be compromised.
 
+The Trivy channel has **already posted the finding and paged the operators, exactly once** per
+image build, before the agent hears of it. Rescans that still find it stay silent. There is no
+reminder loop, and the `escalate` tool refuses Trivy findings: everything below goes in the
+thread given by the event's `thread_ts`, with `reply`.
+
 1. Identify the image and what secret was found:
    - Note the rule ID and category (AWS, GitHub token, generic API key, etc.)
    - Note the file path inside the image where the secret was detected
@@ -15,7 +20,7 @@ it may already be compromised.
    ```bash
    cd ~/repos/<repo> && git log --all --source --oneline -S "<partial_secret_value>" -- <file_path>
    ```
-4. **ALWAYS recommend immediate escalate** with:
+4. **Reply in the finding's thread** (`thread_ts`) with:
    - What kind of secret was exposed
    - Whether the image is currently deployed (multiplies urgency if yes)
    - The file path in the image
