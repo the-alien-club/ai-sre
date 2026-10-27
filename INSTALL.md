@@ -263,8 +263,11 @@ without them rather than running against the wrong channel or with no allowlist.
 
 The Trivy channel posts to Slack and Jira itself, so it also requires `SLACK_BOT_TOKEN`,
 `SRE_SLACK_CHANNEL`, `SRE_OPERATORS` and the three `JIRA_*` variables. Without any of them it
-refuses to start, `start-agent.sh` sees port 8790 never bind, and the whole agent exits
-non-zero. **Add the `JIRA_*` variables to an existing VM's `.env` before deploying 0.4.0.**
+refuses to start. `start-agent.sh` checks every setting the channels require before it stops
+the running session: if one is missing it names it in pm2's error log and the team channel,
+leaves the running session as it is, and exits non-zero. **Add the `JIRA_*` variables to an
+existing VM's `.env` before deploying 0.4.0**, or the restart is refused and the session
+already running, if any, stays on the old code until they are added.
 
 ### Creating the GitLab access token
 
@@ -412,6 +415,8 @@ sudo env PATH=$PATH:/home/sre-agent/.local/share/npm-global/bin pm2 startup syst
 
 The start script (`scripts/start-agent.sh`) handles:
 - Loading `.env`
+- Refusing to restart, before stopping the running session, when `.env` lacks a setting a
+  channel requires (named in the log and the team channel)
 - Waiting for the previous session's webhook ports to be released
 - Starting Claude Code in a tmux session with channels
 - Auto-accepting the dev channels prompt

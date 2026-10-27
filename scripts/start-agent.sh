@@ -29,6 +29,30 @@ SIGNOZ_PORT="${SIGNOZ_WEBHOOK_PORT:-8788}"
 TRIVY_PORT="${TRIVY_WEBHOOK_PORT:-8790}"
 # shellcheck source=scripts/lib/wait-for-port.sh
 source "$SRE_DIR/scripts/lib/wait-for-port.sh"
+# shellcheck source=scripts/lib/channel-settings.sh
+source "$SRE_DIR/scripts/lib/channel-settings.sh"
+# shellcheck source=scripts/lib/notify-ops.sh
+source "$SRE_DIR/scripts/lib/notify-ops.sh"
+
+# A channel without its settings never binds its port, so the new session could not take
+# alert ingestion over. Refuse before stopping the running session (see
+# channel-settings.sh), and say which settings are missing.
+MISSING_SETTINGS="$(missing_channel_settings)"
+if [ -n "$MISSING_SETTINGS" ]; then
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    RUNNING="The session already running was left as it is, on the code it started with."
+  else
+    RUNNING="No agent session is running: alerts and Slack are not being handled."
+  fi
+  echo "[start-agent] not restarting: .env does not set ${MISSING_SETTINGS}, which the channels need to start. ${RUNNING}" >&2
+  notify_ops ":rotating_light: *SRE Agent Health Alert*
+
+*Restart refused:* the agent on ${HOSTNAME} did not restart at $(date -u '+%Y-%m-%d %H:%M UTC'): its \`.env\` does not set ${MISSING_SETTINGS}, which the channels need to start.
+*Impact:* ${RUNNING}
+*Action needed:* add them to \`.env\` on the agent VM (see \`.env.example\`), then \`pm2 restart sre-agent\`." \
+    || echo "[start-agent] ERROR: the team channel could not be told that the restart was refused" >&2
+  exit 1
+fi
 
 # Kill existing session if any
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true

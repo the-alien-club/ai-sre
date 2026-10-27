@@ -61,6 +61,9 @@ export interface JiraClientOptions {
 
 const ERROR_DETAIL_CHARS = 300;
 
+/** The environment variables readJiraConfig requires; start-agent.sh checks them too. */
+export const JIRA_SETTINGS = ["JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"] as const;
+
 /**
  * Reads the Jira credentials. All three are required and have no default: a channel that
  * would silently skip its tickets, or post them to a guessed site, is worse than one that
@@ -68,7 +71,7 @@ const ERROR_DETAIL_CHARS = 300;
  * @throws Error naming every missing or invalid variable.
  */
 export function readJiraConfig(env: NodeJS.ProcessEnv): JiraConfig {
-  const missing = ["JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"].filter((name) => !env[name]);
+  const missing = JIRA_SETTINGS.filter((name) => !env[name]);
   if (missing.length > 0) {
     throw new Error(`${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} not set (see .env.example)`);
   }
