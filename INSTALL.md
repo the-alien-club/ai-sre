@@ -404,10 +404,13 @@ sudo env PATH=$PATH:/home/sre-agent/.local/share/npm-global/bin pm2 startup syst
 
 The start script (`scripts/start-agent.sh`) handles:
 - Loading `.env`
+- Waiting for the previous session's webhook ports to be released
 - Starting Claude Code in a tmux session with channels
 - Auto-accepting the dev channels prompt
-- Waiting for the webhook port to bind
-- Sending the initial prompt
+- Waiting for this session's webhook channels to bind their ports
+- Pasting the initial prompt (briefing and `config/deployment.md`) and proving it was
+  submitted; a failure is logged and posted to the team channel (`SLACK_BOT_TOKEN`,
+  `SRE_SLACK_CHANNEL`)
 
 ## 12. Set up daily restart cron
 

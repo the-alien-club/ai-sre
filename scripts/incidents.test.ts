@@ -179,3 +179,48 @@ test("briefing and patterns still run with defaults", () => {
   assert.match(run(db, "briefing").stdout, /SRE Briefing — Last 7 Days/);
   assert.match(run(db, "patterns").stdout, /Recurring Alerts \(last 7 days\)/);
 });
+
+/** Insert <count> incidents straight into the database, for volumes the CLI would take minutes to log. */
+function bulkInsert(db: string, count: number, select: string): void {
+  const sql = `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${count})
+    INSERT INTO incidents (alert_name, severity, status, cluster, service, verdict, action, cause) ${select};`;
+  const result = spawnSync("sqlite3", ["-bail", db], { input: sql, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+test("briefing stays bounded however many incidents there are", () => {
+  // 263 Trivy findings in 3 days once made the briefing 50KB, too large for tmux to deliver
+  const db = scratchDb();
+  run(db, "briefing");
+  const long = "x".repeat(4_000);
+  bulkInsert(db, 3_000, `SELECT 'Alert ' || (i % 300) || '${long.slice(0, 200)}', 'critical', 'firing', 'cluster-' || (i % 300 % 7), 'svc-' || (i % 300 % 11), CASE WHEN i % 600 < 300 THEN 'real' ELSE 'noise' END, CASE i % 3 WHEN 0 THEN 'escalated' ELSE 'ignored' END, 'line one' || char(10) || 'line two ${long}' FROM n`);
+
+  const result = run(db, "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(Buffer.byteLength(result.stdout) < 12_000, `briefing is ${Buffer.byteLength(result.stdout)} bytes`);
+  const entries = result.stdout.split("\n").filter((line) => line.startsWith("  - "));
+  assert.equal(entries.length, 30, "10 classes in each of the three sections");
+  assert.equal(result.stdout.match(/^ {2}… and \d+ more alert classes: /gm)?.length, 3);
+  for (const line of entries) assert.ok(line.length < 400, `unclipped line: ${line.slice(0, 120)}…`);
+  assert.doesNotMatch(result.stdout, /^line two/m, "a multi-line cause must stay on its line");
+});
+
+test("briefing summarises a repeated alert class in one line", () => {
+  const db = scratchDb();
+  run(db, "briefing");
+  bulkInsert(db, 263, `SELECT 'Trivy VulnerabilityReport', 'critical', 'firing', CASE i % 2 WHEN 0 THEN 'platform-prod' ELSE 'platform-dev' END, 'image-' || i, 'real', 'escalated', 'image ' || i || ' has CVEs' FROM n`);
+
+  const result = run(db, "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Pending escalations \(unacknowledged, last 3 days: 263 in 1 alert classes, latest first\):\n {2}- \[\d{4}-\d\d-\d\d\] Trivy VulnerabilityReport — 263x on platform-\w+,platform-\w+ \(latest #\d+\): image \d+ has CVEs\n\n/);
+});
+
+test("briefing tells the same noisy alert on different clusters apart", () => {
+  const db = scratchDb();
+  run(db, "briefing");
+  bulkInsert(db, 8, `SELECT 'Falco Suspicious Process', 'warning', 'firing', CASE WHEN i <= 5 THEN 'platform-prod' ELSE 'platform-dev' END, 'falco', 'noise', 'ignored', '' FROM n`);
+
+  const result = run(db, "briefing");
+  assert.match(result.stdout, /^ {2}- Falco Suspicious Process on falco @ platform-prod \| 5x$/m);
+  assert.match(result.stdout, /^ {2}- Falco Suspicious Process on falco @ platform-dev \| 3x$/m);
+});

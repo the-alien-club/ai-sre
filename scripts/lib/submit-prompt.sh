@@ -6,10 +6,19 @@
 # sat unsubmitted in the input box for the agent's whole life, so it never received its
 # briefing or deployment config (SDS-992).
 #
+# The prompt is not typed with `send-keys -l` either: tmux carries a send-keys argument in
+# one client-to-server message, so a prompt over about 16KB fails with "command too long"
+# (the ~50KB prompt did, on every restart from 2026-10-27 03:00). It goes through a paste
+# buffer instead: `load-buffer -` streams stdin to the server in chunks, with no size
+# limit, and `paste-buffer` writes it into the pane as one paste.
+#
 # Success is never inferred from something being absent. Every tmux call is checked, the
 # input box must be recognised, the prompt must be seen landing in it, and only an input
 # box that is then empty again counts as submitted. A session that is gone, a UI this code
 # does not recognise, or a prompt that never lands are all failures, never successes.
+
+# shellcheck source=scripts/lib/notify-ops.sh
+source "$(dirname "${BASH_SOURCE[0]}")/notify-ops.sh"
 
 # The input box as rendered by Claude Code (checked on the VM, Claude Code 2.1.110, tmux
 # 3.4): the lines between the last two horizontal rules, the first of them starting with
@@ -40,7 +49,7 @@ input_box_text() {
 }
 
 # prompt_landed <box> <prompt>: whether the input box holds this prompt. Claude Code shows
-# a short prompt as typed and collapses a long one into "[Pasted text #1 +48 lines]"
+# a short prompt as pasted and collapses a long one into "[Pasted text #1 +48 lines]"
 # (as seen on the VM), so either the prompt's first line or that placeholder counts;
 # any other content, such as text someone else typed, does not.
 prompt_landed() {
@@ -50,14 +59,31 @@ prompt_landed() {
   [[ -n "$first_line" && "$box" == *"$first_line"* ]] || [[ "$box" == *"[Pastedtext#"* ]]
 }
 
+# paste_prompt <tmux-session> <prompt>: paste the prompt into the session's pane, whatever
+# its size. -p brackets the paste when the application has enabled bracketed paste, and -r
+# keeps newlines as LF, as `send-keys -l` sent them: tmux would otherwise turn each into a
+# CR, which is Enter. -d drops the buffer once pasted; on failure it is deleted here, so
+# the briefing does not linger in the tmux server.
+paste_prompt() {
+  local session="$1" prompt="$2" buffer="sre-startup-prompt-$$"
+
+  if ! printf '%s' "$prompt" | tmux load-buffer -b "$buffer" -; then
+    echo "[start-agent] could not load the startup prompt into a tmux buffer" >&2
+    return 1
+  fi
+  if ! tmux paste-buffer -b "$buffer" -d -p -r -t "$session"; then
+    tmux delete-buffer -b "$buffer" \
+      || echo "[start-agent] could not delete tmux buffer ${buffer}, which holds the startup prompt" >&2
+    echo "[start-agent] could not paste the startup prompt into tmux session ${session}" >&2
+    return 1
+  fi
+}
+
 # submit_prompt <tmux-session> <prompt> [attempts]
 submit_prompt() {
   local session="$1" prompt="$2" attempts="${3:-5}" pause="${SUBMIT_PROMPT_PAUSE:-2}" box attempt
 
-  if ! tmux send-keys -t "$session" -l -- "$prompt"; then
-    echo "[start-agent] could not type the startup prompt into tmux session ${session}" >&2
-    return 1
-  fi
+  paste_prompt "$session" "$prompt" || return 1
 
   # The prompt must be seen in the input box before Enter means anything
   for (( attempt = 1; attempt <= attempts; attempt++ )); do
@@ -92,11 +118,21 @@ submit_prompt() {
   return 1
 }
 
-# submit_startup_prompt <tmux-session> <prompt>: submit, and on failure say so loudly with
-# the manual fix. Never fails the start: the agent is useful without its briefing (alerts
-# and Slack still flow), and a restart loop would take its triage down with it.
+# submit_startup_prompt <tmux-session> <prompt>: submit, and on failure say so loudly, in
+# the log and in the team channel, then fail. It is the caller's choice what a failure
+# means; start-agent.sh keeps the agent running, because it is useful without its briefing
+# (alerts and Slack still flow) and a restart loop would take its triage down with it.
 submit_startup_prompt() {
-  if ! submit_prompt "$1" "$2"; then
-    echo "[start-agent] ERROR: the agent is running WITHOUT its briefing and deployment config; submit it by hand: tmux send-keys -t $1 Enter" >&2
-  fi
+  submit_prompt "$1" "$2" && return 0
+
+  echo "[start-agent] ERROR: the agent is running WITHOUT its briefing and deployment config;" \
+    "see the error above. If the input box holds the prompt, tmux send-keys -t $1 Enter submits it;" \
+    "otherwise pm2 restart sre-agent" >&2
+  notify_ops ":rotating_light: *SRE Agent Health Alert*
+
+*Startup briefing not delivered:* the agent restarted on ${HOSTNAME} at $(date -u '+%Y-%m-%d %H:%M UTC') and is running WITHOUT its incident briefing and deployment config.
+*Impact:* alerts and Slack still reach it, but it triages without recent incident history and with the placeholder project IDs from CLAUDE.md.
+*Action needed:* read \`pm2 logs sre-agent --err --lines 20\` on the agent VM, then \`pm2 restart sre-agent\`." \
+    || echo "[start-agent] ERROR: the team channel could not be told that the briefing was not delivered" >&2
+  return 1
 }

@@ -25,12 +25,33 @@ export PATH="$HOME/.bun/bin:$PATH"
 
 SESSION_NAME="sre-agent"
 
+SIGNOZ_PORT="${SIGNOZ_WEBHOOK_PORT:-8788}"
+TRIVY_PORT="${TRIVY_WEBHOOK_PORT:-8790}"
+# shellcheck source=scripts/lib/wait-for-port.sh
+source "$SRE_DIR/scripts/lib/wait-for-port.sh"
+
 # Kill existing session if any
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+# The old session's channels take a moment to exit after it is killed. A new channel
+# started while one of them still holds its port dies with EADDRINUSE, so wait for the
+# ports to be released; one that stays held (an orphaned channel) is a failed start.
+if ! wait_for_port_free "SigNoz webhook" "$SIGNOZ_PORT" 20 \
+  || ! wait_for_port_free "Trivy webhook" "$TRIVY_PORT" 20; then
+  echo "[start-agent] a webhook port is still held; stop the process named above before restarting" >&2
+  exit 1
+fi
 
 # Start Claude Code in a tmux session
 tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
   "cd $SRE_DIR && claude --dangerously-skip-permissions --dangerously-load-development-channels server:signoz-webhook server:slack-sre server:trivy-webhook"
+# The channels run under this process; only a listener below it is this session's
+if ! SESSION_PID="$(tmux display-message -p -t "$SESSION_NAME" '#{pane_pid}')" \
+  || [[ ! "$SESSION_PID" =~ ^[0-9]+$ ]]; then
+  echo "[start-agent] could not read the PID of tmux session ${SESSION_NAME}" >&2
+  tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+  exit 1
+fi
 
 # Auto-accept the dev channels prompt
 # Poll tmux pane until we see the prompt, then send Enter
@@ -49,14 +70,13 @@ for _ in $(seq 1 30); do
   fi
 done
 
-# Wait for the webhook channels to bind. A channel that never binds (missing secret,
-# crash on start) means the agent would go live with no alert ingestion, which is worse
-# than not starting: stop the session and exit non-zero so pm2 restarts and the failure
-# shows up in its logs instead of passing silently.
-# shellcheck source=scripts/lib/wait-for-port.sh
-source "$SRE_DIR/scripts/lib/wait-for-port.sh"
-if ! wait_for_port "SigNoz webhook" "${SIGNOZ_WEBHOOK_PORT:-8788}" 30 \
-  || ! wait_for_port "Trivy webhook" "${TRIVY_WEBHOOK_PORT:-8790}" 15; then
+# Wait for this session's webhook channels to bind. A channel that never binds (missing
+# secret, crash on start) means the agent would go live with no alert ingestion, which is
+# worse than not starting: stop the session and exit non-zero so pm2 restarts and the
+# failure shows up in its logs instead of passing silently. A listener outside the session
+# does not count (see wait-for-port.sh).
+if ! wait_for_port "SigNoz webhook" "$SIGNOZ_PORT" 30 "$SESSION_PID" \
+  || ! wait_for_port "Trivy webhook" "$TRIVY_PORT" 15 "$SESSION_PID"; then
   tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
   echo "[start-agent] a webhook channel did not start; check the channel's stderr in the tmux log" >&2
   exit 1
@@ -98,13 +118,15 @@ Use these real values when spawning sub-agents — they override any placeholder
 
 Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the ops team via slack-sre. Remember you are in a shared team channel, not a private DM — see \"Talking to the Ops Team\" in CLAUDE.md. Confirm you are ready by listing your kubectl contexts."
 
-# Submit the prompt and prove it was sent; a failure is reported loudly but does not stop
-# the agent (see submit-prompt.sh).
+# Submit the prompt and prove it was sent. A failure is reported in the log and the team
+# channel, and the agent keeps running without its briefing (see submit-prompt.sh).
 # shellcheck source=scripts/lib/submit-prompt.sh
 source "$SRE_DIR/scripts/lib/submit-prompt.sh"
-submit_startup_prompt "$SESSION_NAME" "$PROMPT"
-
-echo "[start-agent] Agent started with briefing, monitoring tmux session"
+if submit_startup_prompt "$SESSION_NAME" "$PROMPT"; then
+  echo "[start-agent] Agent started with briefing, monitoring tmux session"
+else
+  echo "[start-agent] Agent started WITHOUT its briefing, monitoring tmux session" >&2
+fi
 
 # Keep this script alive so pm2 considers the process running.
 # Monitor the tmux session — if it dies, this script exits and pm2 restarts.
