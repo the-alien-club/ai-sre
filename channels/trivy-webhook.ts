@@ -51,7 +51,13 @@ import {
   ticketUpdates,
 } from "./trivy-findings.js";
 import { syncTickets } from "./trivy-jira.js";
-import { createSlackPoster, DigestPartiallyPostedError, postDigest, secretEscalationText } from "./trivy-slack.js";
+import {
+  createSlackPoster,
+  DigestPartiallyPostedError,
+  postDigest,
+  secretEscalationText,
+  type SecretEscalation,
+} from "./trivy-slack.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 import { OperationTimeoutError, withTimeout } from "./with-timeout.js";
 
@@ -85,6 +91,10 @@ const DIGEST_RUN_TIMEOUT_MS = JIRA_BUDGET_MS + 5 * 60 * 1000;
 // A digest that could not be posted is retried with backoff, never every minute
 const DIGEST_RETRY_MIN_MS = 60 * 1000;
 const DIGEST_RETRY_MAX_MS = 60 * 60 * 1000;
+// A secret that could not be posted is retried sooner: it may be a live leak
+const SECRET_RETRY_MIN_MS = 30 * 1000;
+const SECRET_RETRY_MAX_MS = 15 * 60 * 1000;
+const SECRET_RETRY_CHECK_MS = 15 * 1000;
 
 const store = createTrivyStore({ path: join(DATA_DIR, "trivy-findings.json") });
 const state = store.load();
@@ -98,9 +108,6 @@ const slack = createSlackPoster(
 );
 const jira = createJiraClient(JIRA, { timeoutMs: JIRA_TIMEOUT_MS });
 
-// Secret findings being escalated right now: a second report for the same image (several
-// workloads run it) must not page again while the first post is in flight.
-const secretsInFlight = new Set<string>();
 
 function requireSetting(name: string, what: string): string {
   const value = process.env[name]?.trim();
@@ -179,6 +186,20 @@ function handleVulnerabilityReport(res: ServerResponse, report: VulnerabilityRep
   respond(res, 200, { status, kind: report.kind });
 }
 
+interface PendingSecret {
+  escalation: SecretEscalation;
+  reportName: string;
+  failures: number;
+  nextAttemptAt: number;
+  inFlight: boolean;
+}
+
+// Exposed secrets not yet posted. A failed post stays here and is retried with backoff, so
+// a Slack blip can delay a page but never drop it, and a second report for the same image
+// (several workloads run it) joins the pending one instead of paging twice. In memory only:
+// a restart forgets it, and the next rescan, which finds the secret not yet reported, re-queues it.
+const pendingSecrets = new Map<string, PendingSecret>();
+
 async function handleExposedSecretReport(res: ServerResponse, report: ExposedSecretReport): Promise<void> {
   const kind = report.kind;
   const secrets = actionableSecrets(report.report.secrets);
@@ -190,35 +211,77 @@ async function handleExposedSecretReport(res: ServerResponse, report: ExposedSec
 
   const artifact = report.report.artifact;
   const fingerprint = secretFingerprint(artifact, secrets);
-  const now = Date.now();
 
-  // The operator rescans daily: a finding already escalated stays silent, for good
-  if (secretsInFlight.has(fingerprint) || isSecretReported(state, fingerprint, now)) {
+  // The operator rescans daily: a finding already escalated (or about to be) stays silent
+  if (pendingSecrets.has(fingerprint) || isSecretReported(state, fingerprint, Date.now())) {
     if (saveOrRespond500(res, kind, "could not persist a secret sighting")) respond(res, 200, { status: "duplicate", kind });
     return;
   }
 
-  const image = displayImage(artifact);
-  const namespace = report.metadata.namespace ?? "unknown";
-  const workload = workloadOf(report.metadata);
+  pendingSecrets.set(fingerprint, {
+    escalation: {
+      image: displayImage(artifact),
+      workload: workloadOf(report.metadata),
+      namespace: report.metadata.namespace ?? "unknown",
+      secrets,
+    },
+    reportName: report.metadata.name,
+    failures: 0,
+    nextAttemptAt: 0,
+    inFlight: false,
+  });
 
-  secretsInFlight.add(fingerprint);
+  const outcome = await escalateSecret(fingerprint);
+  if (outcome === "persist_failed") respond(res, 500, { status: "persist_failed", kind });
+  else respond(res, outcome === "escalated" ? 200 : 202, { status: outcome, kind });
+}
+
+/**
+ * Posts one pending secret finding, paging the operators, then hands it to the agent.
+ * A post that timed out may still have reached Slack; it is retried anyway, because for a
+ * possible leak a second page is the lesser harm than none.
+ */
+async function escalateSecret(fingerprint: string): Promise<"escalated" | "retrying" | "persist_failed"> {
+  const pending = pendingSecrets.get(fingerprint);
+  if (!pending || pending.inFlight) return "retrying";
+
+  const { escalation } = pending;
+  pending.inFlight = true;
   let threadTs: string;
   try {
-    threadTs = await slack.post(secretEscalationText({ image, workload, namespace, secrets }, OPERATOR_MENTIONS));
-    markSecretReported(state, fingerprint, now);
+    threadTs = await slack.post(secretEscalationText(escalation, OPERATOR_MENTIONS));
   } catch (err) {
-    console.error(`[trivy-webhook] could not post the exposed-secret escalation for ${image}: ${errorMessage(err)}`);
-    respond(res, 502, { status: "slack_failed", kind });
-    return;
+    pending.failures++;
+    const delay = Math.min(SECRET_RETRY_MIN_MS * 2 ** (pending.failures - 1), SECRET_RETRY_MAX_MS);
+    pending.nextAttemptAt = Date.now() + delay;
+    console.error(
+      `[trivy-webhook] could not post the exposed-secret escalation for ${escalation.image} ` +
+        `(attempt ${pending.failures}), retrying in ${Math.round(delay / 1000)} s: ${errorMessage(err)}`
+    );
+    return "retrying";
   } finally {
-    secretsInFlight.delete(fingerprint);
+    pending.inFlight = false;
   }
 
-  // Already visible and paged. If this fails, the in-memory state still stops a re-page until
-  // a restart; the 500 makes the failure visible to the sender too.
-  const persisted = saveOrRespond500(res, kind, `escalated ${image} but could not persist it, a restart may page again`);
+  pendingSecrets.delete(fingerprint);
+  markSecretReported(state, fingerprint, Date.now());
 
+  // Already visible and paged. If the write fails, the in-memory state still stops a
+  // re-page until a restart; the caller reports the failure.
+  let persisted = true;
+  try {
+    store.save(state);
+  } catch (err) {
+    persisted = false;
+    console.error(`[trivy-webhook] escalated ${escalation.image} but could not persist it, a restart may page again: ${errorMessage(err)}`);
+  }
+
+  await notifyAgentOfSecret(escalation, pending.reportName, threadTs);
+  return persisted ? "escalated" : "persist_failed";
+}
+
+async function notifyAgentOfSecret(escalation: SecretEscalation, reportName: string, threadTs: string): Promise<void> {
+  const { image, workload, namespace, secrets } = escalation;
   const criticalCount = secrets.filter((s) => s.severity === "CRITICAL").length;
   const highCount = secrets.filter((s) => s.severity === "HIGH").length;
 
@@ -238,7 +301,7 @@ async function handleExposedSecretReport(res: ServerResponse, report: ExposedSec
             image,
             workload,
             secret_count: String(secrets.length),
-            fingerprint: `trivy-secret-${report.metadata.name}`,
+            fingerprint: `trivy-secret-${reportName}`,
             thread_ts: threadTs,
             channel: SRE_SLACK_CHANNEL,
           },
@@ -255,9 +318,17 @@ async function handleExposedSecretReport(res: ServerResponse, report: ExposedSec
         console.error(`[trivy-webhook] could not say so in thread ${threadTs} either: ${errorMessage(postErr)}`)
       );
   }
-
-  if (persisted) respond(res, 200, { status: "escalated", kind });
 }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [fingerprint, pending] of pendingSecrets) {
+    if (pending.inFlight || now < pending.nextAttemptAt) continue;
+    escalateSecret(fingerprint).catch((err: unknown) =>
+      console.error(`[trivy-webhook] secret escalation retry failed unexpectedly: ${errorMessage(err)}`)
+    );
+  }
+}, SECRET_RETRY_CHECK_MS);
 
 // -- HTTP Server --------------------------------------------------------------
 
