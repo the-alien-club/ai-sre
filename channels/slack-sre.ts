@@ -40,6 +40,7 @@ import { fileURLToPath } from "node:url";
 import { classifyAddressing, stripBotMention } from "./message-gate.js";
 import { createThreadOwnership } from "./thread-ownership.js";
 import { createEscalationStore, type Escalation } from "./escalation-store.js";
+import { isTrivyEscalation, TRIVY_ESCALATION_REFUSED } from "./escalation-policy.js";
 import {
   operatorMentions,
   operatorRoster,
@@ -473,6 +474,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         message: string;
       };
 
+    // Trivy findings are posted, and paged at most once, by the Trivy channel itself
+    if (isTrivyEscalation(alert_fingerprint, alert_name)) {
+      console.error(`[slack-sre] refused a Trivy escalation from the agent: ${alert_fingerprint} (${alert_name})`);
+      return {
+        content: [{ type: "text" as const, text: TRIVY_ESCALATION_REFUSED }],
+        isError: true,
+      };
+    }
+
     try {
       // Build escalation message with severity-appropriate urgency
       const severityEmoji =
@@ -869,6 +879,8 @@ setInterval(async () => {
 
   for (const [fingerprint, esc] of activeEscalations) {
     if (esc.acknowledged) continue;
+    // Restored from before the Trivy channel posted its own findings: never nag about one
+    if (isTrivyEscalation(fingerprint, esc.alertName)) continue;
 
     // Once MAX_AGENT_NAGS is reached, only Slack-nag at a slower cadence.
     // Stop pushing events into Claude's session to preserve context window.
