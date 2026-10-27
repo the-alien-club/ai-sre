@@ -59,7 +59,7 @@ test("a repository gets one ticket across tags, then comments, never a duplicate
   recordVulnerabilityReport(state, report("ns-data-streaming/backend", "0.18.2"), NOW);
   recordVulnerabilityReport(state, report("ns-data-streaming/backend", "0.18.3"), NOW);
 
-  const first = await syncTickets(state, jira, ticketUpdates(state), { deadline: NOW + 1, now: () => NOW });
+  const first = await syncTickets(state, jira, ticketUpdates(state), { deadline: NOW + 1, persist: () => {}, now: () => NOW });
   assert.deepEqual(first, [{ repository: "ns-data-streaming/backend", issueKey: "SDS-1", action: "created" }]);
   assert.equal(jira.issues.length, 1);
   assert.deepEqual(jira.issues[0].labels, ["trivy", imageLabel("ns-data-streaming/backend")]);
@@ -72,7 +72,7 @@ test("a repository gets one ticket across tags, then comments, never a duplicate
 
   // State lost (or a new CVE): the open ticket is found by label and commented on
   recordVulnerabilityReport(state, report("ns-data-streaming/backend", "0.18.4", "CVE-2"), NOW);
-  const second = await syncTickets(state, jira, ticketUpdates(state), { deadline: NOW + 1, now: () => NOW });
+  const second = await syncTickets(state, jira, ticketUpdates(state), { deadline: NOW + 1, persist: () => {}, now: () => NOW });
   assert.deepEqual(second, [{ repository: "ns-data-streaming/backend", issueKey: "SDS-1", action: "commented" }]);
   assert.equal(jira.issues.length, 1);
   assert.equal(jira.comments.length, 1);
@@ -87,7 +87,7 @@ test("a failed repository is reported and retried later; the others still sync",
   recordVulnerabilityReport(state, report("broken"), NOW);
   recordVulnerabilityReport(state, report("fine"), NOW);
 
-  const results = await syncTickets(state, jira, ticketUpdates(state), { deadline: NOW + 1, now: () => NOW });
+  const results = await syncTickets(state, jira, ticketUpdates(state), { deadline: NOW + 1, persist: () => {}, now: () => NOW });
   assert.deepEqual(results, [
     { repository: "broken", error: "HTTP 500" },
     { repository: "fine", issueKey: "SDS-1", action: "created" },
@@ -104,6 +104,7 @@ test("updates past the time budget are not attempted, and stay pending", async (
   let clock = NOW;
   const results = await syncTickets(state, jira, ticketUpdates(state), {
     deadline: NOW + 10,
+    persist: () => {},
     now: () => {
       const t = clock;
       clock += 10;
@@ -114,4 +115,33 @@ test("updates past the time budget are not attempted, and stay pending", async (
   assert.equal(jira.issues.length, 1);
   assert.match(JSON.stringify(results[1]), /not attempted/);
   assert.deepEqual(ticketUpdates(state).map((u) => u.repository), ["b"]);
+});
+
+test("each ticket write is persisted before the next, and a failed write stops the sync", async () => {
+  const state = emptyState();
+  const jira = new FakeJira();
+  recordVulnerabilityReport(state, report("a"), NOW);
+  recordVulnerabilityReport(state, report("b"), NOW);
+
+  const persisted: string[][] = [];
+  await syncTickets(state, jira, ticketUpdates(state), {
+    deadline: NOW + 1,
+    persist: () => persisted.push(Object.keys(state.jiraTickets)),
+    now: () => NOW,
+  });
+  assert.deepEqual(persisted, [["a"], ["a", "b"]]);
+
+  const fresh = emptyState();
+  recordVulnerabilityReport(fresh, report("c"), NOW);
+  recordVulnerabilityReport(fresh, report("d"), NOW);
+  await assert.rejects(
+    syncTickets(fresh, new FakeJira(), ticketUpdates(fresh), {
+      deadline: NOW + 1,
+      persist: () => {
+        throw new Error("disk full");
+      },
+      now: () => NOW,
+    }),
+    /disk full/
+  );
 });

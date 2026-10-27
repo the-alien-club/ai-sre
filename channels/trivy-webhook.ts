@@ -410,8 +410,10 @@ async function runDigest(): Promise<void> {
   const now = Date.now();
 
   // Tickets first, so the digest can link them
-  const tickets = await syncTickets(state, jira, ticketUpdates(state), { deadline: now + JIRA_BUDGET_MS });
-  store.save(state);
+  const tickets = await syncTickets(state, jira, ticketUpdates(state), {
+    deadline: now + JIRA_BUDGET_MS,
+    persist: () => store.save(state),
+  });
 
   const digest = buildDigest(state, now, tickets, (key) => jira.browseUrl(key));
 

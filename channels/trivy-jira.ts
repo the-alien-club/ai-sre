@@ -76,6 +76,12 @@ export async function syncTicket(jira: JiraClient, update: TicketUpdate): Promis
 export interface SyncOptions {
   /** Wall-clock ceiling for the whole sync: no update starts after it. */
   deadline: number;
+  /**
+   * Persists the state after each ticket write, so a kill mid-sync cannot make the next
+   * digest comment the same CVEs again. A failure stops the sync: later writes would not
+   * be remembered either.
+   */
+  persist: () => void;
   now?: () => number;
 }
 
@@ -91,7 +97,7 @@ export async function syncTickets(
   updates: TicketUpdate[],
   options: SyncOptions
 ): Promise<TicketResult[]> {
-  const { deadline, now = Date.now } = options;
+  const { deadline, persist, now = Date.now } = options;
   const results: TicketResult[] = [];
 
   for (const update of updates) {
@@ -100,15 +106,19 @@ export async function syncTickets(
       continue;
     }
 
+    let synced: Awaited<ReturnType<typeof syncTicket>>;
     try {
-      const { issueKey, action } = await syncTicket(jira, update);
-      markTicketSynced(state, update, issueKey);
-      results.push({ repository: update.repository, issueKey, action });
+      synced = await syncTicket(jira, update);
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       console.error(`[trivy-jira] ticket update for ${update.repository} failed, retried at the next digest: ${error}`);
       results.push({ repository: update.repository, error });
+      continue;
     }
+
+    markTicketSynced(state, update, synced.issueKey);
+    persist();
+    results.push({ repository: update.repository, ...synced });
   }
 
   const skipped = results.filter((r) => "error" in r && r.error.startsWith("not attempted")).length;
