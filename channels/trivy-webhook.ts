@@ -2,50 +2,115 @@
 
 // Trivy Webhook Channel — receives Trivy Operator webhooks for security findings.
 //
-// Filters:
-// - VulnerabilityReport: fixable HIGH/CRITICAL only, recorded and sent as ONE daily digest
-// - ExposedSecretReport: forwarded at once, once per image, known false positives dropped
-// - ConfigAuditReport: IGNORED
-// - ClusterComplianceReport: IGNORED
+// A CVE backlog is not a page. On 2026-10-26/27 the agent turned each VulnerabilityReport
+// into a critical escalation: 263 incidents in 14 hours, 256 escalated, 16 threads nagged
+// 8-12 times with mentions. So this channel posts Trivy findings to Slack itself, and the
+// agent only ever hears about exposed secrets:
+//
+// - VulnerabilityReport: recorded on disk. Once a day, every image's CVE counts by severity
+//   go out as ONE digest (new since the previous digest highlighted, no mention), and each
+//   image repository's Jira ticket (SDS, label trivy) is opened or commented on. The agent
+//   is not told: nothing to triage, no incident, no escalation, no nag.
+// - ExposedSecretReport: posted at once, paging the operators ONCE per image build, and never
+//   registered with slack-sre's nag loop. The agent is then told, to investigate and answer
+//   in that thread.
+// - ConfigAuditReport, ClusterComplianceReport: ignored.
 //
 // Architecture:
-//   Trivy Operator → POST /trivy → this server → Claude Code session
+//   Trivy Operator → POST /trivy → this server → Slack (+ Jira, + the Claude session for secrets)
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WebClient } from "@slack/web-api";
 import { createServer, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { requireLoopbackHost } from "./bind-address.js";
+import { createJiraClient, readJiraConfig } from "./jira-client.js";
+import { operatorMentions, parseOperators } from "./operators.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
+import { buildDigest } from "./trivy-digest.js";
 import {
   actionableSecrets,
-  buildDigest,
   createTrivyStore,
   displayImage,
   isDigestDue,
-  isNewSecretFinding,
+  isSecretReported,
   markDigestSent,
+  markSecretReported,
   recordVulnerabilityReport,
+  secretFingerprint,
+  ticketUpdates,
 } from "./trivy-findings.js";
+import { syncTickets } from "./trivy-jira.js";
+import { createSlackPoster, DigestPartiallyPostedError, postDigest, secretEscalationText } from "./trivy-slack.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
+import { OperationTimeoutError, withTimeout } from "./with-timeout.js";
 
 // -- Configuration ------------------------------------------------------------
 
 const PORT = parseInt(process.env.TRIVY_WEBHOOK_PORT ?? "8790", 10);
 const HOST = requireLoopbackHost(process.env, "TRIVY_WEBHOOK_HOST"); // reached only through Caddy TLS
 const AUTH_TOKEN = requireWebhookToken(process.env, "TRIVY_WEBHOOK_TOKEN");
+// This channel posts to Slack itself, with the same bot and channel as slack-sre.ts
+const SLACK_BOT_TOKEN = requireSetting("SLACK_BOT_TOKEN", "the xoxb- bot token slack-sre.ts uses");
+const SRE_SLACK_CHANNEL = requireSetting("SRE_SLACK_CHANNEL", "the team channel ID slack-sre.ts posts in");
+const OPERATOR_MENTIONS = operatorMentions(parseOperators(requireSetting("SRE_OPERATORS", "the operator roster")));
+const JIRA = readJiraConfig(process.env);
 // A VulnerabilityReport for a large image lists every CVE and runs to several MB
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 // Same data/ directory as slack-sre.ts and incidents.db
 const DATA_DIR = process.env.SRE_DATA_DIR ?? join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
 // The daily digest goes out at this UTC hour (07:00 UTC is 08:00 or 09:00 in Paris)
-const DIGEST_HOUR_UTC = parseInt(process.env.TRIVY_DIGEST_HOUR_UTC ?? "7", 10);
+const DIGEST_HOUR_UTC = readHourUtc(process.env.TRIVY_DIGEST_HOUR_UTC ?? "7");
 const DIGEST_CHECK_INTERVAL_MS = 60 * 1000;
 
-const store = createTrivyStore(join(DATA_DIR, "trivy-findings.json"));
+// Bounds on everything this process waits for (CLAUDE_ERROR_PATTERNS.md §14)
+const SLACK_TIMEOUT_MS = 20 * 1000;
+const JIRA_TIMEOUT_MS = 15 * 1000;
+const AGENT_NOTIFY_TIMEOUT_MS = 10 * 1000;
+// Jira gets this long per digest; what does not fit is retried the next day
+const JIRA_BUDGET_MS = 5 * 60 * 1000;
+// Ceiling on a whole digest run: the Jira budget, one call past it, and the Slack posts
+const DIGEST_RUN_TIMEOUT_MS = JIRA_BUDGET_MS + 5 * 60 * 1000;
+// A digest that could not be posted is retried with backoff, never every minute
+const DIGEST_RETRY_MIN_MS = 60 * 1000;
+const DIGEST_RETRY_MAX_MS = 60 * 60 * 1000;
+
+const store = createTrivyStore({ path: join(DATA_DIR, "trivy-findings.json") });
 const state = store.load();
+
+// No retries inside the client: a retry that lands after withTimeout gave up would post the
+// message twice, and this process decides when to try again.
+const slack = createSlackPoster(
+  new WebClient(SLACK_BOT_TOKEN, { timeout: SLACK_TIMEOUT_MS, retryConfig: { retries: 0 }, rejectRateLimitedCalls: true }),
+  SRE_SLACK_CHANNEL,
+  SLACK_TIMEOUT_MS
+);
+const jira = createJiraClient(JIRA, { timeoutMs: JIRA_TIMEOUT_MS });
+
+// Secret findings being escalated right now: a second report for the same image (several
+// workloads run it) must not page again while the first post is in flight.
+const secretsInFlight = new Set<string>();
+
+function requireSetting(name: string, what: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is not set; the Trivy channel needs ${what}`);
+  return value;
+}
+
+function readHourUtc(raw: string): number {
+  const hour = Number(raw);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+    throw new Error(`TRIVY_DIGEST_HOUR_UTC must be an integer hour from 0 to 23, got "${raw}"`);
+  }
+  return hour;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 // -- Trivy CRD payload types --------------------------------------------------
 
@@ -55,33 +120,24 @@ interface TrivyVulnerability {
   installedVersion: string;
   fixedVersion?: string;
   severity: string;
-  title?: string;
-  primaryLink?: string;
+}
+
+interface TrivyArtifactPayload {
+  repository: string;
+  tag?: string;
+  digest?: string;
+}
+
+interface ReportMetadata {
+  name: string;
+  namespace?: string;
+  labels?: Record<string, string>;
 }
 
 interface VulnerabilityReport {
-  apiVersion: string;
   kind: "VulnerabilityReport";
-  metadata: {
-    name: string;
-    namespace?: string;
-    labels?: Record<string, string>;
-  };
-  report: {
-    artifact: {
-      repository: string;
-      tag?: string;
-      digest?: string;
-    };
-    summary: {
-      criticalCount: number;
-      highCount: number;
-      mediumCount: number;
-      lowCount: number;
-      unknownCount: number;
-    };
-    vulnerabilities: TrivyVulnerability[];
-  };
+  metadata: ReportMetadata;
+  report: { artifact: TrivyArtifactPayload; vulnerabilities?: TrivyVulnerability[] };
 }
 
 interface ExposedSecret {
@@ -90,61 +146,35 @@ interface ExposedSecret {
   severity: string;
   title: string;
   target: string;
-  match?: string;
 }
 
 interface ExposedSecretReport {
-  apiVersion: string;
   kind: "ExposedSecretReport";
-  metadata: {
-    name: string;
-    namespace?: string;
-    labels?: Record<string, string>;
-  };
-  report: {
-    artifact: {
-      repository: string;
-      tag?: string;
-      digest?: string;
-    };
-    summary: {
-      criticalCount: number;
-      highCount: number;
-      mediumCount: number;
-      lowCount: number;
-    };
-    secrets: ExposedSecret[];
-  };
+  metadata: ReportMetadata;
+  report: { artifact: TrivyArtifactPayload; secrets?: ExposedSecret[] };
+}
+
+function workloadOf(metadata: ReportMetadata): string {
+  return metadata.labels?.["trivy-operator.resource.name"] ?? metadata.name;
 }
 
 // -- MCP Channel Server -------------------------------------------------------
 
 const mcp = new Server(
-  { name: "trivy-webhook", version: "0.1.0" },
+  { name: "trivy-webhook", version: "0.2.0" },
   {
     capabilities: { experimental: { "claude/channel": {} } },
-    instructions: `Security findings from Trivy Operator arrive as <channel source="trivy-webhook" ...> tags.
+    instructions: `Exposed-secret findings from Trivy Operator arrive as <channel source="trivy-webhook" kind="secret" ...> tags.
 
-Two kinds of event come through:
+Vulnerability reports never reach you: this channel posts them to the team channel as one daily digest and keeps
+one Jira ticket per image itself. Never escalate, log or post anything about Trivy CVEs.
 
-1. **Vulnerability digest** (once a day, only images new or worse since the previous digest)
-   Meta: kind=vulnerability-digest, severity=info, image_count, own_image_count, third_party_image_count, fingerprint
-   Body: our images (ns-data-streaming) with their top fixable CVEs, then third-party images grouped by namespace
-   Action: post it ONCE with the reply tool, NEVER with escalate (no mentions, no nag timer). For each of our
-   images add one line on what to bump (base image or package). Do not investigate third-party images, they
-   need upstream upgrades: list them as they are. No incidents.sh entry.
-
-2. **ExposedSecret** (forwarded once per image, package-metadata false positives already dropped)
-   Meta: kind=secret, severity, namespace, image, secret_count, fingerprint
-   Body: list of detected secrets (API keys, tokens, credentials)
-   Action: IMMEDIATE escalation to CTO. Exposed secrets in container images are a serious
-   security issue regardless of severity. The image needs rebuilding without the secret,
-   and if the secret is real, it needs rotation.
-
-For an ExposedSecret:
-1. Check if the affected image is actively deployed: kubectl get pods -A -o jsonpath='{..image}' | grep <image>
-2. ALWAYS escalate, even if the pod isn't running anymore
-3. Log the finding via incidents.sh with verdict=real, action=escalated, severity=critical`,
+kind=secret: the channel has ALREADY posted the finding to the team channel and paged the operators, once.
+Meta: kind, severity, namespace, image, workload, secret_count, fingerprint, thread_ts, channel
+Do NOT call escalate for it (the tool refuses trivy- fingerprints): there is no reminder loop for secrets.
+1. Spawn a sub-agent to check whether the image is deployed and when the secret was introduced (trivy-exposed-secret.md).
+2. Post what it found with the reply tool, in the thread given by thread_ts, so operator replies reach you.
+3. Log it via incidents.sh with verdict=real (or false_positive), action=escalated, severity=critical.`,
   }
 );
 
@@ -152,80 +182,119 @@ await mcp.connect(new StdioServerTransport());
 
 // -- HTTP helpers -------------------------------------------------------------
 
-function respond(res: ServerResponse, status: number, body: string, contentType = "text/plain") {
-  res.writeHead(status, { "Content-Type": contentType });
-  res.end(body);
+function respond(res: ServerResponse, status: number, body: Record<string, string>) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
 }
 
-// -- Filtering and formatting -------------------------------------------------
+/** Saves the state; a failure is logged and answered with a 500, so the operator can resend. */
+function saveOrRespond500(res: ServerResponse, kind: string, context: string): boolean {
+  try {
+    store.save(state);
+    return true;
+  } catch (err) {
+    console.error(`[trivy-webhook] ${context}: ${errorMessage(err)}`);
+    respond(res, 500, { status: "persist_failed", kind });
+    return false;
+  }
+}
 
-type ChannelEvent = { content: string; meta: Record<string, string> };
+// -- Report handlers ----------------------------------------------------------
 
-/** Records a report for the daily digest, nothing is sent. Returns false when nothing is actionable. */
-function recordVulnerability(report: VulnerabilityReport): boolean {
-  const recorded = recordVulnerabilityReport(
+function handleVulnerabilityReport(res: ServerResponse, report: VulnerabilityReport): void {
+  const status = recordVulnerabilityReport(
     state,
     {
       artifact: report.report.artifact,
       namespace: report.metadata.namespace ?? "unknown",
-      workload: report.metadata.labels?.["trivy-operator.resource.name"] ?? report.metadata.name,
+      workload: workloadOf(report.metadata),
       vulnerabilities: report.report.vulnerabilities ?? [],
     },
     Date.now()
   );
 
-  if (recorded) store.save(state);
-
-  return recorded;
+  if (!saveOrRespond500(res, report.kind, `could not persist ${displayImage(report.report.artifact)}`)) return;
+  respond(res, 200, { status, kind: report.kind });
 }
 
-function processExposedSecretReport(report: ExposedSecretReport): ChannelEvent | "duplicate" | null {
+async function handleExposedSecretReport(res: ServerResponse, report: ExposedSecretReport): Promise<void> {
+  const kind = report.kind;
   const secrets = actionableSecrets(report.report.secrets ?? []);
-  if (secrets.length === 0) return null;
+  if (secrets.length === 0) {
+    // Nothing left once known false positives are dropped
+    respond(res, 200, { status: "no_action", kind });
+    return;
+  }
 
-  // The operator rescans daily: an image already reported stays silent
-  if (!isNewSecretFinding(state, report.report.artifact, secrets, Date.now())) return "duplicate";
-  store.save(state);
+  const artifact = report.report.artifact;
+  const fingerprint = secretFingerprint(artifact, secrets);
+  const now = Date.now();
 
-  const totalSecrets = secrets.length;
+  // The operator rescans daily: a finding already escalated stays silent, for good
+  if (secretsInFlight.has(fingerprint) || isSecretReported(state, fingerprint, now)) {
+    if (saveOrRespond500(res, kind, "could not persist a secret sighting")) respond(res, 200, { status: "duplicate", kind });
+    return;
+  }
+
+  const image = displayImage(artifact);
   const namespace = report.metadata.namespace ?? "unknown";
-  const image = displayImage(report.report.artifact);
-  const targetWorkload = report.metadata.labels?.["trivy-operator.resource.name"] ?? report.metadata.name;
+  const workload = workloadOf(report.metadata);
+
+  secretsInFlight.add(fingerprint);
+  let threadTs: string;
+  try {
+    threadTs = await slack.post(secretEscalationText({ image, workload, namespace, secrets }, OPERATOR_MENTIONS));
+    markSecretReported(state, fingerprint, now);
+  } catch (err) {
+    console.error(`[trivy-webhook] could not post the exposed-secret escalation for ${image}: ${errorMessage(err)}`);
+    respond(res, 502, { status: "slack_failed", kind });
+    return;
+  } finally {
+    secretsInFlight.delete(fingerprint);
+  }
+
+  // Already visible and paged. If this fails, the in-memory state still stops a re-page until
+  // a restart; the 500 makes the failure visible to the sender too.
+  const persisted = saveOrRespond500(res, kind, `escalated ${image} but could not persist it, a restart may page again`);
 
   const criticalCount = secrets.filter((s) => s.severity === "CRITICAL").length;
   const highCount = secrets.filter((s) => s.severity === "HIGH").length;
-  const severity = criticalCount > 0 ? "critical" : highCount > 0 ? "high" : "medium";
 
-  const content = [
-    `EXPOSED SECRETS DETECTED in container image`,
-    `Image: ${image}`,
-    `Workload: ${targetWorkload}`,
-    `Namespace: ${namespace}`,
-    `Summary: ${criticalCount} critical, ${highCount} high, ${totalSecrets} total`,
-    "",
-    "Detected secrets:",
-    ...secrets.slice(0, 10).map(
-      (s) => `  - [${s.severity}] ${s.ruleID} (${s.category}): ${s.title} in ${s.target}`
-    ),
-    totalSecrets > 10 ? `  ... and ${totalSecrets - 10} more` : "",
-    "",
-    "ACTION REQUIRED: Image must be rebuilt without the secret, and if real, the secret must be rotated.",
-  ].filter(Boolean).join("\n");
+  try {
+    await withTimeout(
+      mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: [
+            `Exposed secret(s) in ${image} (${workload}, ${namespace}), already posted and paged once in thread ${threadTs}.`,
+            ...secrets.slice(0, 10).map((s) => `- [${s.severity}] ${s.ruleID} (${s.category}): ${s.title} in ${s.target}`),
+          ].join("\n"),
+          meta: {
+            kind: "secret",
+            severity: criticalCount > 0 ? "critical" : highCount > 0 ? "high" : "medium",
+            namespace,
+            image,
+            workload,
+            secret_count: String(secrets.length),
+            fingerprint: `trivy-secret-${report.metadata.name}`,
+            thread_ts: threadTs,
+            channel: SRE_SLACK_CHANNEL,
+          },
+        },
+      }),
+      AGENT_NOTIFY_TIMEOUT_MS,
+      "agent notification"
+    );
+  } catch (err) {
+    console.error(`[trivy-webhook] escalated ${image} but could not hand it to the agent: ${errorMessage(err)}`);
+    await slack
+      .post(":warning: The SRE agent could not be notified of this finding: nobody is investigating it automatically.", threadTs)
+      .catch((postErr: unknown) =>
+        console.error(`[trivy-webhook] could not say so in thread ${threadTs} either: ${errorMessage(postErr)}`)
+      );
+  }
 
-  return {
-    content,
-    meta: {
-      kind: "secret",
-      severity,
-      namespace,
-      image,
-      workload: targetWorkload,
-      secret_count: String(totalSecrets),
-      critical_count: String(criticalCount),
-      high_count: String(highCount),
-      fingerprint: `trivy-secret-${report.metadata.name}`,
-    },
-  };
+  if (persisted) respond(res, 200, { status: "escalated", kind });
 }
 
 // -- HTTP Server --------------------------------------------------------------
@@ -234,107 +303,114 @@ const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
   if (req.method === "GET" && url.pathname === "/health") {
-    respond(res, 200, JSON.stringify({ status: "ok", channel: "trivy-webhook" }), "application/json");
+    respond(res, 200, { status: "ok", channel: "trivy-webhook" });
     return;
   }
 
   if (req.method !== "POST" || url.pathname !== "/trivy") {
-    respond(res, 404, "not found");
+    respond(res, 404, { status: "not_found" });
     return;
   }
 
   if (!isAuthorized(extractPresentedToken(req.headers), AUTH_TOKEN)) {
-    respond(res, 401, "unauthorized");
+    respond(res, 401, { status: "unauthorized" });
     return;
   }
 
-  // The operator posts several report kinds, so the body is genuinely unknown until
-  // its "kind" has been inspected — typing it as one of the two we handle would be a
-  // lie that narrows the ignore branch to `never`.
+  // The operator posts several report kinds, so the body is genuinely unknown until its
+  // "kind" has been inspected.
   let payload: unknown;
   try {
-    const body = await readBodyWithLimit(req, MAX_BODY_BYTES);
-    payload = JSON.parse(body);
+    payload = JSON.parse(await readBodyWithLimit(req, MAX_BODY_BYTES));
   } catch (error) {
     if (error instanceof RequestBodyTooLarge) {
-      respond(res, 413, "payload too large");
+      respond(res, 413, { status: "payload_too_large" });
       return;
     }
-    respond(res, 400, "invalid json");
+    respond(res, 400, { status: "invalid_json" });
     return;
   }
 
   if (typeof payload !== "object" || payload === null) {
-    respond(res, 400, "payload is not an object");
+    respond(res, 400, { status: "payload_not_object" });
     return;
   }
 
-  const kind =
-    "kind" in payload && typeof payload.kind === "string"
-      ? payload.kind
-      : undefined;
+  const kind = "kind" in payload && typeof payload.kind === "string" ? payload.kind : "unknown";
 
-  // Route by kind
   if (kind === "VulnerabilityReport") {
-    // Never pushed one by one: it waits for the daily digest
-    const status = recordVulnerability(payload as VulnerabilityReport) ? "queued" : "no_action";
-    respond(res, 200, JSON.stringify({ status, kind }), "application/json");
-    return;
+    handleVulnerabilityReport(res, payload as VulnerabilityReport);
+  } else if (kind === "ExposedSecretReport") {
+    await handleExposedSecretReport(res, payload as ExposedSecretReport);
+  } else {
+    // ConfigAuditReport, ClusterComplianceReport, etc.
+    respond(res, 200, { status: "ignored", kind });
   }
-
-  if (kind !== "ExposedSecretReport") {
-    // ConfigAuditReport, ClusterComplianceReport, etc. — silently ignore
-    respond(res, 200, JSON.stringify({ status: "ignored", kind: kind ?? "unknown" }), "application/json");
-    return;
-  }
-
-  const result = processExposedSecretReport(payload as ExposedSecretReport);
-
-  if (result === "duplicate") {
-    respond(res, 200, JSON.stringify({ status: "duplicate", kind }), "application/json");
-    return;
-  }
-
-  if (!result) {
-    // Nothing left once known false positives are dropped
-    respond(res, 200, JSON.stringify({ status: "no_action", kind }), "application/json");
-    return;
-  }
-
-  await mcp.notification({
-    method: "notifications/claude/channel",
-    params: { content: result.content, meta: result.meta },
-  });
-
-  respond(res, 200, JSON.stringify({ status: "pushed", kind }), "application/json");
 });
 
 httpServer.listen(PORT, HOST, () => {
-  console.error(`[trivy-webhook] listening on ${HOST}:${PORT}/trivy (auth enabled)`);
+  console.error(`[trivy-webhook] listening on ${HOST}:${PORT}/trivy (auth enabled), digest at ${DIGEST_HOUR_UTC}:00 UTC`);
 });
 
 // -- Daily digest -------------------------------------------------------------
 
-async function sendDigestIfDue(): Promise<void> {
+async function runDigest(): Promise<void> {
   const now = Date.now();
-  if (!isDigestDue(state, now, DIGEST_HOUR_UTC)) return;
 
-  const digest = buildDigest(state, now);
+  // Tickets first, so the digest can link them
+  const tickets = await syncTickets(state, jira, ticketUpdates(state), { deadline: now + JIRA_BUDGET_MS });
+  store.save(state);
+
+  const digest = buildDigest(state, now, tickets, (key) => jira.browseUrl(key));
 
   if (digest) {
-    await mcp.notification({
-      method: "notifications/claude/channel",
-      params: { content: digest.content, meta: digest.meta },
-    });
+    try {
+      await postDigest(slack, digest);
+    } catch (err) {
+      // Visible but incomplete: say so in the log, and do not post the whole digest again
+      if (!(err instanceof DigestPartiallyPostedError)) throw err;
+      console.error(`[trivy-webhook] ${err.message}`);
+    }
   }
 
-  // Also on a quiet day, so nothing is checked again before tomorrow's slot
-  markDigestSent(state, digest?.keys ?? [], now);
+  // Also on a day with no findings, so nothing is checked again before tomorrow's slot
+  markDigestSent(state, digest?.shown ?? {}, now);
   store.save(state);
+  console.error(`[trivy-webhook] daily digest done: ${digest ? "posted" : "no findings, nothing posted"}, ${tickets.length} ticket update(s)`);
 }
 
+let digestRunning = false;
+let digestFailures = 0;
+let nextDigestAttemptAt = 0;
+
 setInterval(() => {
-  sendDigestIfDue().catch((err) =>
-    console.error("[trivy-webhook] digest failed, retrying next minute:", err instanceof Error ? err.message : String(err))
-  );
+  const now = Date.now();
+  if (digestRunning || now < nextDigestAttemptAt || !isDigestDue(state, now, DIGEST_HOUR_UTC)) return;
+
+  digestRunning = true;
+  const run = runDigest();
+
+  // The flag follows the run itself, not the timeout, so a run can never overlap another
+  run.then(
+    () => {
+      digestFailures = 0;
+    },
+    (err: unknown) => {
+      digestFailures++;
+      const delay = Math.min(DIGEST_RETRY_MIN_MS * 2 ** (digestFailures - 1), DIGEST_RETRY_MAX_MS);
+      nextDigestAttemptAt = Date.now() + delay;
+      console.error(
+        `[trivy-webhook] daily digest failed (attempt ${digestFailures}), retrying in ${Math.round(delay / 60000)} min: ${errorMessage(err)}`
+      );
+    }
+  ).finally(() => {
+    digestRunning = false;
+  });
+
+  // Only the ceiling is handled here: a run that fails by itself is reported just above
+  withTimeout(run, DIGEST_RUN_TIMEOUT_MS, "daily digest").catch((err: unknown) => {
+    if (err instanceof OperationTimeoutError) {
+      console.error(`[trivy-webhook] ${err.message}; no new digest starts until it settles`);
+    }
+  });
 }, DIGEST_CHECK_INTERVAL_MS);

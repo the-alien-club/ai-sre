@@ -45,3 +45,44 @@ for (const { script, variable } of CHANNELS) {
     });
   }
 }
+
+// The Trivy channel posts to Slack and Jira itself, so it needs their settings too, and has
+// no default for any of them: a channel that silently skipped its digest or its tickets
+// would be found out weeks later.
+const TRIVY_ENV = {
+  TRIVY_WEBHOOK_TOKEN: "a-configured-secret",
+  TRIVY_WEBHOOK_HOST: "127.0.0.1",
+  SLACK_BOT_TOKEN: "xoxb-test",
+  SRE_SLACK_CHANNEL: "C0TEST",
+  SRE_OPERATORS: "U1:Leo",
+  JIRA_BASE_URL: "https://example.atlassian.net",
+  JIRA_USER_EMAIL: "sre@example.com",
+  JIRA_API_TOKEN: "jira-secret",
+};
+
+function startTrivy(env: Record<string, string | undefined>) {
+  return spawnSync(process.execPath, ["--import", "tsx", "channels/trivy-webhook.ts"], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+}
+
+for (const variable of ["SLACK_BOT_TOKEN", "SRE_SLACK_CHANNEL", "SRE_OPERATORS", "JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"]) {
+  test(`channels/trivy-webhook.ts refuses to start without ${variable}`, () => {
+    const result = startTrivy({ ...TRIVY_ENV, [variable]: undefined });
+
+    assert.notEqual(result.status, 0, "channel must exit non-zero");
+    assert.match(result.stderr, new RegExp(`${variable} is not set`));
+    assert.doesNotMatch(result.stderr, /listening on/);
+  });
+}
+
+for (const hour of ["24", "7.5", "seven"]) {
+  test(`channels/trivy-webhook.ts refuses TRIVY_DIGEST_HOUR_UTC=${hour}`, () => {
+    const result = startTrivy({ ...TRIVY_ENV, TRIVY_DIGEST_HOUR_UTC: hour });
+
+    assert.notEqual(result.status, 0, "channel must exit non-zero");
+    assert.match(result.stderr, /TRIVY_DIGEST_HOUR_UTC must be an integer hour from 0 to 23/);
+  });
+}
