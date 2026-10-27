@@ -3,8 +3,8 @@
 // Trivy Webhook Channel — receives Trivy Operator webhooks for security findings.
 //
 // Filters:
-// - VulnerabilityReport: only HIGH/CRITICAL severity with available fixes
-// - ExposedSecretReport: ALL findings (always urgent)
+// - VulnerabilityReport: fixable HIGH/CRITICAL only, recorded and sent as ONE daily digest
+// - ExposedSecretReport: forwarded at once, once per image, known false positives dropped
 // - ConfigAuditReport: IGNORED
 // - ClusterComplianceReport: IGNORED
 //
@@ -14,8 +14,20 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer, type ServerResponse } from "node:http";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { requireLoopbackHost } from "./bind-address.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
+import {
+  actionableSecrets,
+  buildDigest,
+  createTrivyStore,
+  displayImage,
+  isDigestDue,
+  isNewSecretFinding,
+  markDigestSent,
+  recordVulnerabilityReport,
+} from "./trivy-findings.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 
 // -- Configuration ------------------------------------------------------------
@@ -26,8 +38,14 @@ const AUTH_TOKEN = requireWebhookToken(process.env, "TRIVY_WEBHOOK_TOKEN");
 // A VulnerabilityReport for a large image lists every CVE and runs to several MB
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
-// Vulnerabilities below this severity are ignored
-const VULN_SEVERITY_THRESHOLD = ["CRITICAL", "HIGH"];
+// Same data/ directory as slack-sre.ts and incidents.db
+const DATA_DIR = process.env.SRE_DATA_DIR ?? join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
+// The daily digest goes out at this UTC hour (07:00 UTC is 08:00 or 09:00 in Paris)
+const DIGEST_HOUR_UTC = parseInt(process.env.TRIVY_DIGEST_HOUR_UTC ?? "7", 10);
+const DIGEST_CHECK_INTERVAL_MS = 60 * 1000;
+
+const store = createTrivyStore(join(DATA_DIR, "trivy-findings.json"));
+const state = store.load();
 
 // -- Trivy CRD payload types --------------------------------------------------
 
@@ -87,6 +105,7 @@ interface ExposedSecretReport {
     artifact: {
       repository: string;
       tag?: string;
+      digest?: string;
     };
     summary: {
       criticalCount: number;
@@ -106,26 +125,26 @@ const mcp = new Server(
     capabilities: { experimental: { "claude/channel": {} } },
     instructions: `Security findings from Trivy Operator arrive as <channel source="trivy-webhook" ...> tags.
 
-Two report types come through:
+Two kinds of event come through:
 
-1. **VulnerabilityReport** (HIGH/CRITICAL only, with fixes available)
-   Meta: kind=vulnerability, severity=critical|high, namespace, image, vuln_count, fingerprint
-   Body: list of CVEs with fix versions and affected packages
-   Action: Investigate if it's in a production-deployed image. Check if there's an upgrade path.
-   Most often: escalate to CTO with a tuning proposal (image update needed).
+1. **Vulnerability digest** (once a day, only images new or worse since the previous digest)
+   Meta: kind=vulnerability-digest, severity=info, image_count, own_image_count, third_party_image_count, fingerprint
+   Body: our images (ns-data-streaming) with their top fixable CVEs, then third-party images grouped by namespace
+   Action: post it ONCE with the reply tool, NEVER with escalate (no mentions, no nag timer). For each of our
+   images add one line on what to bump (base image or package). Do not investigate third-party images, they
+   need upstream upgrades: list them as they are. No incidents.sh entry.
 
-2. **ExposedSecret** (ALL severities — always urgent)
+2. **ExposedSecret** (forwarded once per image, package-metadata false positives already dropped)
    Meta: kind=secret, severity, namespace, image, secret_count, fingerprint
    Body: list of detected secrets (API keys, tokens, credentials)
    Action: IMMEDIATE escalation to CTO. Exposed secrets in container images are a serious
    security issue regardless of severity. The image needs rebuilding without the secret,
    and if the secret is real, it needs rotation.
 
-When you receive these:
+For an ExposedSecret:
 1. Check if the affected image is actively deployed: kubectl get pods -A -o jsonpath='{..image}' | grep <image>
-2. For ExposedSecret: ALWAYS escalate, even if the pod isn't running anymore
-3. For VulnerabilityReport: check severity, count, and whether the image is in production
-4. Log the finding via incidents.sh with verdict=real, action=escalated, severity=critical`,
+2. ALWAYS escalate, even if the pod isn't running anymore
+3. Log the finding via incidents.sh with verdict=real, action=escalated, severity=critical`,
   }
 );
 
@@ -140,64 +159,41 @@ function respond(res: ServerResponse, status: number, body: string, contentType 
 
 // -- Filtering and formatting -------------------------------------------------
 
-function processVulnerabilityReport(report: VulnerabilityReport): { content: string; meta: Record<string, string> } | null {
-  const { criticalCount, highCount } = report.report.summary;
+type ChannelEvent = { content: string; meta: Record<string, string> };
 
-  // Skip if no high/critical vulns
-  if (criticalCount === 0 && highCount === 0) return null;
-
-  // Filter to high/critical with fix available
-  const actionable = report.report.vulnerabilities.filter(
-    (v) => VULN_SEVERITY_THRESHOLD.includes(v.severity) && v.fixedVersion
+/** Records a report for the daily digest, nothing is sent. Returns false when nothing is actionable. */
+function recordVulnerability(report: VulnerabilityReport): boolean {
+  const recorded = recordVulnerabilityReport(
+    state,
+    {
+      artifact: report.report.artifact,
+      namespace: report.metadata.namespace ?? "unknown",
+      workload: report.metadata.labels?.["trivy-operator.resource.name"] ?? report.metadata.name,
+      vulnerabilities: report.report.vulnerabilities ?? [],
+    },
+    Date.now()
   );
 
-  if (actionable.length === 0) return null;
+  if (recorded) store.save(state);
 
-  const namespace = report.metadata.namespace ?? "unknown";
-  const image = `${report.report.artifact.repository}:${report.report.artifact.tag ?? "latest"}`;
-  const targetWorkload = report.metadata.labels?.["trivy-operator.resource.name"] ?? report.metadata.name;
-
-  // Pick the worst severity
-  const severity = criticalCount > 0 ? "critical" : "high";
-
-  const content = [
-    `Image: ${image}`,
-    `Workload: ${targetWorkload}`,
-    `Namespace: ${namespace}`,
-    `Summary: ${criticalCount} critical, ${highCount} high (with available fixes)`,
-    "",
-    "Top fixable vulnerabilities:",
-    ...actionable.slice(0, 10).map(
-      (v) => `  - ${v.severity} ${v.vulnerabilityID} in ${v.resource}@${v.installedVersion} → fix in ${v.fixedVersion}`
-    ),
-    actionable.length > 10 ? `  ... and ${actionable.length - 10} more` : "",
-  ].filter(Boolean).join("\n");
-
-  return {
-    content,
-    meta: {
-      kind: "vulnerability",
-      severity,
-      namespace,
-      image,
-      workload: targetWorkload,
-      critical_count: String(criticalCount),
-      high_count: String(highCount),
-      fixable_count: String(actionable.length),
-      fingerprint: `trivy-vuln-${report.metadata.name}`,
-    },
-  };
+  return recorded;
 }
 
-function processExposedSecretReport(report: ExposedSecretReport): { content: string; meta: Record<string, string> } | null {
-  const totalSecrets = report.report.secrets.length;
-  if (totalSecrets === 0) return null;
+function processExposedSecretReport(report: ExposedSecretReport): ChannelEvent | "duplicate" | null {
+  const secrets = actionableSecrets(report.report.secrets ?? []);
+  if (secrets.length === 0) return null;
 
+  // The operator rescans daily: an image already reported stays silent
+  if (!isNewSecretFinding(state, report.report.artifact, secrets, Date.now())) return "duplicate";
+  store.save(state);
+
+  const totalSecrets = secrets.length;
   const namespace = report.metadata.namespace ?? "unknown";
-  const image = `${report.report.artifact.repository}:${report.report.artifact.tag ?? "latest"}`;
+  const image = displayImage(report.report.artifact);
   const targetWorkload = report.metadata.labels?.["trivy-operator.resource.name"] ?? report.metadata.name;
 
-  const { criticalCount, highCount } = report.report.summary;
+  const criticalCount = secrets.filter((s) => s.severity === "CRITICAL").length;
+  const highCount = secrets.filter((s) => s.severity === "HIGH").length;
   const severity = criticalCount > 0 ? "critical" : highCount > 0 ? "high" : "medium";
 
   const content = [
@@ -208,7 +204,7 @@ function processExposedSecretReport(report: ExposedSecretReport): { content: str
     `Summary: ${criticalCount} critical, ${highCount} high, ${totalSecrets} total`,
     "",
     "Detected secrets:",
-    ...report.report.secrets.slice(0, 10).map(
+    ...secrets.slice(0, 10).map(
       (s) => `  - [${s.severity}] ${s.ruleID} (${s.category}): ${s.title} in ${s.target}`
     ),
     totalSecrets > 10 ? `  ... and ${totalSecrets - 10} more` : "",
@@ -279,20 +275,28 @@ const httpServer = createServer(async (req, res) => {
       : undefined;
 
   // Route by kind
-  let result: { content: string; meta: Record<string, string> } | null = null;
-
   if (kind === "VulnerabilityReport") {
-    result = processVulnerabilityReport(payload as VulnerabilityReport);
-  } else if (kind === "ExposedSecretReport") {
-    result = processExposedSecretReport(payload as ExposedSecretReport);
-  } else {
+    // Never pushed one by one: it waits for the daily digest
+    const status = recordVulnerability(payload as VulnerabilityReport) ? "queued" : "no_action";
+    respond(res, 200, JSON.stringify({ status, kind }), "application/json");
+    return;
+  }
+
+  if (kind !== "ExposedSecretReport") {
     // ConfigAuditReport, ClusterComplianceReport, etc. — silently ignore
     respond(res, 200, JSON.stringify({ status: "ignored", kind: kind ?? "unknown" }), "application/json");
     return;
   }
 
+  const result = processExposedSecretReport(payload as ExposedSecretReport);
+
+  if (result === "duplicate") {
+    respond(res, 200, JSON.stringify({ status: "duplicate", kind }), "application/json");
+    return;
+  }
+
   if (!result) {
-    // No actionable findings (e.g. only LOW/MEDIUM vulns without fixes)
+    // Nothing left once known false positives are dropped
     respond(res, 200, JSON.stringify({ status: "no_action", kind }), "application/json");
     return;
   }
@@ -308,3 +312,29 @@ const httpServer = createServer(async (req, res) => {
 httpServer.listen(PORT, HOST, () => {
   console.error(`[trivy-webhook] listening on ${HOST}:${PORT}/trivy (auth enabled)`);
 });
+
+// -- Daily digest -------------------------------------------------------------
+
+async function sendDigestIfDue(): Promise<void> {
+  const now = Date.now();
+  if (!isDigestDue(state, now, DIGEST_HOUR_UTC)) return;
+
+  const digest = buildDigest(state, now);
+
+  if (digest) {
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: { content: digest.content, meta: digest.meta },
+    });
+  }
+
+  // Also on a quiet day, so nothing is checked again before tomorrow's slot
+  markDigestSent(state, digest?.keys ?? [], now);
+  store.save(state);
+}
+
+setInterval(() => {
+  sendDigestIfDue().catch((err) =>
+    console.error("[trivy-webhook] digest failed, retrying next minute:", err instanceof Error ? err.message : String(err))
+  );
+}, DIGEST_CHECK_INTERVAL_MS);
