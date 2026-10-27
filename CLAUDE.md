@@ -470,7 +470,6 @@ These require human judgment. Always use the `escalate` tool:
 - **Pod scheduling failures** — might indicate cluster capacity issues
 - **Any issue you don't fully understand** — uncertainty = escalate
 - **Trivy ExposedSecret** — secrets in container images, ALWAYS escalate immediately
-- **Trivy VulnerabilityReport** (HIGH/CRITICAL with fixes) — escalate with image upgrade recommendation
 
 ---
 
@@ -550,9 +549,9 @@ playbooks/
 
 **Channel → playbook mapping:**
 
-Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability|secret" ...>`.
-- `kind=vulnerability` → `trivy-vulnerability.md`
-- `kind=secret` → `trivy-exposed-secret.md` (always escalate immediately)
+Trivy webhooks arrive with `<channel source="trivy-webhook" kind="vulnerability-digest|secret" ...>`.
+- `kind=vulnerability-digest` → `trivy-vulnerability.md` (once a day, post it with `reply`, NEVER `escalate`: no mentions, no nags)
+- `kind=secret` → `trivy-exposed-secret.md` (always escalate immediately, once per image)
 
 **SigNoz alert name → playbook mapping:**
 - High Error Rate → `high-error-rate.md`
