@@ -5,12 +5,14 @@
 // prompt sat unsubmitted for the agent's whole life (SDS-992). Typed with `send-keys -l`, a
 // 49.5KB prompt then failed with tmux's "command too long" on every restart from
 // 2026-10-27, while out.log still said "Agent started with briefing". The fix must deliver a
-// prompt of any size, prove it was sent and never assume it, so most of these tests are about failures being reported as failures.
+// prompt of any size, prove it was sent, never assume it, and say so loudly when it was not,
+// so most of these tests are about failures being reported as failures.
 //
 // The stub tmux (fixtures/tmux-stub.sh) parses its flags, rejects a send-keys argument over
 // tmux's message size, and renders the input box the way Claude Code does (taken from the
 // live pane on the agent VM): between two horizontal rules, starting with "❯" and a no-break
-// space. Environment variables make it fail in each of the ways a real session can.
+// space. Environment variables make it fail in each of the ways a real session can. The
+// stub curl (fixtures/curl-stub.sh) stands in for Slack.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -29,14 +31,17 @@ interface Options {
   noLand?: boolean;
   showOther?: boolean;
   showLiteral?: boolean;
+  slack?: { response: string; exit?: number } | "unconfigured";
 }
 
 function stubDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "sre-submit-"));
   writeFileSync(join(dir, "tmux.log"), "");
   writeFileSync(join(dir, "enters"), "0");
-  copyFileSync("scripts/fixtures/tmux-stub.sh", join(dir, "tmux"));
-  chmodSync(join(dir, "tmux"), 0o755);
+  for (const [stub, name] of [["tmux-stub.sh", "tmux"], ["curl-stub.sh", "curl"]]) {
+    copyFileSync(join("scripts/fixtures", stub), join(dir, name));
+    chmodSync(join(dir, name), 0o755);
+  }
   return dir;
 }
 
@@ -50,6 +55,11 @@ function run(prompt: string, options: Options = {}, attempts = 3, fn = "submit_p
     STUB_DIR: dir,
     STUB_LOG: join(dir, "tmux.log"),
     STUB_ENTERS_NEEDED: String(options.entersNeeded ?? 1),
+    CURL_DIR: dir,
+    CURL_RESPONSE: options.slack === "unconfigured" ? "" : (options.slack?.response ?? '{"ok":true}'),
+    CURL_EXIT: String(options.slack === "unconfigured" ? 0 : (options.slack?.exit ?? 0)),
+    SLACK_BOT_TOKEN: "xoxb-test-token",
+    SRE_SLACK_CHANNEL: "C0TESTCHAN",
     ...(options.failLoad ? { STUB_FAIL_LOAD: "1" } : {}),
     ...(options.failPaste ? { STUB_FAIL_PASTE: "1" } : {}),
     ...(options.failSend ? { STUB_FAIL_SEND: "1" } : {}),
@@ -59,6 +69,7 @@ function run(prompt: string, options: Options = {}, attempts = 3, fn = "submit_p
     ...(options.showOther ? { STUB_SHOW_OTHER: "1" } : {}),
     ...(options.showLiteral ? { STUB_SHOW_LITERAL: "1" } : {}),
   };
+  if (options.slack === "unconfigured") delete env.SLACK_BOT_TOKEN;
   // Through a file, not the environment: an exec'd variable is capped at 128KB, and the
   // large-prompt test exceeds it. `read -d ''` keeps trailing newlines, which $(cat) drops.
   writeFileSync(join(dir, "prompt"), prompt);
@@ -73,6 +84,7 @@ function run(prompt: string, options: Options = {}, attempts = 3, fn = "submit_p
     enters: calls.filter((call) => call === "key:Enter").length,
     pasted: read("typed"),
     buffersLeft: readdirSync(dir).filter((name) => name.startsWith("buffer-")),
+    slack: { args: read("args"), headers: read("headers"), body: read("body") },
   };
 }
 
@@ -175,14 +187,55 @@ test("unrelated text in the input box is not mistaken for the prompt", () => {
   assert.equal(result.enters, 0, "Enter must not submit someone else's text");
 });
 
-test("submit_startup_prompt reports a failure loudly and does not fail the start", () => {
-  const result = run(PROMPT, { failCapture: true }, 3, "submit_startup_prompt");
-  assert.equal(result.status, 0);
-  assert.match(result.stderr, /ERROR: the agent is running WITHOUT its briefing/);
+test("submit_startup_prompt succeeds quietly when the prompt is submitted", () => {
+  const result = run(PROMPT, {}, 3, "submit_startup_prompt");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.slack.args, undefined, "no Slack notice on success");
 });
 
-test("start-agent.sh submits through submit_startup_prompt only", () => {
+test("submit_startup_prompt fails, logs and notifies the team channel when delivery fails", () => {
+  const result = run(PROMPT, { failCapture: true }, 3, "submit_startup_prompt");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ERROR: the agent is running WITHOUT its briefing/);
+  assert.match(result.stdout, /team channel notified/);
+
+  assert.match(result.slack.args ?? "", /^https:\/\/slack\.com\/api\/chat\.postMessage$/m);
+  assert.match(result.slack.args ?? "", /^--max-time$/m);
+  assert.doesNotMatch(result.slack.args ?? "", /xoxb-test-token/, "the token must not be on curl's command line");
+  assert.equal(result.slack.headers, "Authorization: Bearer xoxb-test-token\n");
+  const body = JSON.parse(result.slack.body ?? "") as { channel: string; text: string };
+  assert.equal(body.channel, "C0TESTCHAN");
+  assert.match(body.text, /Startup briefing not delivered/);
+  assert.match(body.text, /`pm2 restart sre-agent`/);
+});
+
+test("submit_startup_prompt says so when Slack refuses the notice", () => {
+  const result = run(PROMPT, { failCapture: true, slack: { response: '{"ok":false,"error":"not_in_channel"}' } }, 3, "submit_startup_prompt");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Slack refused the notice: \{"ok":false,"error":"not_in_channel"\}/);
+  assert.match(result.stderr, /team channel could not be told/);
+});
+
+test("submit_startup_prompt says so when Slack cannot be reached", () => {
+  const result = run(PROMPT, { failCapture: true, slack: { response: "", exit: 28 } }, 3, "submit_startup_prompt");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /could not reach Slack/);
+  assert.match(result.stderr, /team channel could not be told/);
+});
+
+test("submit_startup_prompt says so when Slack is not configured", () => {
+  const result = run(PROMPT, { failCapture: true, slack: "unconfigured" }, 3, "submit_startup_prompt");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /SLACK_BOT_TOKEN or SRE_SLACK_CHANNEL is not set/);
+  assert.equal(result.slack.args, undefined, "curl must not run without a token");
+});
+
+test("start-agent.sh logs 'started with briefing' only when the prompt was submitted", () => {
   const launcher = readFileSync("scripts/start-agent.sh", "utf8");
-  assert.match(launcher, /^submit_startup_prompt "\$SESSION_NAME" "\$PROMPT"$/m);
+  assert.match(
+    launcher,
+    /^if submit_startup_prompt "\$SESSION_NAME" "\$PROMPT"; then\n\s+echo "\[start-agent\] Agent started with briefing[^\n]*\nelse\n\s+echo "\[start-agent\] Agent started WITHOUT its briefing[^\n]*>&2\nfi$/m,
+  );
+  assert.equal(launcher.match(/Agent started with briefing/g)?.length, 1);
   assert.doesNotMatch(launcher, /send-keys[^\n]*\$PROMPT/);
 });

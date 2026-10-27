@@ -17,6 +17,9 @@
 # box that is then empty again counts as submitted. A session that is gone, a UI this code
 # does not recognise, or a prompt that never lands are all failures, never successes.
 
+# shellcheck source=scripts/lib/notify-ops.sh
+source "$(dirname "${BASH_SOURCE[0]}")/notify-ops.sh"
+
 # The input box as rendered by Claude Code (checked on the VM, Claude Code 2.1.110, tmux
 # 3.4): the lines between the last two horizontal rules, the first of them starting with
 # "❯" and a no-break space (U+00A0), not an ordinary space.
@@ -115,11 +118,21 @@ submit_prompt() {
   return 1
 }
 
-# submit_startup_prompt <tmux-session> <prompt>: submit, and on failure say so loudly with
-# the manual fix. Never fails the start: the agent is useful without its briefing (alerts
-# and Slack still flow), and a restart loop would take its triage down with it.
+# submit_startup_prompt <tmux-session> <prompt>: submit, and on failure say so loudly, in
+# the log and in the team channel, then fail. It is the caller's choice what a failure
+# means; start-agent.sh keeps the agent running, because it is useful without its briefing
+# (alerts and Slack still flow) and a restart loop would take its triage down with it.
 submit_startup_prompt() {
-  if ! submit_prompt "$1" "$2"; then
-    echo "[start-agent] ERROR: the agent is running WITHOUT its briefing and deployment config; submit it by hand: tmux send-keys -t $1 Enter" >&2
-  fi
+  submit_prompt "$1" "$2" && return 0
+
+  echo "[start-agent] ERROR: the agent is running WITHOUT its briefing and deployment config;" \
+    "see the error above. If the input box holds the prompt, tmux send-keys -t $1 Enter submits it;" \
+    "otherwise pm2 restart sre-agent" >&2
+  notify_ops ":rotating_light: *SRE Agent Health Alert*
+
+*Startup briefing not delivered:* the agent restarted on ${HOSTNAME} at $(date -u '+%Y-%m-%d %H:%M UTC') and is running WITHOUT its incident briefing and deployment config.
+*Impact:* alerts and Slack still reach it, but it triages without recent incident history and with the placeholder project IDs from CLAUDE.md.
+*Action needed:* read \`pm2 logs sre-agent --err --lines 20\` on the agent VM, then \`pm2 restart sre-agent\`." \
+    || echo "[start-agent] ERROR: the team channel could not be told that the briefing was not delivered" >&2
+  return 1
 }

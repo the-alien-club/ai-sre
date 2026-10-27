@@ -98,13 +98,15 @@ Use these real values when spawning sub-agents — they override any placeholder
 
 Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the ops team via slack-sre. Remember you are in a shared team channel, not a private DM — see \"Talking to the Ops Team\" in CLAUDE.md. Confirm you are ready by listing your kubectl contexts."
 
-# Submit the prompt and prove it was sent; a failure is reported loudly but does not stop
-# the agent (see submit-prompt.sh).
+# Submit the prompt and prove it was sent. A failure is reported in the log and the team
+# channel, and the agent keeps running without its briefing (see submit-prompt.sh).
 # shellcheck source=scripts/lib/submit-prompt.sh
 source "$SRE_DIR/scripts/lib/submit-prompt.sh"
-submit_startup_prompt "$SESSION_NAME" "$PROMPT"
-
-echo "[start-agent] Agent started with briefing, monitoring tmux session"
+if submit_startup_prompt "$SESSION_NAME" "$PROMPT"; then
+  echo "[start-agent] Agent started with briefing, monitoring tmux session"
+else
+  echo "[start-agent] Agent started WITHOUT its briefing, monitoring tmux session" >&2
+fi
 
 # Keep this script alive so pm2 considers the process running.
 # Monitor the tmux session — if it dies, this script exits and pm2 restarts.
