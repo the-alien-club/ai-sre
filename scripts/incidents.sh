@@ -39,6 +39,27 @@ sql_int() {
     printf '%s' "$value"
 }
 
+# Bounds on the startup briefing (see `briefing`): alert classes listed per section, and
+# the longest name or cause shown before it is clipped.
+readonly BRIEFING_CLASSES=10
+readonly BRIEFING_NAME_CHARS=80
+readonly BRIEFING_CAUSE_CHARS=160
+
+# SQL for <expression> on one line and at most <max> characters, ending in "…" when
+# clipped. Line breaks become spaces, so a multi-line cause cannot break the line layout.
+sql_clip() {
+    local flat="replace(replace($1, char(13), ' '), char(10), ' ')" max="$2"
+    printf "CASE WHEN length(%s) > %d THEN substr(%s, 1, %d) || '…' ELSE %s END" \
+        "$flat" "$max" "$flat" "$((max - 1))" "$flat"
+}
+
+# more_classes <count> <command>: the line saying how many classes the section left out.
+more_classes() {
+    if (( $1 > BRIEFING_CLASSES )); then
+        echo "  … and $(( $1 - BRIEFING_CLASSES )) more alert classes: $2"
+    fi
+}
+
 # Run SQL read from stdin against the database. The statement never travels as a
 # command-line argument: hex-encoded values double its size, and a long cause or note
 # would otherwise hit the kernel's argument length limit ("Argument list too long").
@@ -143,42 +164,61 @@ case "$CMD" in
         ;;
 
     briefing)
-        # Generate a startup briefing for the main agent
+        # Generate a startup briefing for the main agent. It is pasted into the agent's
+        # first prompt, so its size must not grow with the number of incidents: one alert
+        # class (263 Trivy findings in 3 days) once made it 50KB. Each section is
+        # summarised per alert class, capped at a fixed number of classes, and every
+        # free-text value is clipped, so the briefing stays a few KB whatever the database
+        # holds. The detail is one `check`, `patterns` or `timeline` away.
         DAYS=7
         [ "${1:-}" = "--days" ] && DAYS="$2"
         DAYS="$(sql_int --days "$DAYS")" || exit 1
+        WINDOW="created_at > datetime('now', '-${DAYS} days')"
+        NOISY="verdict IN ('noise','false_positive','known_issue')"
+        PENDING_WINDOW="action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days')"
+        NAME="$(sql_clip alert_name "$BRIEFING_NAME_CHARS")"
+        LOCATION="$(sql_clip "COALESCE(service || ' @ ' || cluster, service, cluster, '?')" "$BRIEFING_NAME_CHARS")"
+        CAUSE="CASE WHEN cause IS NOT NULL AND cause != '' THEN ': ' || $(sql_clip cause "$BRIEFING_CAUSE_CHARS") ELSE '' END"
 
-        TOTAL=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE created_at > datetime('now', '-${DAYS} days');")
-        NOISE=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days');")
-        REAL=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE verdict = 'real' AND created_at > datetime('now', '-${DAYS} days');")
-        FIXED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE action = 'auto_fixed' AND created_at > datetime('now', '-${DAYS} days');")
-        ESCALATED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE action = 'escalated' AND created_at > datetime('now', '-${DAYS} days');")
+        TOTAL=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE ${WINDOW};") || exit 1
+        NOISE=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE ${NOISY} AND ${WINDOW};") || exit 1
+        REAL=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE verdict = 'real' AND ${WINDOW};") || exit 1
+        FIXED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE action = 'auto_fixed' AND ${WINDOW};") || exit 1
+        ESCALATED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE action = 'escalated' AND ${WINDOW};") || exit 1
 
         echo "=== SRE Briefing — Last ${DAYS} Days ==="
         echo "Total: ${TOTAL} alerts processed | ${NOISE} noise | ${REAL} real | ${FIXED} auto-fixed | ${ESCALATED} escalated"
         echo ""
 
-        # Recurring noise
-        RECURRING=$(sql_run -separator ' | ' <<< "SELECT alert_name || ' on ' || COALESCE(service, cluster, '?'), COUNT(*) || 'x' FROM incidents WHERE verdict IN ('noise','false_positive','known_issue') AND created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, service, cluster HAVING COUNT(*) >= 3 ORDER BY COUNT(*) DESC;")
-        if [ -n "$RECURRING" ]; then
+        # Recurring noise: one line per alert, service and cluster that was noise 3+ times
+        NOISE_CLASSES="SELECT alert_name, NULLIF(service, '') AS service, NULLIF(cluster, '') AS cluster, COUNT(*) AS fires FROM incidents WHERE ${NOISY} AND ${WINDOW} GROUP BY 1, 2, 3 HAVING COUNT(*) >= 3"
+        NOISE_COUNT=$(sql_run <<< "SELECT COUNT(*) FROM (${NOISE_CLASSES});") || exit 1
+        if [ "$NOISE_COUNT" != "0" ]; then
             echo "Recurring noise (consider tuning):"
-            echo "$RECURRING" | while read -r line; do echo "  - $line"; done
+            sql_run <<< "SELECT '  - ' || ${NAME} || ' on ' || ${LOCATION} || ' | ' || fires || 'x' FROM (${NOISE_CLASSES}) ORDER BY fires DESC, alert_name LIMIT ${BRIEFING_CLASSES};" || exit 1
+            more_classes "$NOISE_COUNT" "./scripts/incidents.sh patterns --days ${DAYS}"
             echo ""
         fi
 
-        # Recent real incidents
-        REAL_INCIDENTS=$(sql_run -separator '' <<< "SELECT '[' || date(created_at) || '] ' || alert_name || ' on ' || COALESCE(service, cluster, '?') || ' — ' || action || CASE WHEN cause IS NOT NULL AND cause != '' THEN ': ' || cause ELSE '' END FROM incidents WHERE verdict = 'real' AND created_at > datetime('now', '-${DAYS} days') ORDER BY created_at DESC LIMIT 10;")
-        if [ -n "$REAL_INCIDENTS" ]; then
-            echo "Recent real incidents:"
-            echo "$REAL_INCIDENTS" | while read -r line; do echo "  - $line"; done
+        # Real incidents: one line per alert, service and cluster, with its latest outcome
+        REAL_CLASSES="SELECT *, COUNT(*) OVER (PARTITION BY alert_name, service, cluster) AS fires, ROW_NUMBER() OVER (PARTITION BY alert_name, service, cluster ORDER BY created_at DESC, id DESC) AS latest FROM (SELECT id, created_at, alert_name, NULLIF(service, '') AS service, NULLIF(cluster, '') AS cluster, action, cause FROM incidents WHERE verdict = 'real' AND ${WINDOW})"
+        REAL_COUNT=$(sql_run <<< "SELECT COUNT(*) FROM (${REAL_CLASSES}) WHERE latest = 1;") || exit 1
+        if [ "$REAL_COUNT" != "0" ]; then
+            echo "Recent real incidents (${REAL} in ${REAL_COUNT} alert classes, latest first):"
+            sql_run <<< "SELECT '  - [' || date(created_at) || '] ' || ${NAME} || ' on ' || ${LOCATION} || ' — ' || fires || 'x, latest ' || action || ${CAUSE} FROM (${REAL_CLASSES}) WHERE latest = 1 ORDER BY created_at DESC, id DESC LIMIT ${BRIEFING_CLASSES};" || exit 1
+            more_classes "$REAL_COUNT" "./scripts/incidents.sh check --alert <name> --days ${DAYS}"
             echo ""
         fi
 
-        # Pending escalations
-        PENDING=$(sql_run -separator '' <<< "SELECT '[' || date(created_at) || '] ' || alert_name || ' on ' || COALESCE(cluster, '?') || ' — ' || COALESCE(cause, 'unknown cause') FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days') ORDER BY created_at DESC;")
-        if [ -n "$PENDING" ]; then
-            echo "Pending escalations (unacknowledged):"
-            echo "$PENDING" | while read -r line; do echo "  - $line"; done
+        # Pending escalations: one line per alert, with every cluster it is pending on
+        PENDING_CLASSES="SELECT *, COUNT(*) OVER (PARTITION BY alert_name) AS fires, ROW_NUMBER() OVER (PARTITION BY alert_name ORDER BY created_at DESC, id DESC) AS latest FROM (SELECT id, created_at, alert_name, NULLIF(cluster, '') AS cluster, cause FROM incidents WHERE ${PENDING_WINDOW})"
+        PENDING_CLUSTERS="SELECT alert_name, group_concat(DISTINCT NULLIF(cluster, '')) AS clusters FROM incidents WHERE ${PENDING_WINDOW} GROUP BY alert_name"
+        PENDING=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE ${PENDING_WINDOW};") || exit 1
+        PENDING_COUNT=$(sql_run <<< "SELECT COUNT(*) FROM (${PENDING_CLASSES}) WHERE latest = 1;") || exit 1
+        if [ "$PENDING_COUNT" != "0" ]; then
+            echo "Pending escalations (unacknowledged, last 3 days: ${PENDING} in ${PENDING_COUNT} alert classes, latest first):"
+            sql_run <<< "SELECT '  - [' || date(p.created_at) || '] ' || ${NAME} || ' — ' || p.fires || 'x' || COALESCE(' on ' || $(sql_clip c.clusters "$BRIEFING_NAME_CHARS"), '') || ' (latest #' || p.id || ')' || ${CAUSE} FROM (${PENDING_CLASSES}) AS p JOIN (${PENDING_CLUSTERS}) AS c USING (alert_name) WHERE p.latest = 1 ORDER BY p.created_at DESC, p.id DESC LIMIT ${BRIEFING_CLASSES};" || exit 1
+            more_classes "$PENDING_COUNT" "./scripts/incidents.sh patterns --days 3"
             echo ""
         fi
 
