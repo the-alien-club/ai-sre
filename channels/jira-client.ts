@@ -91,20 +91,29 @@ export function createJiraClient(config: JiraConfig, options: JiraClientOptions)
   const authorization = `Basic ${Buffer.from(`${config.email}:${config.apiToken}`).toString("base64")}`;
 
   async function call(operation: string, path: string, body: unknown): Promise<unknown> {
+    // Not AbortSignal.timeout(): its timer is unref'd, so a process with nothing else alive
+    // could exit before the bound fires. The deadline covers reading the body too.
+    const controller = new AbortController();
+    const timeout = new OperationTimeoutError(`Jira ${operation}`, timeoutMs);
+    const timer = setTimeout(() => controller.abort(timeout), timeoutMs);
+
     let response: Response;
+    let text: string;
     try {
       response = await fetchImpl(`${config.baseUrl}${path}`, {
         method: "POST",
         headers: { Authorization: authorization, Accept: "application/json", "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: controller.signal,
       });
+      text = await response.text();
     } catch (err) {
-      if (err instanceof Error && err.name === "TimeoutError") throw new OperationTimeoutError(`Jira ${operation}`, timeoutMs);
+      if (controller.signal.aborted) throw timeout;
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
 
-    const text = await response.text();
     if (!response.ok) throw new JiraError(operation, response.status, text.slice(0, ERROR_DETAIL_CHARS));
     if (text === "") return null;
 

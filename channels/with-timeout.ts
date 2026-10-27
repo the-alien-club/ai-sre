@@ -14,7 +14,8 @@ export class OperationTimeoutError extends Error {
 
 /**
  * Settles with `work`, or rejects with OperationTimeoutError once `timeoutMs` has passed.
- * The timer never keeps the process alive, and is cleared as soon as `work` settles.
+ * The timer is cleared as soon as `work` settles. It is deliberately not unref'd: a bound
+ * that the process may exit before has bounded nothing.
  */
 export async function withTimeout<T>(work: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -24,7 +25,6 @@ export async function withTimeout<T>(work: Promise<T>, timeoutMs: number, operat
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new OperationTimeoutError(operation, timeoutMs)), timeoutMs);
-    timer.unref();
   });
 
   try {
