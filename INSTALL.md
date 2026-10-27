@@ -253,10 +253,18 @@ cp .env.example .env
 # SRE_SLACK_CHANNEL: from step 6 — the channel the agent lives in
 # SRE_OPERATORS: from step 6 — "U123:Leo,U456:Adrien,U789:Ghislain"
 # GITLAB_TOKEN: group access token with read_api scope (Reporter level)
+# JIRA_BASE_URL / JIRA_USER_EMAIL / JIRA_API_TOKEN: an Atlassian API token for an account
+#   that can create and comment on SDS issues (the Trivy channel files one ticket per image)
+# TRIVY_DIGEST_HOUR_UTC: hour of the daily Trivy digest, 0-23 (default 7)
 ```
 
 `SRE_SLACK_CHANNEL` and `SRE_OPERATORS` are required — the channel refuses to start
 without them rather than running against the wrong channel or with no allowlist.
+
+The Trivy channel posts to Slack and Jira itself, so it also requires `SLACK_BOT_TOKEN`,
+`SRE_SLACK_CHANNEL`, `SRE_OPERATORS` and the three `JIRA_*` variables. Without any of them it
+refuses to start, `start-agent.sh` sees port 8790 never bind, and the whole agent exits
+non-zero. **Add the `JIRA_*` variables to an existing VM's `.env` before deploying 0.4.0.**
 
 ### Creating the GitLab access token
 
