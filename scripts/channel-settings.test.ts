@@ -15,9 +15,12 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JIRA_SETTINGS } from "../channels/jira-client.js";
+import { RUNDECK_SETTINGS } from "../channels/rundeck-client.js";
 
 const COMPLETE_SETTINGS: Record<string, string> = {
   SIGNOZ_WEBHOOK_TOKEN: "signoz-secret",
+  RUNDECK_URL: "http://10.66.0.1:30440",
+  RUNDECK_API_TOKEN: "rundeck-token",
   SLACK_BOT_TOKEN: "xoxb-test-token",
   SLACK_APP_TOKEN: "xapp-test-token",
   SRE_SLACK_CHANNEL: "C0TESTCHAN",
@@ -41,6 +44,7 @@ function settingsTheChannelsRequire(): string[] {
     const calls = source.matchAll(/\b(?:requireEnv|requireSetting)\(\s*"(\w+)"|\brequireWebhookToken\(\s*process\.env,\s*"(\w+)"/g);
     for (const match of calls) required.add(match[1] ?? match[2]);
     if (/\breadJiraConfig\(\s*process\.env\s*\)/.test(source)) for (const name of JIRA_SETTINGS) required.add(name);
+    if (/\breadRundeckConfig\(\s*process\.env\s*\)/.test(source)) for (const name of RUNDECK_SETTINGS) required.add(name);
   }
   return [...required].sort();
 }
@@ -65,7 +69,10 @@ function missing(settings: Record<string, string>): string {
 test("start-agent.sh checks exactly the settings the channels require", () => {
   const required = settingsTheChannelsRequire();
   // The scan must find the channels' checks, or it would pass with an empty list
-  assert.ok(required.includes("SIGNOZ_WEBHOOK_TOKEN") && required.includes("JIRA_API_TOKEN"), required.join(" "));
+  assert.ok(
+    required.includes("SIGNOZ_WEBHOOK_TOKEN") && required.includes("JIRA_API_TOKEN") && required.includes("RUNDECK_API_TOKEN"),
+    required.join(" ")
+  );
   assert.deepEqual(checkedSettings(), required);
   assert.deepEqual(Object.keys(COMPLETE_SETTINGS).sort(), required);
 });

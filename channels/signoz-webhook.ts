@@ -7,17 +7,26 @@
 // This channel parses those payloads and pushes each alert as a separate event.
 //
 // Architecture:
-//   SigNoz cloud → POST /alert → this server → Claude Code session
+//   SigNoz cloud / sentinel AM-S → POST /alert → this server → Claude Code session
 //   Health check: GET /health
+//
+// Sentinel's stage-1 `remediable` alerts (sentinel_class=remediable) never reach the session:
+// this server runs the Rundeck job they name itself, deterministically (sentinel-remediation.ts).
 //
 // Works with both Bun and Node.js (via tsx).
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer, type ServerResponse } from "node:http";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { requireLoopbackHost } from "./bind-address.js";
+import { createRemediationStore } from "./remediation-store.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
+import { createRundeckClient, readRundeckConfig } from "./rundeck-client.js";
+import { createRemediator, DEFAULT_REMEDIATION_CONFIG_PATH, isRemediable, readRemediationConfig } from "./sentinel-remediation.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
+import { withTimeout } from "./with-timeout.js";
 
 // -- Configuration (env vars, with sensible defaults) -------------------------
 
@@ -26,6 +35,25 @@ const HOST = requireLoopbackHost(process.env, "SIGNOZ_WEBHOOK_HOST"); // reached
 const AUTH_TOKEN = requireWebhookToken(process.env, "SIGNOZ_WEBHOOK_TOKEN"); // shared secret, required
 // An Alertmanager payload carries a handful of alerts; 1 MiB is far beyond any real one
 const MAX_BODY_BYTES = 1024 * 1024;
+// Sentinel remediation: Rundeck on VM-A over WireGuard, required (no default for either)
+const RUNDECK = readRundeckConfig(process.env);
+const REMEDIATION = readRemediationConfig(DEFAULT_REMEDIATION_CONFIG_PATH);
+// Same data/ directory as slack-sre.ts, trivy-webhook.ts and incidents.db
+const DATA_DIR = process.env.SRE_DATA_DIR ?? join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
+
+// Bounds on everything this process waits for (CLAUDE_ERROR_PATTERNS.md §14). A run request
+// returns as soon as Rundeck has queued the execution; the job itself runs for up to 30 min.
+const RUNDECK_TIMEOUT_MS = 10 * 1000;
+const AGENT_NOTIFY_TIMEOUT_MS = 10 * 1000;
+
+const remediationStore = createRemediationStore({ path: join(DATA_DIR, "sentinel-remediations.json") });
+const remediationRecords = remediationStore.load();
+const remediator = createRemediator({
+  config: REMEDIATION,
+  rundeck: createRundeckClient(RUNDECK, { timeoutMs: RUNDECK_TIMEOUT_MS }),
+  records: remediationRecords,
+  persist: () => remediationStore.save(remediationRecords),
+});
 
 // -- Types for Alertmanager-compatible webhook payload ------------------------
 
@@ -76,6 +104,10 @@ When you receive an alert:
 2. DIAGNOSE: Use kubectl to inspect affected pods, deployments, events, logs
 3. DECIDE: Is this a quick fix you can handle, or does it need CTO escalation?
 4. ACT: Either fix it (if safe) or escalate via the slack-sre reply tool
+
+Sentinel's stage-1 alerts labelled sentinel_class="remediable" never reach you: this channel runs the Rundeck job
+they name itself, and the job reports to #alerts-ops. If it does not fix the problem, sentinel's stage 2 alert
+("Hop down: ...") follows as an ordinary ticket. Do not run or re-run sentinel Rundeck jobs yourself.
 
 For "resolved" alerts: acknowledge them, note the resolution, no action needed unless the same alert keeps flapping.
 
@@ -154,6 +186,10 @@ function extractMeta(alert: AlertmanagerAlert, groupStatus: string): Record<stri
 
 // -- HTTP helpers for Node.js -------------------------------------------------
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function respond(res: ServerResponse, status: number, body: string, contentType = "text/plain") {
   res.writeHead(status, { "Content-Type": contentType });
   res.end(body);
@@ -201,31 +237,51 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Push each alert as a separate channel event
-  const results = await Promise.allSettled(
-    payload.alerts.map(async (alert) => {
-      const content = formatAlertContent(alert, payload.status);
-      const meta = extractMeta(alert, payload.status);
+  // Remediable alerts are handled in code and never reach the session. The Rundeck calls are
+  // not awaited: Alertmanager needs no more than receipt, and a retry it made on a slow answer
+  // would be deduplicated anyway. handle() never rejects; the catch is the last line of defence.
+  const remediable = payload.alerts.filter((alert) => isRemediable(alert));
+  for (const alert of remediable) {
+    remediator.handle(alert).catch((err: unknown) => console.error(`[signoz-webhook] remediation failed unexpectedly: ${errorMessage(err)}`));
+  }
 
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: { content, meta },
-      });
-    })
+  // Push every other alert as a separate channel event
+  const results = await Promise.allSettled(
+    payload.alerts
+      .filter((alert) => !isRemediable(alert))
+      .map(async (alert) => {
+        const content = formatAlertContent(alert, payload.status);
+        const meta = extractMeta(alert, payload.status);
+
+        await withTimeout(
+          mcp.notification({
+            method: "notifications/claude/channel",
+            params: { content, meta },
+          }),
+          AGENT_NOTIFY_TIMEOUT_MS,
+          "agent notification"
+        );
+      })
   );
 
   const succeeded = results.filter((r) => r.status === "fulfilled").length;
   const failed = results.filter((r) => r.status === "rejected").length;
+  for (const result of results) {
+    if (result.status === "rejected") console.error(`[signoz-webhook] could not push an alert to the agent: ${errorMessage(result.reason)}`);
+  }
 
   respond(
     res,
     failed > 0 ? 207 : 200,
-    JSON.stringify({ received: payload.alerts.length, pushed: succeeded, failed }),
+    JSON.stringify({ received: payload.alerts.length, pushed: succeeded, remediable: remediable.length, failed }),
     "application/json"
   );
 });
 
 httpServer.listen(PORT, HOST, () => {
   // Log to stderr (stdout is reserved for MCP stdio transport)
-  console.error(`[signoz-webhook] listening on ${HOST}:${PORT}/alert (auth enabled)`);
+  console.error(
+    `[signoz-webhook] listening on ${HOST}:${PORT}/alert (auth enabled), ` +
+      `remediable actions ${REMEDIATION.actions.join(", ")} via ${RUNDECK.baseUrl}`
+  );
 });

@@ -1,0 +1,5 @@
+{
+  "rundeckProject": "sentinel",
+  "jobGroup": "actions",
+  "actions": ["restart_otel_agent_pod", "restart_otel_collector"]
+}
