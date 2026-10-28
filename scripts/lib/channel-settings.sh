@@ -7,14 +7,17 @@
 # working session, with the reason in the channel's MCP log rather than pm2's. Since 0.4.0
 # the Trivy channel also needs the Jira credentials, which a VM upgraded in place does not
 # have yet. Checked here first, the missing names go to the log and the team channel, and
-# the session that is running is left alone.
+# the session that is running is left alone. Since 0.5.0 the SigNoz channel needs the Rundeck
+# endpoint and token for sentinel's remediable alerts, which a VM upgraded in place lacks too.
 #
 # Presence only: each channel still validates the values itself. channel-settings.test.ts
 # keeps this list in step with what the channels require.
 
 REQUIRED_CHANNEL_SETTINGS=(
-  # signoz-webhook
+  # signoz-webhook; it runs sentinel's remediable alerts on VM-A's Rundeck itself
   SIGNOZ_WEBHOOK_TOKEN
+  RUNDECK_URL
+  RUNDECK_API_TOKEN
   # slack-sre; trivy-webhook posts with the same bot, channel and operator roster
   SLACK_BOT_TOKEN
   SLACK_APP_TOKEN

@@ -86,3 +86,39 @@ for (const hour of ["24", "7.5", "seven"]) {
     assert.match(result.stderr, /TRIVY_DIGEST_HOUR_UTC must be an integer hour from 0 to 23/);
   });
 }
+
+// The SigNoz channel runs sentinel's remediable alerts on Rundeck itself, so it needs the
+// endpoint and token, with no default for either: a remediation path that silently did
+// nothing would be found out only when stage 2 paged a human.
+const SIGNOZ_ENV = {
+  SIGNOZ_WEBHOOK_TOKEN: "a-configured-secret",
+  SIGNOZ_WEBHOOK_HOST: "127.0.0.1",
+  RUNDECK_URL: "http://10.66.0.1:30440",
+  RUNDECK_API_TOKEN: "rundeck-secret",
+};
+
+function startSignoz(env: Record<string, string | undefined>) {
+  return spawnSync(process.execPath, ["--import", "tsx", "channels/signoz-webhook.ts"], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+}
+
+for (const variable of ["RUNDECK_URL", "RUNDECK_API_TOKEN"]) {
+  test(`channels/signoz-webhook.ts refuses to start without ${variable}`, () => {
+    const result = startSignoz({ ...SIGNOZ_ENV, [variable]: undefined });
+
+    assert.notEqual(result.status, 0, "channel must exit non-zero");
+    assert.match(result.stderr, new RegExp(`${variable} is not set`));
+    assert.doesNotMatch(result.stderr, /listening on/);
+  });
+}
+
+test("channels/signoz-webhook.ts refuses to send the Rundeck token over plain http to a public host", () => {
+  const result = startSignoz({ ...SIGNOZ_ENV, RUNDECK_URL: "http://rundeck.example.com:30440" });
+
+  assert.notEqual(result.status, 0, "channel must exit non-zero");
+  assert.match(result.stderr, /plain http only to a private IPv4 address/);
+  assert.doesNotMatch(result.stderr, /listening on/);
+});

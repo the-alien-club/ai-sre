@@ -256,6 +256,8 @@ cp .env.example .env
 # JIRA_BASE_URL / JIRA_USER_EMAIL / JIRA_API_TOKEN: an Atlassian API token for an account
 #   that can create and comment on SDS issues (the Trivy channel files one ticket per image)
 # TRIVY_DIGEST_HOUR_UTC: hour of the daily Trivy digest, 0-23 (default 7)
+# RUNDECK_URL / RUNDECK_API_TOKEN: VM-A's Rundeck over WireGuard and the `sre-agent` token
+#   (required by the SigNoz channel; see "Sentinel remediation" below)
 ```
 
 `SRE_SLACK_CHANNEL` and `SRE_OPERATORS` are required — the channel refuses to start
@@ -268,6 +270,46 @@ the running session: if one is missing it names it in pm2's error log and the te
 leaves the running session as it is, and exits non-zero. **Add the `JIRA_*` variables to an
 existing VM's `.env` before deploying 0.4.0**, or the restart is refused and the session
 already running, if any, stays on the old code until they are added.
+
+### Sentinel remediation (Rundeck on VM-A)
+
+Sentinel's stage-1 alerts for a hop that can be remediated (`sentinel_class=remediable`, see
+sentinel `signoz/README.md` D-8) arrive on the SigNoz channel's `/alert` from AM-S. The
+channel handles them in code and never hands them to Claude:
+
+- A **firing** alert runs Rundeck job `actions/<sentinel_action>` in project `sentinel` with
+  exactly `target=<sentinel_target>`, `fingerprint=<Alertmanager fingerprint>` and
+  `incident=none`. Nothing else is chosen: not the action, the target or a node.
+- `sentinel_action` must be in `channels/sentinel-remediation.json` (today
+  `restart_otel_agent_pod` and `restart_otel_collector`); changing that list is a reviewed
+  MR. `sentinel_target` must be lowercase `/`-separated DNS-label-like segments, and one of
+  the values the live job definition enforces for `target`. Anything else is logged and skipped.
+- It runs **once per firing episode** (fingerprint and `startsAt`), whatever the outcome:
+  started, refused (cooldown, breaker, preconditions, an invalid option) or Rundeck
+  unreachable. AM-S's hourly repeat is ignored. The record is kept in
+  `data/sentinel-remediations.json`, so a restart does not run it again. Resolved
+  notifications are ignored.
+- The job posts its own outcome to #alerts-ops. If it does not fix the problem, sentinel's
+  stage 2 (`Hop down: <hop>`) escalates to a human; the agent does nothing more.
+- Each call to Rundeck times out after 10 s. The execution id is logged to pm2's error log
+  (`[sentinel-remediation] started actions/... execution <id>`) and kept in the record.
+
+What ops must provide:
+
+| Item | Value |
+|---|---|
+| `RUNDECK_API_TOKEN` | The static token of Rundeck user `sre-agent` (Bitwarden `vm-a-rundeck-sentinel`, property `TOKEN_SRE_AGENT`; rendered into Rundeck's `tokens.properties` by VM-A's ExternalSecret). Role `sre-agent`: read project `sentinel`; list, read and run jobs in `actions` and `actions/**`; read their executions. No other scope is needed, and none should be granted. |
+| `RUNDECK_URL` | `http://10.66.0.1:30440`: VM-A's WireGuard address and Rundeck's k3s NodePort. Rundeck has no TLS; the channel accepts plain http only to a private address. |
+| Network path | Agent VM `wg0` (10.66.0.2) → VM-A `wg0` (10.66.0.1, UDP 51820, `vm-a.internal.alien.club`) → NodePort 30440. The agent VM's side is sentinel `deploy/vm-a/wireguard/agent-vm.conf.tpl`, and VM-A adds the agent as a peer with `AGENT_PUBLIC_KEY=<key> deploy/vm-a/wireguard/setup-vm-a.sh`. VM-A's security group never opens 30440. |
+
+**Until that WireGuard link is up on the agent VM, Rundeck is not reachable from it.** The
+template is not applied on the live VM (sentinel gates that on Leo). Without the link, every
+remediable alert is logged as `failed` (connection timeout) and stage 2 escalates as designed.
+Check it from the agent VM with
+`curl -sS -m 5 -o /dev/null -w '%{http_code}\n' http://10.66.0.1:30440/user/login` (200 when reachable).
+
+**Add `RUNDECK_URL` and `RUNDECK_API_TOKEN` to an existing VM's `.env` before deploying
+0.5.0**, or `start-agent.sh` refuses the restart, as for the `JIRA_*` variables above.
 
 ### Creating the GitLab access token
 
