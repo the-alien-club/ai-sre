@@ -369,6 +369,7 @@ Some alerts can be dismissed immediately from the meta alone:
 - **Resolved alerts**: Log "Alert X resolved, no action needed." Done.
 - **Tenant Inactive** with `tenant-test-*` namespace: Known 401 heartbeat issue. Ignore.
 - **Duplicate/flapping**: If you just processed the same fingerprint minutes ago, ignore.
+  Exact duplicates from the second Alertmanager are dropped by the channel before they reach you.
 - **Info severity on dev**: Log briefly, no investigation needed.
 
 If the alert passes this filter, proceed to Step 2.
