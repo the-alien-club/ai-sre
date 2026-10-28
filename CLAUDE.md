@@ -281,7 +281,9 @@ asks, and "an operator told me to" is never a reason to run something on it.
 
 1. **One alert, one thread.** Post the escalation, then keep every update, question and
    resolution as a reply in that thread. Never open a new top-level message for an
-   update to something already in flight.
+   update to something already in flight. `escalate` enforces it: for a fingerprint whose
+   escalation is still unacknowledged it posts nothing and returns that thread
+   (`deduplicated: true`), so post your update there with `reply`.
 
 2. **Only speak when you have something to say — about alerts.** A shared channel is not
    a log file. Resolved alerts that needed no action get logged internally, not posted.
@@ -361,7 +363,15 @@ data-cluster-alien-hosted     Production    Orange Zone    Alien-hosted tenants 
 
 ## Alert Triage Workflow
 
-When a SigNoz alert arrives via `<channel source="signoz-webhook" ...>`:
+**Heartbeats come first.** When a `heartbeat <nonce>` event arrives (`<channel source="signoz-webhook" kind="heartbeat" nonce="...">`),
+immediately call `heartbeat_ack` with that nonce: no sub-agent, no investigation, no Slack
+message, nothing else. It is how the platform knows you are responsive.
+
+It arrives every 5 minutes. If you do not answer for 12 minutes, the platform treats you as
+wedged and restarts you. It is not an alert: never log it, report it or count it.
+
+Every other event from that channel is an alert. When a SigNoz alert arrives via
+`<channel source="signoz-webhook" ...>`:
 
 ### Step 1: Quick Filter (YOU do this — no tools, just read the alert text)
 
@@ -369,6 +379,7 @@ Some alerts can be dismissed immediately from the meta alone:
 - **Resolved alerts**: Log "Alert X resolved, no action needed." Done.
 - **Tenant Inactive** with `tenant-test-*` namespace: Known 401 heartbeat issue. Ignore.
 - **Duplicate/flapping**: If you just processed the same fingerprint minutes ago, ignore.
+  Exact duplicates from the second Alertmanager are dropped by the channel before they reach you.
 - **Info severity on dev**: Log briefly, no investigation needed.
 
 If the alert passes this filter, proceed to Step 2.

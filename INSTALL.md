@@ -378,7 +378,11 @@ claude auth login
 
 The webhook channels must not be reachable in cleartext: the shared secret and every
 alert payload travel in each request. Caddy terminates TLS for the agent's hostname and
-forwards `/alert` and `/trivy` to the channels, which listen on loopback only.
+forwards `/alert` and `/trivy` to the channels, which listen on loopback only. It also
+forwards `GET /health` and `GET /health/session` of the SigNoz channel, unauthenticated:
+sentinel's `sre_agent` hop probes `/health/session` (200 while the Claude session answered a
+heartbeat in the last 12 min, 503 otherwise, including for about a minute after every start).
+Everything else answers 404.
 
 ```bash
 # DNS first: an A record for the hostname pointing at the VM (prod: sre-agent.internal.alien.club)
@@ -411,6 +415,15 @@ this version, change both to `127.0.0.1` or delete the two lines:
 ```bash
 sed -i -E 's/^(SIGNOZ|TRIVY)_WEBHOOK_HOST=.*/\1_WEBHOOK_HOST=127.0.0.1/' ~/sre-agent/.env
 grep -E '^(SIGNOZ|TRIVY)_WEBHOOK_HOST=' ~/sre-agent/.env
+```
+
+**Updating the Caddyfile on an existing VM:** Caddy does not reread it on its own. Install
+the new file, validate it, then reload (no dropped connections, no certificate reissue):
+
+```bash
+sudo install -m 0644 provision/caddy/Caddyfile /etc/caddy/Caddyfile
+SRE_AGENT_HOSTNAME=$SRE_AGENT_HOSTNAME caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
 ```
 
 In the Scaleway security group, allow 80 (ACME challenge) and 443 inbound, and remove
@@ -482,6 +495,9 @@ ss -tlnp | grep 8788
 
 # Check tmux screen
 tmux capture-pane -t sre-agent -p | tail -20
+
+# The session answers heartbeats: 503 never_acked for ~1 min after a start, then 200 ok
+curl -s "https://$SRE_AGENT_HOSTNAME/health/session"
 
 # Send a test alert
 curl -s -X POST "https://$SRE_AGENT_HOSTNAME/alert" \

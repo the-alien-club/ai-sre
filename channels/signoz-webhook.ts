@@ -7,24 +7,33 @@
 // This channel parses those payloads and pushes each alert as a separate event.
 //
 // Architecture:
-//   SigNoz cloud / sentinel AM-S → POST /alert → this server → Claude Code session
-//   Health check: GET /health
+//   SigNoz cloud / sentinel AM-S / AM-R → POST /alert → this server → Claude Code session
+//   Health check: GET /health (the listener is up)
+//   Session check: GET /health/session (the session answered a heartbeat recently)
 //
 // Sentinel's stage-1 `remediable` alerts (sentinel_class=remediable) never reach the session:
 // this server runs the Rundeck job they name itself, deterministically (sentinel-remediation.ts).
+// Both sentinel Alertmanagers deliver every alert; the second copy is dropped here
+// (alert-dedupe.ts). A heartbeat round trip through the session proves it still answers
+// (session-heartbeat.ts).
 //
 // Works with both Bun and Node.js (via tsx).
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import { createAlertDedupe } from "./alert-dedupe.js";
+import { deliverAlerts, type AlertmanagerAlert, type AlertmanagerPayload } from "./alert-delivery.js";
 import { requireLoopbackHost } from "./bind-address.js";
 import { createRemediationStore } from "./remediation-store.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
 import { createRundeckClient, readRundeckConfig } from "./rundeck-client.js";
-import { createRemediator, DEFAULT_REMEDIATION_CONFIG_PATH, isRemediable, readRemediationConfig } from "./sentinel-remediation.js";
+import { createRemediator, DEFAULT_REMEDIATION_CONFIG_PATH, readRemediationConfig } from "./sentinel-remediation.js";
+import { createSessionHeartbeat, HEARTBEAT_ACK_TOOL } from "./session-heartbeat.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
 import { withTimeout } from "./with-timeout.js";
 
@@ -55,37 +64,14 @@ const remediator = createRemediator({
   persist: () => remediationStore.save(remediationRecords),
 });
 
-// -- Types for Alertmanager-compatible webhook payload ------------------------
-
-interface AlertmanagerAlert {
-  status: "firing" | "resolved";
-  labels: Record<string, string>;
-  annotations: Record<string, string>;
-  startsAt: string;
-  endsAt: string;
-  generatorURL?: string;
-  fingerprint: string;
-}
-
-interface AlertmanagerPayload {
-  version?: string;
-  groupKey?: string;
-  truncatedAlerts?: number;
-  status: "firing" | "resolved";
-  receiver: string;
-  groupLabels: Record<string, string>;
-  commonLabels: Record<string, string>;
-  commonAnnotations: Record<string, string>;
-  externalURL?: string;
-  alerts: AlertmanagerAlert[];
-}
+const alertDedupe = createAlertDedupe();
 
 // -- MCP Channel Server -------------------------------------------------------
 
 const mcp = new Server(
   { name: "signoz-webhook", version: "0.1.0" },
   {
-    capabilities: { experimental: { "claude/channel": {} } },
+    capabilities: { experimental: { "claude/channel": {} }, tools: {} },
     instructions: `You are an SRE agent. Alert events from SigNoz arrive as <channel source="signoz-webhook" ...> tags.
 
 Each alert has these meta attributes:
@@ -109,6 +95,12 @@ Sentinel's stage-1 alerts labelled sentinel_class="remediable" never reach you: 
 they name itself, and the job reports to #alerts-ops. If it does not fix the problem, sentinel's stage 2 alert
 ("Hop down: ...") follows as an ordinary ticket. Do not run or re-run sentinel Rundeck jobs yourself.
 
+Both of sentinel's Alertmanagers deliver every alert; exact duplicates are dropped by this channel before they reach you.
+
+Heartbeats: an event whose content is "heartbeat <nonce>" (meta kind="heartbeat") is not an alert. Immediately call the
+${HEARTBEAT_ACK_TOOL} tool with that nonce: no sub-agent, no investigation, no Slack message, nothing else. It is how the
+platform knows you are responsive; if you do not answer, you are restarted.
+
 For "resolved" alerts: acknowledge them, note the resolution, no action needed unless the same alert keeps flapping.
 
 Severity-based behavior:
@@ -117,6 +109,52 @@ Severity-based behavior:
 - prod cluster alerts: investigate carefully, auto-fix ONLY safe operations, escalate aggressively for anything complex`,
   }
 );
+
+// -- Tools: the heartbeat answer ---------------------------------------------
+
+const heartbeat = createSessionHeartbeat({
+  push: (content, meta) =>
+    withTimeout(mcp.notification({ method: "notifications/claude/channel", params: { content, meta } }), AGENT_NOTIFY_TIMEOUT_MS, "heartbeat notification"),
+});
+
+const HeartbeatAckArgs = z.object({ nonce: z.string().min(1) }).strict();
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: HEARTBEAT_ACK_TOOL,
+      description:
+        'Answer a "heartbeat <nonce>" event from this channel. Call it immediately with the nonce, and do nothing else for that event.',
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          nonce: { type: "string", description: "The nonce from the heartbeat event, exactly as received." },
+        },
+        required: ["nonce"],
+      },
+    },
+  ],
+}));
+
+// Never throws (CLAUDE_ERROR_PATTERNS.md §15): every failure is an error result the agent can read.
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: args } = req.params;
+  if (name !== HEARTBEAT_ACK_TOOL) {
+    return { content: [{ type: "text" as const, text: `unknown tool: ${name}` }], isError: true };
+  }
+
+  const parsed = HeartbeatAckArgs.safeParse(args);
+  if (!parsed.success) {
+    return { content: [{ type: "text" as const, text: `invalid arguments: nonce must be a non-empty string (${parsed.error.issues.map((i) => i.message).join("; ")})` }], isError: true };
+  }
+
+  const result = heartbeat.ack(parsed.data.nonce);
+  if (!result.ok) {
+    console.error(`[signoz-webhook] refused a heartbeat ack: ${result.error}`);
+    return { content: [{ type: "text" as const, text: result.error }], isError: true };
+  }
+  return { content: [{ type: "text" as const, text: "ok" }] };
+});
 
 await mcp.connect(new StdioServerTransport());
 
@@ -200,9 +238,16 @@ function respond(res: ServerResponse, status: number, body: string, contentType 
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
-  // Health check
+  // Health check: the listener is up
   if (req.method === "GET" && url.pathname === "/health") {
     respond(res, 200, JSON.stringify({ status: "ok", channel: "signoz-webhook" }), "application/json");
+    return;
+  }
+
+  // Session check: the session answered a heartbeat recently. Public through Caddy, no secrets.
+  if (req.method === "GET" && url.pathname === "/health/session") {
+    const { httpStatus, body } = heartbeat.health();
+    respond(res, httpStatus, JSON.stringify(body), "application/json");
     return;
   }
 
@@ -237,45 +282,24 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Remediable alerts are handled in code and never reach the session. The Rundeck calls are
-  // not awaited: Alertmanager needs no more than receipt, and a retry it made on a slow answer
-  // would be deduplicated anyway. handle() never rejects; the catch is the last line of defence.
-  const remediable = payload.alerts.filter((alert) => isRemediable(alert));
-  for (const alert of remediable) {
-    remediator.handle(alert).catch((err: unknown) => console.error(`[signoz-webhook] remediation failed unexpectedly: ${errorMessage(err)}`));
-  }
+  const { httpStatus, counts } = await deliverAlerts(payload, {
+    dedupe: alertDedupe,
+    // handle() never rejects; the catch is the last line of defence
+    remediate: (alert) => {
+      remediator.handle(alert).catch((err: unknown) => console.error(`[signoz-webhook] remediation failed unexpectedly: ${errorMessage(err)}`));
+    },
+    push: (alert, groupStatus) =>
+      withTimeout(
+        mcp.notification({
+          method: "notifications/claude/channel",
+          params: { content: formatAlertContent(alert, groupStatus), meta: extractMeta(alert, groupStatus) },
+        }),
+        AGENT_NOTIFY_TIMEOUT_MS,
+        "agent notification"
+      ),
+  });
 
-  // Push every other alert as a separate channel event
-  const results = await Promise.allSettled(
-    payload.alerts
-      .filter((alert) => !isRemediable(alert))
-      .map(async (alert) => {
-        const content = formatAlertContent(alert, payload.status);
-        const meta = extractMeta(alert, payload.status);
-
-        await withTimeout(
-          mcp.notification({
-            method: "notifications/claude/channel",
-            params: { content, meta },
-          }),
-          AGENT_NOTIFY_TIMEOUT_MS,
-          "agent notification"
-        );
-      })
-  );
-
-  const succeeded = results.filter((r) => r.status === "fulfilled").length;
-  const failed = results.filter((r) => r.status === "rejected").length;
-  for (const result of results) {
-    if (result.status === "rejected") console.error(`[signoz-webhook] could not push an alert to the agent: ${errorMessage(result.reason)}`);
-  }
-
-  respond(
-    res,
-    failed > 0 ? 207 : 200,
-    JSON.stringify({ received: payload.alerts.length, pushed: succeeded, remediable: remediable.length, failed }),
-    "application/json"
-  );
+  respond(res, httpStatus, JSON.stringify(counts), "application/json");
 });
 
 httpServer.listen(PORT, HOST, () => {
@@ -284,4 +308,5 @@ httpServer.listen(PORT, HOST, () => {
     `[signoz-webhook] listening on ${HOST}:${PORT}/alert (auth enabled), ` +
       `remediable actions ${REMEDIATION.actions.join(", ")} via ${RUNDECK.baseUrl}`
   );
+  heartbeat.start();
 });

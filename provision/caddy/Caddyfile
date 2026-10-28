@@ -3,7 +3,9 @@
 # SigNoz and the Trivy operator used to post to http://<bare IP>:8788 and :8790, so the
 # webhook secret and every alert payload crossed the internet in cleartext. Caddy
 # terminates TLS for SRE_AGENT_HOSTNAME with an automatically renewed certificate and
-# forwards to the channels, which bind to loopback by default.
+# forwards to the channels, which bind to loopback by default. Exposed: POST /alert and
+# /trivy (authenticated by the channels), and GET /health and /health/session of the SigNoz
+# channel (public). Everything else is 404.
 #
 # The hostname is an environment variable so this file does not hard-code a deployment.
 # Production: SRE_AGENT_HOSTNAME=sre-agent.internal.alien.club (A record to the VM).
@@ -41,7 +43,17 @@
 		}
 		reverse_proxy 127.0.0.1:{$TRIVY_WEBHOOK_PORT:8790}
 	}
-	# The channels' own /health stays on loopback; nothing else is exposed
+	# The SigNoz channel's health checks, for sentinel's `sre_agent` hop: /health (the listener
+	# is up) and /health/session (the Claude session answered a heartbeat in the last 12 min;
+	# 200 or 503). GET only, and public: they carry no secret and accept no input.
+	@signoz_health {
+		method GET
+		path /health /health/session
+	}
+	handle @signoz_health {
+		reverse_proxy 127.0.0.1:{$SIGNOZ_WEBHOOK_PORT:8788}
+	}
+	# Nothing else is exposed: any other path or method, the Trivy channel's /health included
 	handle {
 		respond 404
 	}
