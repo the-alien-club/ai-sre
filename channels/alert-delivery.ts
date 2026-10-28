@@ -6,6 +6,12 @@
 // - an exact duplicate of an alert accepted in the last window (alert-dedupe.ts), which is the
 //   second Alertmanager's copy, is counted and dropped;
 // - everything else is pushed to the session.
+//
+// Each dropped duplicate and each pushed alert is one log line naming the alert's
+// fingerprint, status and startsAt, so pm2's error log shows what the dedupe decided and why.
+// Only those three fields are logged: they identify the episode and carry no secret (labels
+// and annotations, which can, are never logged). Session heartbeats do not come through here
+// and are never logged when they succeed.
 
 import type { AlertDedupe } from "./alert-dedupe.js";
 import { isRemediable } from "./sentinel-remediation.js";
@@ -68,6 +74,15 @@ function seconds(ms: number): string {
   return `${Math.round(ms / 1000)} s`;
 }
 
+/**
+ * The alert's identity for a log line. Each value is JSON-quoted: they come from the sender,
+ * and a newline in one must not forge a second log line.
+ */
+function describeAlert(alert: Pick<AlertmanagerAlert, "fingerprint" | "startsAt">, status: unknown): string {
+  const quote = (value: unknown) => (value === undefined ? "none" : JSON.stringify(value));
+  return `fingerprint=${quote(alert.fingerprint)} status=${quote(status)} startsAt=${quote(alert.startsAt)}`;
+}
+
 export async function deliverAlerts(payload: AlertmanagerPayload, deps: AlertDeliveryDeps): Promise<AlertDeliveryResult> {
   const { dedupe, push, remediate, log = (line: string) => console.error(line) } = deps;
 
@@ -79,7 +94,7 @@ export async function deliverAlerts(payload: AlertmanagerPayload, deps: AlertDel
 
   // Claimed synchronously, before any push is awaited, so two copies in one payload or in
   // two concurrent requests cannot both pass.
-  const toPush: Array<{ alert: AlertmanagerAlert; key: string | undefined }> = [];
+  const toPush: Array<{ alert: AlertmanagerAlert; status: AlertmanagerAlert["status"]; key: string | undefined }> = [];
   let duplicates = 0;
   for (const alert of payload.alerts) {
     if (remediable.has(alert)) continue;
@@ -87,26 +102,29 @@ export async function deliverAlerts(payload: AlertmanagerPayload, deps: AlertDel
     const verdict = dedupe.claim({ fingerprint: alert.fingerprint, status, startsAt: alert.startsAt });
     if (verdict.kind === "duplicate") {
       duplicates++;
-      log(`[signoz-webhook] dropped a duplicate delivery of ${alert.fingerprint} (${status}), first accepted ${seconds(verdict.ageMs)} ago`);
+      log(`[signoz-webhook] dropped duplicate alert ${describeAlert(alert, status)}: first accepted ${seconds(verdict.ageMs)} ago`);
       continue;
     }
     if (verdict.kind === "unkeyed") {
       log(`[signoz-webhook] WARNING: pushing an alert that cannot be deduplicated (${verdict.reason}); every copy of it will reach the agent`);
-      toPush.push({ alert, key: undefined });
+      toPush.push({ alert, status, key: undefined });
       continue;
     }
-    toPush.push({ alert, key: verdict.key });
+    toPush.push({ alert, status, key: verdict.key });
   }
 
   const results = await Promise.allSettled(toPush.map(({ alert }) => push(alert, payload.status)));
 
   let failed = 0;
   results.forEach((result, index) => {
-    if (result.status === "fulfilled") return;
+    const { alert, status, key } = toPush[index];
+    if (result.status === "fulfilled") {
+      log(`[signoz-webhook] pushed alert ${describeAlert(alert, status)}`);
+      return;
+    }
     failed++;
-    log(`[signoz-webhook] could not push an alert to the agent: ${errorMessage(result.reason)}`);
+    log(`[signoz-webhook] could not push alert ${describeAlert(alert, status)} to the agent: ${errorMessage(result.reason)}`);
     // Not accepted after all: let the other Alertmanager's copy through
-    const { key } = toPush[index];
     if (key !== undefined) dedupe.release(key);
   });
 

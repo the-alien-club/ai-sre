@@ -35,6 +35,7 @@ import { createRundeckClient, readRundeckConfig } from "./rundeck-client.js";
 import { createRemediator, DEFAULT_REMEDIATION_CONFIG_PATH, readRemediationConfig } from "./sentinel-remediation.js";
 import { createSessionHeartbeat, HEARTBEAT_ACK_TOOL } from "./session-heartbeat.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
+import { createWatchdogRestartsReader, DEFAULT_WATCHDOG_LAST_RESTART_PATH, withWatchdogRestarts } from "./watchdog-restarts.js";
 import { withTimeout } from "./with-timeout.js";
 
 // -- Configuration (env vars, with sensible defaults) -------------------------
@@ -49,6 +50,8 @@ const RUNDECK = readRundeckConfig(process.env);
 const REMEDIATION = readRemediationConfig(DEFAULT_REMEDIATION_CONFIG_PATH);
 // Same data/ directory as slack-sre.ts, trivy-webhook.ts and incidents.db
 const DATA_DIR = process.env.SRE_DATA_DIR ?? join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
+// The session watchdog's restart record (scripts/session-watchdog.sh), reported by /health/session
+const WATCHDOG_LAST_RESTART_PATH = process.env.SRE_WATCHDOG_LAST_RESTART_PATH ?? DEFAULT_WATCHDOG_LAST_RESTART_PATH;
 
 // Bounds on everything this process waits for (CLAUDE_ERROR_PATTERNS.md §14). A run request
 // returns as soon as Rundeck has queued the execution; the job itself runs for up to 30 min.
@@ -65,6 +68,7 @@ const remediator = createRemediator({
 });
 
 const alertDedupe = createAlertDedupe();
+const readWatchdogRestarts = createWatchdogRestartsReader({ path: WATCHDOG_LAST_RESTART_PATH });
 
 // -- MCP Channel Server -------------------------------------------------------
 
@@ -245,8 +249,9 @@ const httpServer = createServer(async (req, res) => {
   }
 
   // Session check: the session answered a heartbeat recently. Public through Caddy, no secrets.
+  // The watchdog's restarts ride along in the body; only the heartbeat decides the status.
   if (req.method === "GET" && url.pathname === "/health/session") {
-    const { httpStatus, body } = heartbeat.health();
+    const { httpStatus, body } = withWatchdogRestarts(heartbeat.health(), await readWatchdogRestarts());
     respond(res, httpStatus, JSON.stringify(body), "application/json");
     return;
   }

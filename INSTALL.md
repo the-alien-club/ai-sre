@@ -486,6 +486,67 @@ The start script (`scripts/start-agent.sh`) handles:
 (crontab -l 2>/dev/null; echo "0 4 * * * /usr/local/bin/pm2 restart sre-agent >> /var/log/sre-agent/cron-restart.log 2>&1") | crontab -
 ```
 
+## 12b. Install the session watchdog
+
+`GET /health/session` goes 503 when the Claude session stops answering heartbeats (wedged,
+rate-limited, stuck compacting, waiting on a prompt). A systemd timer checks it every minute
+from the VM itself and runs `pm2 restart sre-agent` once it has been non-200 for more than 5
+consecutive minutes. The rules, all in `scripts/session-watchdog.sh`:
+
+- A restart ends the failure window: the new session answers 503 `never_acked` for about 2 min
+  after it starts, and the next restart needs another full 5 min of failures after that.
+- A gap of more than 3 min between two checks (the timer did not run, the VM rebooted) starts
+  the window again; an old first failure never counts.
+- **At most 2 restarts per rolling hour.** Past that it logs the refusal on every check and does
+  nothing else: a session that two restarts did not fix needs a human, and sentinel's
+  `sre_agent` hop pages one. Every attempt counts, including one pm2 reported as failed.
+- A corrupt restart history refuses every restart (and fails the unit) until it is fixed.
+
+The units run as `sre-agent`, with state in `/var/lib/sre-agent-watchdog` (created by systemd,
+`0750 sre-agent:sre-agent`). They run the script from the checkout, so `git pull` updates it.
+
+```bash
+cd ~/sre-agent
+sudo install -m 0644 provision/systemd/sre-agent-session-watchdog.service /etc/systemd/system/
+sudo install -m 0644 provision/systemd/sre-agent-session-watchdog.timer /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/sre-agent-session-watchdog.{service,timer}
+sudo systemctl daemon-reload
+sudo systemctl enable --now sre-agent-session-watchdog.timer
+
+# The unit's PATH must find pm2 (npm-global, /usr/local/bin or /usr/bin), else every restart fails
+sudo -u sre-agent env PATH=/home/sre-agent/.local/share/npm-global/bin:/usr/local/bin:/usr/bin:/bin sh -c 'command -v pm2'
+
+# One check now, rather than waiting for the timer
+sudo systemctl start sre-agent-session-watchdog.service
+journalctl -u sre-agent-session-watchdog -n 5 --no-pager
+```
+
+The unit expects the checkout at `/home/sre-agent/sre-agent` and the SigNoz channel on
+`127.0.0.1:8788`. If `SIGNOZ_WEBHOOK_PORT` is changed in `.env`, change `SRE_WATCHDOG_URL` in
+the unit with `sudo systemctl edit sre-agent-session-watchdog.service`.
+
+**Inspecting it:**
+
+```bash
+systemctl list-timers sre-agent-session-watchdog.timer      # last and next run
+journalctl -u sre-agent-session-watchdog --since -1h        # one line per check
+journalctl -u sre-agent-session-watchdog -p warning         # failures, restarts and refusals only
+sudo ls -l /var/lib/sre-agent-watchdog/
+sudo cat /var/lib/sre-agent-watchdog/last_restart           # {"last_restart_at":...,"restarts_last_hour":N,"restarts":[...]}
+sudo cat /var/lib/sre-agent-watchdog/restart_history        # epoch seconds of the restarts of the last hour
+sudo cat /var/lib/sre-agent-watchdog/first_failure          # epoch of the current failure streak; absent while healthy
+curl -s http://127.0.0.1:8788/health/session                # also reports last_restart_at and restarts_last_hour
+```
+
+`/health/session` reads `last_restart` on each request and adds `last_restart_at` (null when
+none is recorded) and `restarts_last_hour` (0 when none; null when the record cannot be read,
+which the channel logs). Its status and other fields still come only from the heartbeat. Set
+`SRE_WATCHDOG_LAST_RESTART_PATH` in `.env` only if the state directory moves.
+
+To stop it, for maintenance that keeps the session down on purpose:
+`sudo systemctl stop sre-agent-session-watchdog.timer` (and `start` it afterwards). A
+`pm2 stop sre-agent` alone is not enough: the watchdog would restart it after 5 min.
+
 ## 13. Verify
 
 ```bash
@@ -498,6 +559,10 @@ tmux capture-pane -t sre-agent -p | tail -20
 
 # The session answers heartbeats: 503 never_acked for ~1 min after a start, then 200 ok
 curl -s "https://$SRE_AGENT_HOSTNAME/health/session"
+
+# The session watchdog's timer is active and its checks see the session healthy
+systemctl list-timers sre-agent-session-watchdog.timer
+journalctl -u sre-agent-session-watchdog -n 3 --no-pager
 
 # Send a test alert
 curl -s -X POST "https://$SRE_AGENT_HOSTNAME/alert" \
@@ -523,6 +588,13 @@ tmux attach -t sre-agent   # Ctrl+B D to detach
 # Restart agent (fresh context)
 pm2 restart sre-agent
 
+# What the session watchdog decided, and its restarts (§12b)
+journalctl -u sre-agent-session-watchdog --since -1h
+sudo cat /var/lib/sre-agent-watchdog/last_restart
+
+# Which alerts were pushed and which duplicates were dropped (one line each)
+grep -E '\[signoz-webhook\] (pushed alert|dropped duplicate alert)' /var/log/sre-agent/error.log | tail -20
+
 # Update CLAUDE.md from local
 cd /path/to/sre-agent && git push
 ssh sre-agent@$SRE_IP 'cd ~/sre-agent && git pull'
@@ -540,3 +612,4 @@ pm2 restart sre-agent
 - **SigNoz channel**: "SRE Agent" (webhook, all 20 alert rules)
 - **Slack bot**: "Claude SRE" (Socket Mode, DM with CTO)
 - **Daily restart**: 4:00 UTC via cron
+- **Session watchdog**: systemd timer `sre-agent-session-watchdog.timer`, every minute (§12b)

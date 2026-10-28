@@ -1,0 +1,12 @@
+# Runs sre-agent-session-watchdog.service once a minute; see that unit for installation.
+[Unit]
+Description=Run the SRE agent session watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=sre-agent-session-watchdog.service
+
+[Install]
+WantedBy=timers.target

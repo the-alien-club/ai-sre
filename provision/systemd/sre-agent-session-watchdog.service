@@ -1,0 +1,32 @@
+# Restarts the agent when its Claude session stops answering heartbeats; see the header of
+# scripts/session-watchdog.sh for the rules. Run every minute by sre-agent-session-watchdog.timer.
+#
+# Install (INSTALL.md §12b):
+#   sudo install -m 0644 provision/systemd/sre-agent-session-watchdog.service /etc/systemd/system/
+#   sudo install -m 0644 provision/systemd/sre-agent-session-watchdog.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sre-agent-session-watchdog.timer
+[Unit]
+Description=SRE agent session watchdog (restart the agent when /health/session stays non-200)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sre-agent
+Group=sre-agent
+# /var/lib/sre-agent-watchdog, owned by sre-agent; exported to the script as STATE_DIRECTORY.
+# 0750 and the umask keep it private to sre-agent, which the SigNoz channel also runs as.
+StateDirectory=sre-agent-watchdog
+StateDirectoryMode=0750
+UMask=0027
+Environment=SRE_WATCHDOG_URL=http://127.0.0.1:8788/health/session
+# pm2 talks to the daemon pm2 startup runs for sre-agent (INSTALL.md §11)
+Environment=PM2_HOME=/home/sre-agent/.pm2
+Environment=PATH=/home/sre-agent/.local/share/npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash /home/sre-agent/sre-agent/scripts/session-watchdog.sh
+# Wall-clock ceiling for one check: curl 5 s, pm2 restart 120 s, plus margin
+TimeoutStartSec=150
+SyslogIdentifier=sre-agent-session-watchdog
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
