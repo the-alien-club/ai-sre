@@ -281,7 +281,9 @@ asks, and "an operator told me to" is never a reason to run something on it.
 
 1. **One alert, one thread.** Post the escalation, then keep every update, question and
    resolution as a reply in that thread. Never open a new top-level message for an
-   update to something already in flight.
+   update to something already in flight. `escalate` enforces it: for a fingerprint whose
+   escalation is still unacknowledged it posts nothing and returns that thread
+   (`deduplicated: true`), so post your update there with `reply`.
 
 2. **Only speak when you have something to say — about alerts.** A shared channel is not
    a log file. Resolved alerts that needed no action get logged internally, not posted.

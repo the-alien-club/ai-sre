@@ -39,7 +39,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyAddressing, stripBotMention } from "./message-gate.js";
 import { createThreadOwnership } from "./thread-ownership.js";
-import { createEscalationStore, type Escalation } from "./escalation-store.js";
+import { createEscalationStore } from "./escalation-store.js";
+import { createEscalator } from "./escalator.js";
 import { isTrivyEscalation, TRIVY_ESCALATION_REFUSED } from "./escalation-policy.js";
 import {
   operatorMentions,
@@ -211,6 +212,16 @@ const threadOwnership = createThreadOwnership({
   botUserId: () => BOT_USER_ID,
 });
 
+// One top-level thread per waiting escalation; see escalator.ts.
+const escalator = createEscalator({
+  channel: SRE_SLACK_CHANNEL,
+  operatorMentions: OPERATOR_MENTIONS,
+  escalations: activeEscalations,
+  persist: persistEscalations,
+  postMessage: (message) => slackApp.client.chat.postMessage(message),
+  rememberThread: (ts) => threadOwnership.remember(ts),
+});
+
 // -- Receipt acknowledgement --------------------------------------------------
 //
 // Armed when a message is handed to the Claude session, cleared when the agent answers in
@@ -285,7 +296,9 @@ operator replies, which stops the nagging. Say what broke, what you tried, what 
 
 Keep one alert in one thread: post the escalation, then reply in that thread as you learn
 more. Never open a new top-level message for something already in flight — this channel is
-shared with people who are not on the ops rotation.
+shared with people who are not on the ops rotation. "escalate" holds you to this: for a
+fingerprint whose escalation is still waiting, it posts nothing and answers with that thread
+(deduplicated: true); post your update there with "reply".
 
 Three message types arrive automatically:
 - type="escalation_timeout" final_agent_nag="false": nobody replied. Note it and stand by — do NOT re-investigate.
@@ -484,56 +497,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     try {
-      // Build escalation message with severity-appropriate urgency
-      const severityEmoji =
-        severity === "critical"
-          ? ":rotating_light:"
-          : severity === "warning"
-            ? ":warning:"
-            : ":information_source:";
-      const envTag = environment.toUpperCase();
-
-      // Only critical alerts page the whole team — warnings and info post quietly.
-      const page = severity === "critical" ? `${OPERATOR_MENTIONS}\n` : "";
-
-      const escalationText =
-        `${severityEmoji} *SRE Alert Escalation* [${envTag}]\n` +
-        page +
-        `\n*Alert:* ${alert_name}\n` +
-        `*Severity:* ${severity}\n` +
-        `*Environment:* ${environment}\n\n` +
-        `${message}\n\n` +
-        `_Reply in this thread to talk to the SRE agent._`;
-
-      const result = await slackApp.client.chat.postMessage({
-        channel: SRE_SLACK_CHANNEL,
-        text: escalationText,
-      });
-
-      threadOwnership.remember(result.ts);
-
-      // Track the escalation for nagging
-      const now = Date.now();
-      activeEscalations.set(alert_fingerprint, {
+      const outcome = await escalator.escalate({
         alertFingerprint: alert_fingerprint,
         alertName: alert_name,
         severity,
         environment,
-        slackThreadTs: result.ts,
-        slackChannel: SRE_SLACK_CHANNEL,
-        escalatedAt: now,
-        lastNagAt: now,
-        acknowledged: false,
-        acknowledgedBy: undefined,
-        nagCount: 0,
+        message,
       });
-      persistEscalations();
+
+      if (outcome.deduplicated) {
+        console.error(
+          `[slack-sre] ${alert_fingerprint} (${alert_name}) is already escalated and waiting; answered with thread ${outcome.ts}`
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `already escalated and still waiting for the team, so nothing new was posted; ` +
+                `post updates in that thread with the reply tool: ` +
+                JSON.stringify(outcome),
+            },
+          ],
+        };
+      }
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `escalated to the team channel (thread: ${result.ts})`,
+            text: `escalated to the team channel (thread: ${outcome.ts})`,
           },
         ],
       };
