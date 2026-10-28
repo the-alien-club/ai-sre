@@ -41,6 +41,8 @@ import { classifyAddressing, stripBotMention } from "./message-gate.js";
 import { createThreadOwnership } from "./thread-ownership.js";
 import { createEscalationStore } from "./escalation-store.js";
 import { createEscalator } from "./escalator.js";
+import { createSlackPostClient, createSlackPoster, SlackPostRejected } from "./slack-poster.js";
+import { withTimeout } from "./with-timeout.js";
 import { isTrivyEscalation, TRIVY_ESCALATION_REFUSED } from "./escalation-policy.js";
 import {
   operatorMentions,
@@ -202,6 +204,30 @@ const slackApp = new App({
   socketMode: true,
 });
 
+// Bounds on everything this process waits for (CLAUDE_ERROR_PATTERNS.md §14)
+const SLACK_TIMEOUT_MS = 20 * 1000;
+const AGENT_NOTIFY_TIMEOUT_MS = 10 * 1000;
+
+// Every post goes through this, never through slackApp.client: Bolt's client has no timeout
+// and retries for ~30 min, and a retry that lands after the caller gave up posts the message
+// twice. One bounded attempt; this process decides whether to try again (slack-poster.ts).
+const slackPoster = createSlackPoster(createSlackPostClient(SLACK_BOT_TOKEN, SLACK_TIMEOUT_MS), SLACK_TIMEOUT_MS);
+
+/** A post failure as the agent or the log should read it: refused, or of unknown outcome. */
+function describePostFailure(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return err instanceof SlackPostRejected ? message : `${message} (the message may or may not be visible)`;
+}
+
+/** For posts nobody waits on: a failure is logged, never thrown. */
+async function postOrLog(message: { channel: string; text: string; thread_ts?: string }, what: string): Promise<void> {
+  try {
+    await slackPoster.post(message);
+  } catch (err) {
+    console.error(`[slack-sre] failed to post ${what}: ${describePostFailure(err)}`);
+  }
+}
+
 // Resolved during startup validation — needed to detect @-mentions of the bot.
 let BOT_USER_ID = "";
 
@@ -218,7 +244,8 @@ const escalator = createEscalator({
   operatorMentions: OPERATOR_MENTIONS,
   escalations: activeEscalations,
   persist: persistEscalations,
-  postMessage: (message) => slackApp.client.chat.postMessage(message),
+  poster: slackPoster,
+  botUserId: () => BOT_USER_ID,
   rememberThread: (ts) => threadOwnership.remember(ts),
 });
 
@@ -250,8 +277,8 @@ function armReceiptAck(
 
   const timer = setTimeout(() => {
     pendingAcks.delete(threadTs);
-    void slackApp.client.chat
-      .postMessage({
+    void slackPoster
+      .post({
         channel,
         thread_ts: threadTs,
         text: `:eyes: On it, ${senderName} — investigating. I'll answer in this thread.`,
@@ -453,7 +480,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const target = channel ?? SRE_SLACK_CHANNEL;
 
     try {
-      const result = await slackApp.client.chat.postMessage({
+      const ts = await slackPoster.post({
         channel: target,
         text,
         thread_ts,
@@ -461,7 +488,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       // Remember the thread so operator replies to it come back to us without
       // needing an explicit @-mention.
-      const conversationTs = thread_ts ?? result.ts;
+      const conversationTs = thread_ts ?? ts;
       threadOwnership.remember(conversationTs);
 
       // The agent has spoken for itself — no need for the channel to do it.
@@ -469,9 +496,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       return { content: [{ type: "text" as const, text: "sent" }] };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
       return {
-        content: [{ type: "text" as const, text: `failed to send: ${msg}` }],
+        content: [{ type: "text" as const, text: `failed to send: ${describePostFailure(err)}` }],
         isError: true,
       };
     }
@@ -531,11 +557,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ],
       };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: "text" as const, text: `escalation failed: ${msg}` }],
-        isError: true,
-      };
+      const text =
+        err instanceof SlackPostRejected
+          ? `escalation failed, nothing was posted: ${err.message}`
+          : `escalation outcome unknown: ${describePostFailure(err)}. Calling escalate again for this fingerprint is ` +
+            `safe: it checks the channel first and never posts a second thread.`;
+      return { content: [{ type: "text" as const, text }], isError: true };
     }
   }
 
@@ -560,7 +587,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     // Post resolution to the escalation thread
     if (escalation.slackChannel && escalation.slackThreadTs) {
       try {
-        await slackApp.client.chat.postMessage({
+        await slackPoster.post({
           channel: escalation.slackChannel,
           thread_ts: escalation.slackThreadTs,
           text: `:white_check_mark: *Resolved*\n\n${resolution_message}`,
@@ -568,7 +595,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       } catch (err) {
         // Non-fatal for the agent's bookkeeping, but it means the team never saw
         // the resolution — say so rather than reporting a clean success.
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describePostFailure(err);
         console.error(
           `[slack-sre] failed to post resolution for ${alert_fingerprint}:`,
           err
@@ -595,7 +622,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 
-  throw new Error(`unknown tool: ${name}`);
+  // Never throw out of a tool call (CLAUDE_ERROR_PATTERNS.md §15)
+  return {
+    content: [{ type: "text" as const, text: `unknown tool: ${name}` }],
+    isError: true,
+  };
 });
 
 // -- Permission relay: forward tool approval prompts to Slack -----------------
@@ -618,7 +649,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
         ? params.input_preview.slice(0, 300) + "..."
         : params.input_preview;
 
-    const result = await slackApp.client.chat.postMessage({
+    const ts = await slackPoster.post({
       channel: SRE_SLACK_CHANNEL,
       text:
         `:lock: *Permission Request* \`${params.request_id}\` ${OPERATOR_MENTIONS}\n\n` +
@@ -630,7 +661,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
         `Any operator: reply \`yes ${params.request_id}\` to approve or \`no ${params.request_id}\` to deny.`,
     });
 
-    threadOwnership.remember(result.ts);
+    threadOwnership.remember(ts);
     pendingPermissions.set(params.request_id, {
       toolName: params.tool_name,
       requestedAt: Date.now(),
@@ -736,14 +767,17 @@ slackApp.message(async ({ message }) => {
       console.error(
         `[slack-sre] ${senderName} answered unknown permission request ${requestId}`
       );
-      await slackApp.client.chat.postMessage({
-        channel: channelId ?? SRE_SLACK_CHANNEL,
-        thread_ts: replyThreadTs,
-        text:
-          `:grey_question: No pending permission request \`${requestId}\` — it was already answered, ` +
-          "expired, or the agent restarted since it asked. Nothing is waiting on this verdict; " +
-          "the agent will ask again if it still needs approval.",
-      });
+      await postOrLog(
+        {
+          channel: channelId ?? SRE_SLACK_CHANNEL,
+          thread_ts: replyThreadTs,
+          text:
+            `:grey_question: No pending permission request \`${requestId}\` — it was already answered, ` +
+            "expired, or the agent restarted since it asked. Nothing is waiting on this verdict; " +
+            "the agent will ask again if it still needs approval.",
+        },
+        `the unknown-permission notice for ${requestId}`
+      );
       return;
     }
 
@@ -757,11 +791,14 @@ slackApp.message(async ({ message }) => {
       },
     });
 
-    await slackApp.client.chat.postMessage({
-      channel: channelId ?? SRE_SLACK_CHANNEL,
-      thread_ts: replyThreadTs,
-      text: `:white_check_mark: Permission ${approved ? "approved" : "denied"} for \`${requestId}\` by ${senderName}.`,
-    });
+    await postOrLog(
+      {
+        channel: channelId ?? SRE_SLACK_CHANNEL,
+        thread_ts: replyThreadTs,
+        text: `:white_check_mark: Permission ${approved ? "approved" : "denied"} for \`${requestId}\` by ${senderName}.`,
+      },
+      `the permission verdict for ${requestId}`
+    );
     return;
   }
 
@@ -863,7 +900,11 @@ console.error(
 
 // -- Escalation nag timer -----------------------------------------------------
 
-setInterval(async () => {
+// One sweep at a time: with every Slack post bounded at SLACK_TIMEOUT_MS, a sweep over many
+// escalations can outlast the 1-min tick, and two overlapping sweeps would nag twice.
+let sweeping = false;
+
+async function nagSweep(): Promise<void> {
   threadOwnership.prune();
   prunePendingPermissions();
 
@@ -904,34 +945,42 @@ setInterval(async () => {
           ? " _(Slack-only nag — agent standing by silently)_"
           : "";
 
-        await slackApp.client.chat.postMessage({
+        await slackPoster.post({
           channel: esc.slackChannel,
           thread_ts: esc.slackThreadTs,
           text: `${urgency} — alert *${esc.alertName}* [${esc.environment.toUpperCase()}] is still unacknowledged. Nag #${esc.nagCount}.${slackOnlyNote}`,
         });
       } catch (err) {
-        console.error(`[slack-sre] failed to nag for ${fingerprint}:`, err);
+        console.error(`[slack-sre] failed to nag for ${fingerprint}: ${describePostFailure(err)}`);
       }
     }
 
     // Only push timeout events into Claude's session up to MAX_AGENT_NAGS.
     // After that, Slack nags continue but the agent's context is preserved.
     if (!agentExhausted) {
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: `Escalation for "${esc.alertName}" has been unacknowledged for ${minutesWaiting} minutes. Nag #${esc.nagCount} sent to the team.${esc.nagCount === MAX_AGENT_NAGS ? ` This is the final agent notification — the team appears offline. Will continue Slack-only nags every 2 hours.` : ""}`,
-          meta: {
-            type: "escalation_timeout",
-            alert_fingerprint: fingerprint,
-            alert_name: esc.alertName,
-            severity: esc.severity,
-            environment: esc.environment,
-            minutes_waiting: String(minutesWaiting),
-            nag_count: String(esc.nagCount),
-            final_agent_nag: esc.nagCount === MAX_AGENT_NAGS ? "true" : "false",
+      await withTimeout(
+        mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `Escalation for "${esc.alertName}" has been unacknowledged for ${minutesWaiting} minutes. Nag #${esc.nagCount} sent to the team.${esc.nagCount === MAX_AGENT_NAGS ? ` This is the final agent notification — the team appears offline. Will continue Slack-only nags every 2 hours.` : ""}`,
+            meta: {
+              type: "escalation_timeout",
+              alert_fingerprint: fingerprint,
+              alert_name: esc.alertName,
+              severity: esc.severity,
+              environment: esc.environment,
+              minutes_waiting: String(minutesWaiting),
+              nag_count: String(esc.nagCount),
+              final_agent_nag: esc.nagCount === MAX_AGENT_NAGS ? "true" : "false",
+            },
           },
-        },
+        }),
+        AGENT_NOTIFY_TIMEOUT_MS,
+        "agent notification"
+      ).catch((err: unknown) => {
+        console.error(
+          `[slack-sre] could not push the nag for ${fingerprint} to the agent: ${err instanceof Error ? err.message : String(err)}`
+        );
       });
     }
   }
@@ -939,4 +988,16 @@ setInterval(async () => {
   // One write per sweep rather than one per escalation: the nag counters only have to
   // survive a restart, and a restart cannot land mid-loop.
   if (escalationsChanged) persistEscalations();
+}
+
+setInterval(() => {
+  if (sweeping) return;
+  sweeping = true;
+  nagSweep()
+    .catch((err: unknown) => {
+      console.error(`[slack-sre] nag sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    })
+    .finally(() => {
+      sweeping = false;
+    });
 }, 60_000); // check every minute

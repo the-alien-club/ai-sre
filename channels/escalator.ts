@@ -7,8 +7,16 @@
 // nag loop, which now follows the second thread. So while an escalation for the fingerprint is
 // still waiting (in the map, not acknowledged), escalate answers with that thread instead and
 // leaves its record untouched. An acknowledged one can be escalated afresh.
+//
+// A post that timed out may still have landed (slack-poster.ts). If the agent then escalates
+// the same fingerprint again, posting blindly could put two threads in the channel. So the
+// escalation text carries its fingerprint, and the next escalate after an uncertain post
+// first looks for it in the channel's recent history: found, it adopts that thread; not
+// found, it posts; history unreadable, it refuses rather than guess.
 
 import type { Escalation } from "./escalation-store.js";
+import { SlackPostRejected, type SlackPoster } from "./slack-poster.js";
+import { escapeSlackText } from "./slack-text.js";
 
 export interface EscalateRequest {
   alertFingerprint: string;
@@ -33,17 +41,30 @@ export interface EscalatorDeps {
   /** fingerprint → escalation, shared with the nag loop and the acknowledgement handler. */
   escalations: Map<string, Escalation>;
   persist: () => void;
-  /** Posts a top-level message. Rejects when Slack refused it. */
-  postMessage: (message: { channel: string; text: string }) => Promise<{ ts?: string }>;
+  /** Bounded, single-attempt Slack posting. */
+  poster: SlackPoster;
+  /** The bot's own user id, whose messages the history lookup matches. */
+  botUserId: () => string;
   /** Marks a thread as the agent's, so replies in it reach the session. */
   rememberThread: (ts: string) => void;
   now?: () => number;
 }
 
 export interface Escalator {
-  /** Rejects when Slack could not be posted to; the tool handler turns that into an error result. */
+  /**
+   * Rejects when Slack could not be posted to, or when an earlier post's outcome is unknown
+   * and cannot be checked; the tool handler turns that into an error result.
+   */
   escalate(request: EscalateRequest): Promise<EscalateOutcome>;
 }
+
+/** The line that identifies an escalation's thread in the channel history. */
+export function fingerprintMarker(alertFingerprint: string): string {
+  return `Alert fingerprint: \`${escapeSlackText(alertFingerprint)}\``;
+}
+
+/** How long before an uncertain post the history lookup starts, for clock skew with Slack. */
+const LOOKUP_SKEW_MS = 60 * 1000;
 
 function escalationText(request: EscalateRequest, operatorMentions: string): string {
   const { alertName, severity, environment, message } = request;
@@ -58,14 +79,17 @@ function escalationText(request: EscalateRequest, operatorMentions: string): str
     `*Severity:* ${severity}\n` +
     `*Environment:* ${environment}\n\n` +
     `${message}\n\n` +
-    `_Reply in this thread to talk to the SRE agent._`
+    `_Reply in this thread to talk to the SRE agent._\n` +
+    `_${fingerprintMarker(request.alertFingerprint)}_`
   );
 }
 
 export function createEscalator(deps: EscalatorDeps): Escalator {
-  const { channel, operatorMentions, escalations, persist, postMessage, rememberThread, now = Date.now } = deps;
+  const { channel, operatorMentions, escalations, persist, poster, botUserId, rememberThread, now = Date.now } = deps;
   // fingerprint → the post in flight, so two concurrent calls cannot both post
   const inFlight = new Map<string, Promise<EscalateOutcome>>();
+  // fingerprint → when a post whose outcome is unknown was attempted
+  const uncertain = new Map<string, number>();
 
   function waitingThread(fingerprint: string): EscalateOutcome | undefined {
     const existing = escalations.get(fingerprint);
@@ -75,18 +99,14 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     return { channel: existing.slackChannel, ts: existing.slackThreadTs, deduplicated: true };
   }
 
-  async function post(request: EscalateRequest): Promise<EscalateOutcome> {
-    const result = await postMessage({ channel, text: escalationText(request, operatorMentions) });
-    if (!result.ts) throw new Error("Slack accepted the escalation but returned no message ts");
-
-    rememberThread(result.ts);
-    const at = now();
+  function record(request: EscalateRequest, ts: string, at: number): EscalateOutcome {
+    rememberThread(ts);
     escalations.set(request.alertFingerprint, {
       alertFingerprint: request.alertFingerprint,
       alertName: request.alertName,
       severity: request.severity,
       environment: request.environment,
-      slackThreadTs: result.ts,
+      slackThreadTs: ts,
       slackChannel: channel,
       escalatedAt: at,
       lastNagAt: at,
@@ -95,7 +115,35 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       nagCount: 0,
     });
     persist();
-    return { channel, ts: result.ts, deduplicated: false };
+    return { channel, ts, deduplicated: false };
+  }
+
+  async function post(request: EscalateRequest): Promise<EscalateOutcome> {
+    const fingerprint = request.alertFingerprint;
+    const attemptedAt = uncertain.get(fingerprint);
+    if (attemptedAt !== undefined) {
+      let found: string | undefined;
+      try {
+        found = await poster.findRecent(channel, botUserId(), fingerprintMarker(fingerprint), attemptedAt - LOOKUP_SKEW_MS);
+      } catch (err) {
+        throw new Error(
+          `an earlier escalation of ${fingerprint} timed out and may be visible, and the channel history could not be checked ` +
+            `(${err instanceof Error ? err.message : String(err)}); not posting again, try later`
+        );
+      }
+      uncertain.delete(fingerprint);
+      if (found !== undefined) return { ...record(request, found, attemptedAt), deduplicated: true };
+    }
+
+    const startedAt = now();
+    let ts: string;
+    try {
+      ts = await poster.post({ channel, text: escalationText(request, operatorMentions) });
+    } catch (err) {
+      if (!(err instanceof SlackPostRejected)) uncertain.set(fingerprint, startedAt);
+      throw err;
+    }
+    return record(request, ts, startedAt);
   }
 
   return {
