@@ -363,7 +363,15 @@ data-cluster-alien-hosted     Production    Orange Zone    Alien-hosted tenants 
 
 ## Alert Triage Workflow
 
-When a SigNoz alert arrives via `<channel source="signoz-webhook" ...>`:
+**Heartbeats come first.** When a `heartbeat <nonce>` event arrives (`<channel source="signoz-webhook" kind="heartbeat" nonce="...">`),
+immediately call `heartbeat_ack` with that nonce: no sub-agent, no investigation, no Slack
+message, nothing else. It is how the platform knows you are responsive.
+
+It arrives every 5 minutes. If you do not answer for 12 minutes, the platform treats you as
+wedged and restarts you. It is not an alert: never log it, report it or count it.
+
+Every other event from that channel is an alert. When a SigNoz alert arrives via
+`<channel source="signoz-webhook" ...>`:
 
 ### Step 1: Quick Filter (YOU do this — no tools, just read the alert text)
 
