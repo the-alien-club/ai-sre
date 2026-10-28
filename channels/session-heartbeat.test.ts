@@ -201,3 +201,13 @@ test("a failed push is logged, never thrown, and the nonce stays acceptable", as
   assert.match(h.logs[0], /could not push heartbeat nonce-1: heartbeat notification timed out/);
   assert.equal(h.heartbeat.ack("nonce-1").ok, true);
 });
+
+test("a heartbeat that is pushed and acked logs nothing", async () => {
+  const h = harness();
+
+  await h.heartbeat.beat();
+  h.heartbeat.ack("nonce-1");
+  h.heartbeat.health();
+
+  assert.deepEqual(h.logs, []);
+});

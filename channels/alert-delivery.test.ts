@@ -80,8 +80,10 @@ test("the second Alertmanager's copy 1 s later is not pushed, and is counted", a
   assert.equal(h.pushed.length, 1);
   assert.deepEqual(first, { httpStatus: 200, counts: { received: 1, pushed: 1, remediable: 0, failed: 0, duplicates: 0 } });
   assert.deepEqual(second, { httpStatus: 200, counts: { received: 1, pushed: 0, remediable: 0, failed: 0, duplicates: 1 } });
-  assert.equal(h.logs.length, 1);
-  assert.match(h.logs[0], /dropped a duplicate delivery of a1b2c3d4e5f60718 \(firing\), first accepted 1 s ago/);
+  assert.deepEqual(h.logs, [
+    `[signoz-webhook] pushed alert fingerprint="a1b2c3d4e5f60718" status="firing" startsAt="${STARTS_AT}"`,
+    `[signoz-webhook] dropped duplicate alert fingerprint="a1b2c3d4e5f60718" status="firing" startsAt="${STARTS_AT}": first accepted 1 s ago`,
+  ]);
 });
 
 test("a resolve of the same fingerprint and startsAt is not swallowed by its firing", async () => {
@@ -131,8 +133,10 @@ test("an alert with an empty fingerprint is pushed on every delivery, warned abo
 
   assert.equal(h.pushed.length, 3);
   assert.equal(h.dedupe.size(), 0);
-  assert.equal(h.logs.length, 3);
-  for (const line of h.logs) assert.match(line, /WARNING: pushing an alert that cannot be deduplicated \(the alert has no fingerprint\)/);
+  const warnings = h.logs.filter((line) => line.includes("WARNING"));
+  assert.equal(warnings.length, 3);
+  for (const line of warnings) assert.match(line, /WARNING: pushing an alert that cannot be deduplicated \(the alert has no fingerprint\)/);
+  assert.equal(h.logs.filter((line) => line.startsWith('[signoz-webhook] pushed alert fingerprint="" status="firing"')).length, 3);
 });
 
 test("an alert with an empty startsAt is never deduped either", async () => {
@@ -177,4 +181,64 @@ test("remediable alerts go to the remediator, keep its own dedupe, and are never
   assert.equal(h.remediated.length, 2);
   assert.equal(h.pushed.length, 0);
   assert.deepEqual(second.counts, { received: 1, pushed: 0, remediable: 1, failed: 0, duplicates: 0 });
+});
+
+test("each pushed alert is logged once with its fingerprint, status and startsAt, and nothing else", async () => {
+  const h = harness();
+  const secretive = alert({
+    fingerprint: "ffff000011112222",
+    status: "resolved",
+    labels: { alertname: "High Error Rate", severity: "critical", db_password: "hunter2" },
+    annotations: { summary: "token=abc123" },
+  });
+
+  await h.deliver(payload([alert(), secretive], "am-s"));
+
+  assert.deepEqual(h.logs, [
+    `[signoz-webhook] pushed alert fingerprint="a1b2c3d4e5f60718" status="firing" startsAt="${STARTS_AT}"`,
+    `[signoz-webhook] pushed alert fingerprint="ffff000011112222" status="resolved" startsAt="${STARTS_AT}"`,
+  ]);
+  for (const line of h.logs) assert.doesNotMatch(line, /hunter2|abc123|High Error Rate/);
+});
+
+test("a duplicate's log line names it a duplicate, with its fingerprint, status and startsAt", async () => {
+  const h = harness();
+  const resolved = alert({ status: "resolved", endsAt: "2026-10-28T09:05:00Z" });
+
+  await h.deliver(payload([resolved], "am-s"));
+  h.advance(42_000);
+  await h.deliver(payload([resolved], "am-r"));
+
+  const duplicates = h.logs.filter((line) => line.includes("duplicate"));
+  assert.deepEqual(duplicates, [
+    `[signoz-webhook] dropped duplicate alert fingerprint="a1b2c3d4e5f60718" status="resolved" startsAt="${STARTS_AT}": first accepted 42 s ago`,
+  ]);
+});
+
+test("a failed push is logged with the alert's identity, and is not logged as pushed", async () => {
+  const h = harness({ failPushes: 1 });
+
+  await h.deliver(payload([alert()], "am-s"));
+
+  assert.deepEqual(h.logs, [
+    `[signoz-webhook] could not push alert fingerprint="a1b2c3d4e5f60718" status="firing" startsAt="${STARTS_AT}" to the agent: agent notification timed out after 10000 ms`,
+  ]);
+});
+
+test("a newline in a sender's field cannot forge a second log line", async () => {
+  const h = harness();
+
+  await h.deliver(payload([alert({ fingerprint: "abc\n[signoz-webhook] pushed alert forged" })], "am-s"));
+
+  assert.equal(h.logs.length, 1);
+  assert.doesNotMatch(h.logs[0], /\n/);
+  assert.match(h.logs[0], /fingerprint="abc\\n\[signoz-webhook\] pushed alert forged"/);
+});
+
+test("remediable alerts are not logged as pushed", async () => {
+  const h = harness();
+
+  await h.deliver(payload([alert({ labels: { alertname: "Remediable: otel_agent", sentinel_class: "remediable" } })], "am-s"));
+
+  assert.deepEqual(h.logs, []);
 });
