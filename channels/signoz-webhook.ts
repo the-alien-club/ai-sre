@@ -18,6 +18,7 @@ import { createServer, type ServerResponse } from "node:http";
 import { requireLoopbackHost } from "./bind-address.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
 import { extractPresentedToken, isAuthorized, requireWebhookToken } from "./webhook-auth.js";
+import { withTimeout } from "./with-timeout.js";
 
 // -- Configuration (env vars, with sensible defaults) -------------------------
 
@@ -26,6 +27,8 @@ const HOST = requireLoopbackHost(process.env, "SIGNOZ_WEBHOOK_HOST"); // reached
 const AUTH_TOKEN = requireWebhookToken(process.env, "SIGNOZ_WEBHOOK_TOKEN"); // shared secret, required
 // An Alertmanager payload carries a handful of alerts; 1 MiB is far beyond any real one
 const MAX_BODY_BYTES = 1024 * 1024;
+// Bound on handing an alert to the Claude session (CLAUDE_ERROR_PATTERNS.md §14)
+const AGENT_NOTIFY_TIMEOUT_MS = 10 * 1000;
 
 // -- Types for Alertmanager-compatible webhook payload ------------------------
 
@@ -154,6 +157,10 @@ function extractMeta(alert: AlertmanagerAlert, groupStatus: string): Record<stri
 
 // -- HTTP helpers for Node.js -------------------------------------------------
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function respond(res: ServerResponse, status: number, body: string, contentType = "text/plain") {
   res.writeHead(status, { "Content-Type": contentType });
   res.end(body);
@@ -207,15 +214,22 @@ const httpServer = createServer(async (req, res) => {
       const content = formatAlertContent(alert, payload.status);
       const meta = extractMeta(alert, payload.status);
 
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: { content, meta },
-      });
+      await withTimeout(
+        mcp.notification({
+          method: "notifications/claude/channel",
+          params: { content, meta },
+        }),
+        AGENT_NOTIFY_TIMEOUT_MS,
+        "agent notification"
+      );
     })
   );
 
   const succeeded = results.filter((r) => r.status === "fulfilled").length;
   const failed = results.filter((r) => r.status === "rejected").length;
+  for (const result of results) {
+    if (result.status === "rejected") console.error(`[signoz-webhook] could not push an alert to the agent: ${errorMessage(result.reason)}`);
+  }
 
   respond(
     res,
