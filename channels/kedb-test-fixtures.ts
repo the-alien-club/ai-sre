@@ -25,6 +25,7 @@ export function sampleProposal(overrides: Partial<Proposal> = {}): Proposal {
     status: "pending",
     status_reason: null,
     approval: null,
+    payload_gap: null,
     commit_sha: null,
     created_at: 1_000,
     updated_at: 1_000,

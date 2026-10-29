@@ -1113,6 +1113,12 @@ slackApp.message(async ({ message }) => {
   const conversationThreadTs = parentThreadTs ?? message.ts;
   threadOwnership.remember(conversationThreadTs);
 
+  // An approver asking for a runbook proposal, as Slack says (user id, channel, thread): the
+  // only thing that lets a proposal through without a kept raw payload (kedb-loop.ts).
+  if (kedbLoop !== undefined && channelId !== undefined) {
+    kedbLoop.noteRequest({ user: senderId, text, channel: channelId, ts: message.ts, threadTs: parentThreadTs });
+  }
+
   // Promise the operator an answer if the agent stays quiet, and chase it if it stays quiet
   // for minutes.
   operatorWait.messageReceived(channelId ?? SRE_SLACK_CHANNEL, conversationThreadTs, senderName);

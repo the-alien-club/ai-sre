@@ -33,6 +33,11 @@ export const OPEN_STATUSES: ReadonlySet<ProposalStatus> = new Set(["pending", "a
 
 export const PROPOSAL_ID = /^KB-[1-9][0-9]{0,5}$/;
 export const SLACK_TS = /^[0-9]{9,11}\.[0-9]{6}$/;
+/**
+ * A fingerprint that may be written into a commit trailer and a Slack post as is: no spaces,
+ * no newlines, nothing to escape. alert-payload-store.ts names directories by the same rule.
+ */
+export const GAP_FINGERPRINT = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA1 = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
@@ -72,6 +77,22 @@ const Proposal = z
       .object({ user: z.string(), name: z.string(), ts: z.string().regex(SLACK_TS), permalink: z.string().url(), text: z.string() })
       .strict()
       .nullable(),
+    /**
+     * Set when the injection check (plan §5d) could not run because no raw payload was kept
+     * for the fingerprint, and the proposal went ahead only because an approver asked for it in
+     * its thread (kedb-loop.ts). Null when the check ran. Defaults to null for records written
+     * before 0.9.1, which all ran it.
+     */
+    payload_gap: z
+      .object({
+        fingerprint: z.string().regex(GAP_FINGERPRINT),
+        requested_by: z
+          .object({ user: z.string(), name: z.string(), ts: z.string().regex(SLACK_TS), permalink: z.string().url() })
+          .strict(),
+      })
+      .strict()
+      .nullable()
+      .default(null),
     commit_sha: z.string().regex(SHA1).nullable(),
     created_at: z.number().int(),
     updated_at: z.number().int(),

@@ -240,6 +240,14 @@ What the loop writes on the VM: `data/kedb-proposals.json` (the proposals, writt
 if it is ever unreadable the loop turns itself off and the briefing says why, rather than
 reusing `KB-<n>` numbers) and `data/kedb-stage/` (scratch copies for diffs and lint runs).
 
+Since 0.9.1 the loop also reads `data/incidents.db` (read-only, through `sqlite3`): a
+proposal's `fingerprint` must be the one its incident was logged with. A proposal whose
+fingerprint has no kept raw payload (older than 7 days, or than 0.8.0) is refused unless an
+approver asked for it in its thread; it is then posted and committed with the statement that
+the injection check did not run (`Injection-Check:` trailer). sre-kedb's verify-approvals
+passes such a commit with or without its Injection-Check support; with it, it also proves from
+Slack that an approver asked in the proposal's thread and that the post showed the warning.
+
 ## 5. Create RBAC-scoped kubeconfigs
 
 The agent should NOT have cluster-admin access. Create a scoped ServiceAccount on each cluster.
