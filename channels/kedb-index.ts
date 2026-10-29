@@ -42,7 +42,8 @@ export const KEDB_MAX_SIGNATURE_MATCHES = 2;
 /** The action ladder, lowest first (sre-kedb schema). */
 export const ACTION_LADDER = ["ignore", "log", "fyi", "ticket", "escalate", "page"] as const;
 
-const ENTRY_ID = /^[a-z0-9][a-z0-9-]*\/(_family|[a-z0-9][a-z0-9-]*)$/;
+/** An entry id: the path under entries/ without .md (sre-kedb schema). */
+export const ENTRY_ID = /^[a-z0-9][a-z0-9-]*\/(_family|[a-z0-9][a-z0-9-]*)$/;
 const MAX_REGEX_CHARS = 200;
 const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)\s*[+*{]/;
 
@@ -53,7 +54,7 @@ const Action = z.enum(ACTION_LADDER);
 const Verdict = z.enum(["real", "noise", "false_positive", "known_issue", "flapping"]);
 const SignatureValue = z.union([Pattern, z.number(), z.array(z.union([z.string().min(1).max(MAX_REGEX_CHARS), z.number()])).min(1).max(10)]);
 
-const EntryFrontMatter = z
+export const EntryFrontMatter = z
   .object({
     id: z.string().regex(ENTRY_ID),
     kind: z.enum(["family", "signature"]),
@@ -88,7 +89,7 @@ const EntryFrontMatter = z
   // Fields the index does not act on (evidence, related_changes, ...) are sre-kedb CI's to check.
   .passthrough();
 
-type EntryFrontMatter = z.infer<typeof EntryFrontMatter>;
+export type EntryFrontMatter = z.infer<typeof EntryFrontMatter>;
 
 /** A value test: exact string, number, /regex/, or any of a list of those. */
 type Matcher = (value: string) => boolean;
@@ -155,14 +156,30 @@ function isRegexLiteral(value: string): boolean {
   return value.length >= 2 && value.startsWith("/") && value.endsWith("/");
 }
 
+/**
+ * Why a "/x/" pattern is not an acceptable regex (empty, nested quantifiers, a backreference,
+ * or it does not compile), or null when it is, or when the pattern is an exact string.
+ */
+export function regexProblem(pattern: string): string | null {
+  if (!isRegexLiteral(pattern)) return null;
+  const source = pattern.slice(1, -1);
+  if (source.length === 0 || NESTED_QUANTIFIER.test(source) || /\\[1-9]/.test(source)) {
+    return `regex ${pattern} is empty, nests quantifiers or uses a backreference`;
+  }
+  try {
+    new RegExp(source);
+  } catch (err) {
+    return `regex ${pattern} does not compile: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  return null;
+}
+
 /** Compiles "/x/" to a regex test and anything else to an equality test. Throws on a bad regex. */
 function compilePattern(pattern: string): Matcher {
   if (!isRegexLiteral(pattern)) return (value) => value === pattern;
-  const source = pattern.slice(1, -1);
-  if (source.length === 0 || NESTED_QUANTIFIER.test(source) || /\\[1-9]/.test(source)) {
-    throw new Error(`regex ${pattern} is empty, nests quantifiers or uses a backreference`);
-  }
-  const regex = new RegExp(source);
+  const problem = regexProblem(pattern);
+  if (problem !== null) throw new Error(problem);
+  const regex = new RegExp(pattern.slice(1, -1));
   return (value) => regex.test(value);
 }
 
