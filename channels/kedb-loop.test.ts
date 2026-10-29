@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createKedbGit, KEDB_COMMIT_AUTHOR } from "./kedb-git.js";
 import { createKedbLoop, EXPIRY_AFTER_MS, formatDiffPosts, MAX_SLACK_POST_CHARS, REMINDER_AFTER_MS, REQUEST_TTL_MS, type KedbLoop } from "./kedb-loop.js";
+import { createOperatorWait } from "./operator-wait.js";
 import type { IncidentRecord } from "./incident-lookup.js";
 import { createProposalStore, type ProposalStore } from "./proposal-store.js";
 import { edit, FALCO_FAMILY, HISTORY_ENTRY, HISTORY_WITH_CAUSE } from "./kedb-test-entries.js";
@@ -58,6 +59,8 @@ interface World {
   data: string;
   posts: Array<{ channel: string; text: string; thread_ts?: string; ts: string }>;
   notifications: Array<{ content: string; meta: Record<string, string> }>;
+  /** The threads the loop said it answered in, in order. */
+  answered: string[];
   /** Hooks into the next poster call: throw to fail it. */
   failPost: { when: ((text: string) => boolean) | null };
   clock: { now: number };
@@ -104,6 +107,7 @@ function setup(): World {
 
   const posts: World["posts"] = [];
   const notifications: World["notifications"] = [];
+  const answered: string[] = [];
   const failPost: World["failPost"] = { when: null };
   const clock = { now: 1_793_201_700_000 };
   const storePath = join(data, "kedb-proposals.json");
@@ -137,6 +141,9 @@ function setup(): World {
       notifyAgent: async (content, meta) => {
         notifications.push({ content, meta });
       },
+      answered: (threadTs) => {
+        answered.push(threadTs);
+      },
       approvers: new Map([[LEO, "Leo"]]),
       channel: CHANNEL,
       teamUrl: () => "https://alien.slack.com/",
@@ -165,6 +172,7 @@ function setup(): World {
     data,
     posts,
     notifications,
+    answered,
     failPost,
     clock,
     incidents,
@@ -633,4 +641,88 @@ test("a diff message that fails to post withdraws the proposal and says so in th
   world.failPost.when = null;
   assert.deepEqual(await reply(world, "yes downgrade KB-1"), { handled: true });
   assert.match(world.posts.at(-1)!.text, /KB-1 rev 1 is withdrawn; there is nothing to approve/);
+});
+
+// -- The channel's own answer stops the operator-wait timers (2026-10-29) ---------------------
+
+test("Leo's message, then his approval taken and applied by code: no 'still no answer' follow-up", async () => {
+  const world = setup();
+  // A fake clock for operator-wait: callbacks run when the test advances past them
+  let clock = 0;
+  const timers: Array<{ at: number; fn: () => void; cancelled: boolean }> = [];
+  const followUps: string[] = [];
+  const acks: string[] = [];
+  const wait = createOperatorWait({
+    ackDelayMs: 20_000,
+    followUpMs: 300_000,
+    postAck: async (thread) => {
+      acks.push(thread.threadTs);
+    },
+    postFollowUp: async (thread) => {
+      followUps.push(thread.threadTs);
+    },
+    signalAgent: async () => {},
+    now: () => clock,
+    schedule: (fn, ms) => {
+      const timer = { at: clock + ms, fn, cancelled: false };
+      timers.push(timer);
+      return () => {
+        timer.cancelled = true;
+      };
+    },
+    log: () => {},
+  });
+  const advance = (ms: number) => {
+    clock += ms;
+    for (const timer of timers.filter((t) => !t.cancelled && t.at <= clock)) {
+      timer.cancelled = true;
+      timer.fn();
+    }
+  };
+  // slack-sre's glue: the loop's answers answer the thread; an unhandled message arms the timers
+  const answeredBefore = world.answered.length;
+  const deliver = async (text: string) => {
+    const outcome = await reply(world, text);
+    for (const thread of world.answered.splice(answeredBefore)) wait.answered(thread);
+    if (!outcome.handled) wait.messageReceived(CHANNEL, THREAD, "Leo");
+    return outcome;
+  };
+
+  assert.equal((await world.loop.propose(proposeArgs())).isError, false);
+
+  // 11:54:03Z: a reply the loop does not consume reaches the agent and arms the timers; the
+  // agent says nothing in the thread
+  assert.equal((await deliver("looks right, one question first")).handled, false);
+  advance(20_000);
+  assert.deepEqual(acks, [THREAD], "the 'On it'");
+
+  // Leo's approval: consumed and answered by code, then applied by code
+  assert.deepEqual(await deliver("yes downgrade KB-1"), { handled: true });
+  await until(() => world.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  assert.match(world.posts.at(-1)!.text, /:white_check_mark: Applied KB-1/);
+  for (const thread of world.answered.splice(answeredBefore)) wait.answered(thread);
+
+  advance(300_000);
+  assert.deepEqual(followUps, [], "no 'still no answer' after the channel answered");
+  assert.equal(wait.isWaiting(THREAD), false);
+});
+
+test("the loop answers a thread only when its post there went out", async () => {
+  const world = setup();
+  assert.equal((await world.loop.propose(proposeArgs())).isError, false);
+  world.answered.length = 0;
+  world.failPost.when = (text) => text.includes("approved by Leo");
+  await reply(world, "yes downgrade KB-1");
+  await until(() => world.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  world.failPost.when = null;
+  // The approval's receipt failed; the applied post went out, and that answers the thread
+  assert.deepEqual(world.answered, [THREAD]);
+
+  const second = setup();
+  assert.equal((await second.loop.propose(proposeArgs())).isError, false);
+  second.answered.length = 0;
+  second.failPost.when = () => true;
+  await reply(second, "yes downgrade KB-1");
+  await until(() => second.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  assert.deepEqual(second.answered, [], "nothing was posted, so nothing was answered");
 });

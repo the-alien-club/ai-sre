@@ -88,6 +88,11 @@ export interface SlackPost {
 
 export interface KedbLoopOptions {
   store: ProposalStore;
+  /**
+   * The channel answered in this thread itself (an approval taken, a rejection, an applied,
+   * stale or failed proposal): an operator waiting there has had an answer.
+   */
+  answered(threadTs: string): void;
   git: KedbGit;
   poster: SlackPost;
   /** Pushes an event into the Claude session. Rejections are logged, never thrown. */
@@ -301,12 +306,24 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     return next;
   }
 
-  async function postInThread(p: Proposal, text: string): Promise<void> {
+  /** Posts in the proposal's thread; failures are logged. True when it was posted. */
+  async function postInThread(p: Proposal, text: string): Promise<boolean> {
     try {
       await poster.post({ channel: p.slack_channel, thread_ts: p.thread_ts, text });
+      return true;
     } catch (err) {
       log(`[kedb-loop] could not post in the thread of ${p.id}: ${message(err)}`);
+      return false;
     }
+  }
+
+  /**
+   * Posts the outcome of something an operator is waiting on in the proposal's thread (applied,
+   * stale, failed, withdrawn). Posted, it is the answer there: the "On it" and follow-up timers
+   * of that thread stop, as they would for the agent's own reply.
+   */
+  async function answerInThread(p: Proposal, text: string): Promise<void> {
+    if (await postInThread(p, text)) options.answered(p.thread_ts);
   }
 
   async function notify(content: string, meta: Record<string, string>): Promise<void> {
@@ -594,7 +611,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
       if (outcome.kind === "stale") {
         update(p, { status: "stale", status_reason: "main changed since the proposal" });
-        await postInThread(p, `:arrows_counterclockwise: ${p.id} not applied: \`${p.entry_id}\` changed on main since I proposed it. I will re-propose it against the new version.`);
+        await answerInThread(p, `:arrows_counterclockwise: ${p.id} not applied: \`${p.entry_id}\` changed on main since I proposed it. I will re-propose it against the new version.`);
         await notify(`${p.id} rev ${p.rev} is stale: ${p.entry_id} changed on main. Re-propose against the current entry with supersedes "${p.id}".`, {
           type: "runbook_stale",
           proposal_id: p.id,
@@ -606,7 +623,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
       update(p, { status: "applied", status_reason: null, commit_sha: outcome.sha });
       const url = options.commitUrl(outcome.sha);
-      await postInThread(p, `:white_check_mark: Applied ${p.id}: ${url}`);
+      await answerInThread(p, `:white_check_mark: Applied ${p.id}: ${url}`);
       await notify(`${p.id} rev ${p.rev} is applied to ${p.entry_id}: ${url}`, {
         type: "runbook_applied",
         proposal_id: p.id,
@@ -623,7 +640,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
       } catch (storeErr) {
         log(`[kedb-loop] could not record the failure of ${p.id}: ${message(storeErr)}`);
       }
-      await postInThread(p, `:x: Could not apply ${p.id}: ${escapeSlackText(reason.slice(0, 500))}. Nothing changed on main; the agent can retry with apply_runbook_update.`);
+      await answerInThread(p, `:x: Could not apply ${p.id}: ${escapeSlackText(reason.slice(0, 500))}. Nothing changed on main; the agent can retry with apply_runbook_update.`);
       await notify(`${p.id} rev ${p.rev} failed to apply: ${reason}. Retry with apply_runbook_update once the cause is fixed.`, {
         type: "runbook_failed",
         proposal_id: p.id,
@@ -640,7 +657,17 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
   async function onMessage(msg: InboundMessage): Promise<MessageOutcome> {
     const meaning = classifyReply(msg, { approvers, proposals: store.latest() });
-    const reply = (text: string) => poster.post({ channel: msg.channel, thread_ts: msg.threadTs ?? msg.ts, text }).catch((err: unknown) => log(`[kedb-loop] could not answer in ${msg.threadTs ?? msg.ts}: ${message(err)}`));
+    const thread = msg.threadTs ?? msg.ts;
+    // The channel's own answer in the thread is the answer there (see answerInThread)
+    const reply = async (text: string): Promise<void> => {
+      try {
+        await poster.post({ channel: msg.channel, thread_ts: thread, text });
+      } catch (err) {
+        log(`[kedb-loop] could not answer in ${thread}: ${message(err)}`);
+        return;
+      }
+      options.answered(thread);
+    };
 
     switch (meaning.kind) {
       case "none":
@@ -766,7 +793,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
       } catch (err) {
         return refuse(`could not withdraw ${p.id}: ${message(err)}`);
       }
-      await postInThread(p, `:leftwards_arrow_with_hook: ${p.id} withdrawn by the agent: ${escapeSlackText(parsed.data.reason)}`);
+      await answerInThread(p, `:leftwards_arrow_with_hook: ${p.id} withdrawn by the agent: ${escapeSlackText(parsed.data.reason)}`);
       return { text: `withdrew ${p.id}`, isError: false };
     },
 

@@ -392,6 +392,9 @@ try {
     }),
     poster: slackPoster,
     notifyAgent,
+    // The loop's own answers in a thread (approval taken, applied, rejected...) answer an
+    // operator waiting there, like the agent's reply does
+    answered: (threadTs) => operatorWait.answered(threadTs),
     approvers: KEDB_APPROVERS,
     channel: SRE_SLACK_CHANNEL,
     teamUrl: () => SLACK_TEAM_URL,
