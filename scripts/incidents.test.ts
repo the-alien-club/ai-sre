@@ -8,7 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -223,4 +223,134 @@ test("briefing tells the same noisy alert on different clusters apart", () => {
   const result = run(db, "briefing");
   assert.match(result.stdout, /^ {2}- Falco Suspicious Process on falco @ platform-prod \| 5x$/m);
   assert.match(result.stdout, /^ {2}- Falco Suspicious Process on falco @ platform-dev \| 3x$/m);
+});
+
+// -- KEDB columns, flags, correct and briefing (plan §6) --
+
+const KEDB_COLUMNS = ["kedb_id", "kedb_rev", "kedb_match", "kedb_predicted_verdict", "kedb_predicted_action", "corroboration", "operator_verdict", "operator_verdict_by", "operator_verdict_at"];
+
+function columns(db: string): string[] {
+  return query(db, "SELECT name FROM pragma_table_info('incidents');").split("\n");
+}
+
+const KEDB_FLAGS: Record<string, string> = {
+  "--kedb-id": "falco/delete-or-rename-shell-history",
+  "--kedb-rev": "a1b2c3d",
+  "--kedb-match": "exact",
+  "--kedb-predicted-verdict": "real",
+  "--kedb-predicted-action": "page",
+  "--corroboration": '{"serial-login":"pass","short-session":"not-run"}',
+};
+
+test("a database created before the KEDB gains its columns, keeping its rows, idempotently", () => {
+  const db = scratchDb();
+  // The pre-KEDB schema: the init SQL alone, as start-agent.sh created it
+  const init = spawnSync("sqlite3", ["-bail", db], { input: readFileSync("scripts/incidents-db-init.sql", "utf8"), encoding: "utf8" });
+  assert.equal(init.status, 0, init.stderr);
+  bulkInsert(db, 3, "SELECT 'Old Alert', 'warning', 'firing', 'platform-prod', 'svc', 'noise', 'ignored', 'old' FROM n");
+  assert.ok(!columns(db).includes("kedb_id"));
+
+  for (let i = 0; i < 2; i++) assert.equal(run(db, "briefing").status, 0);
+  for (const column of KEDB_COLUMNS) assert.ok(columns(db).includes(column), column);
+  assert.equal(columns(db).length, new Set(columns(db)).size, "no column added twice");
+  assert.equal(query(db, "SELECT COUNT(*), COUNT(kedb_id) FROM incidents;"), "3|0");
+});
+
+test("a database with some KEDB columns already gets only the missing ones", () => {
+  const db = scratchDb();
+  spawnSync("sqlite3", ["-bail", db], { input: readFileSync("scripts/incidents-db-init.sql", "utf8") });
+  spawnSync("sqlite3", [db, "ALTER TABLE incidents ADD COLUMN kedb_id TEXT;"]);
+  assert.equal(run(db, "patterns").status, 0);
+  for (const column of KEDB_COLUMNS) assert.ok(columns(db).includes(column), column);
+});
+
+test("log stores the KEDB fields, and NULL when they are not given", () => {
+  const db = scratchDb();
+  assert.equal(logIncident(db, KEDB_FLAGS).status, 0);
+  assert.equal(logIncident(db, { "--fingerprint": "fp-2" }).status, 0);
+  assert.equal(
+    query(db, "SELECT kedb_id, kedb_rev, kedb_match, kedb_predicted_verdict, kedb_predicted_action, corroboration FROM incidents WHERE id = 1;"),
+    'falco/delete-or-rename-shell-history|a1b2c3d|exact|real|page|{"serial-login":"pass","short-session":"not-run"}'
+  );
+  assert.equal(query(db, "SELECT kedb_id IS NULL, kedb_match IS NULL, corroboration IS NULL FROM incidents WHERE id = 2;"), "1|1|1");
+});
+
+test("malformed or hostile KEDB flags are rejected and nothing is logged", () => {
+  const db = scratchDb();
+  for (const [flag, value] of [
+    ["--kedb-match", "maybe"],
+    ["--kedb-id", "../../etc/passwd"],
+    ["--kedb-id", HOSTILE],
+    ["--kedb-rev", "HEAD"],
+    ["--kedb-predicted-verdict", "fine"],
+    ["--kedb-predicted-action", "shout"],
+    ["--corroboration", "not json"],
+    ["--corroboration", '["pass"]'],
+    ["--corroboration", '{"serial-login":"maybe"}'],
+    ["--corroboration", '{"serial-login":1}'],
+    ["--corroboration", `{"x'); DROP TABLE incidents; --":"pass"}`],
+  ]) {
+    const result = logIncident(db, { ...KEDB_FLAGS, [flag]: value });
+    assert.notEqual(result.status, 0, `${flag} ${value}`);
+    assert.match(result.stderr, /Invalid/, `${flag} ${value}`);
+  }
+  const noMatch = logIncident(db, { "--kedb-id": "falco/_family" });
+  assert.notEqual(noMatch.status, 0);
+  assert.match(noMatch.stderr, /--kedb-id needs --kedb-match/);
+  assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "0");
+});
+
+test("correct records the operator's verdict next to the agent's", () => {
+  const db = scratchDb();
+  logIncident(db, KEDB_FLAGS);
+  const result = run(db, "correct", "--id", "1", "--verdict", "known_issue", "--by", "Leo");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Incident 1: operator verdict known_issue \(by Leo\)/);
+  assert.equal(query(db, "SELECT verdict, operator_verdict, operator_verdict_by, operator_verdict_at LIKE '20__-__-__T__:__:__Z' FROM incidents;"), "real|known_issue|Leo|1");
+});
+
+test("correct rejects an unknown id, a bad verdict and a missing --by", () => {
+  const db = scratchDb();
+  logIncident(db);
+  const unknown = run(db, "correct", "--id", "42", "--verdict", "noise", "--by", "Leo");
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stderr, /No incident with id 42/);
+  const badVerdict = run(db, "correct", "--id", "1", "--verdict", "meh", "--by", "Leo");
+  assert.notEqual(badVerdict.status, 0);
+  assert.match(badVerdict.stderr, /Invalid --verdict/);
+  assert.notEqual(run(db, "correct", "--id", "1", "--verdict", "noise").status, 0);
+  assert.notEqual(run(db, "correct", "--id", "1 OR 1=1", "--verdict", "noise", "--by", "Leo").status, 0);
+  assert.equal(query(db, "SELECT operator_verdict IS NULL FROM incidents;"), "1");
+});
+
+test("correct stores a hostile operator name verbatim", () => {
+  const db = scratchDb();
+  logIncident(db);
+  assert.equal(run(db, "correct", "--id", "1", "--verdict", "noise", "--by", HOSTILE).status, 0);
+  assert.equal(query(db, "SELECT operator_verdict_by FROM incidents;"), HOSTILE);
+  assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "1");
+});
+
+test("briefing reports KEDB predictions and the entries that got them wrong", () => {
+  const db = scratchDb();
+  // Right: predicted real, agent said real
+  logIncident(db, KEDB_FLAGS);
+  // Wrong per the agent: predicted real, agent said known_issue
+  logIncident(db, { ...KEDB_FLAGS, "--verdict": "known_issue", "--fingerprint": "fp-2" });
+  // Wrong per the operator: agent agreed with the prediction, Leo corrected it
+  logIncident(db, { ...KEDB_FLAGS, "--fingerprint": "fp-3" });
+  run(db, "correct", "--id", "3", "--verdict", "noise", "--by", "Leo");
+  // Family match: no prediction
+  logIncident(db, { "--kedb-match": "family", "--kedb-id": "falco/_family", "--kedb-rev": "a1b2c3d", "--fingerprint": "fp-4" });
+
+  const result = run(db, "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^KEDB: 4 logged with a KEDB match field \| 3 exact \| 1 family only \| predictions right 1\/3 \| 1 corrected by an operator$/m);
+  assert.match(result.stdout, /^ {2}- falco\/delete-or-rename-shell-history \| 2x \(real→(known_issue,real→noise|noise,real→known_issue)\)$/m);
+});
+
+test("briefing leaves the KEDB section out until an incident carries a KEDB field", () => {
+  const db = scratchDb();
+  logIncident(db);
+  assert.doesNotMatch(run(db, "briefing").stdout, /KEDB/);
 });
