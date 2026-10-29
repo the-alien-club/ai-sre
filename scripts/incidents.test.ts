@@ -8,9 +8,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { sampleProposal } from "../channels/kedb-test-fixtures.js";
 
 const SCRIPT = "scripts/incidents.sh";
 
@@ -353,4 +354,45 @@ test("briefing leaves the KEDB section out until an incident carries a KEDB fiel
   const db = scratchDb();
   logIncident(db);
   assert.doesNotMatch(run(db, "briefing").stdout, /KEDB/);
+});
+
+// -- Runbook proposals in the briefing (plan §4, "Timeouts") --
+
+function writeProposals(db: string, proposals: unknown[], nextNumber = 10): void {
+  writeFileSync(join(dirname(db), "kedb-proposals.json"), JSON.stringify({ version: 1, next_number: nextNumber, proposals }));
+}
+
+test("briefing lists the open runbook proposals, newest revision only", () => {
+  const db = scratchDb();
+  logIncident(db);
+  const day = 24 * 60 * 60 * 1000;
+  writeProposals(db, [
+    sampleProposal({ rev: 1, status: "superseded", posted_at: Date.now() - 3 * day }),
+    sampleProposal({ rev: 2, status: "pending", posted_at: Date.now() - 2 * day - 60_000, downgrade: { from: "page", to: "fyi", scope: ["x"] } }),
+    sampleProposal({ id: "KB-2", status: "failed", status_reason: "git push failed\nremote: denied", posted_at: Date.now() - day - 60_000 }),
+    sampleProposal({ id: "KB-3", status: "applied" }),
+  ]);
+  const result = run(db, "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Runbook proposals open \(2\); approvers answer them in their Slack threads:$/m);
+  assert.match(result.stdout, /^ {2}- KB-1 rev 2 pending \(downgrade\): falco\/delete-or-rename-shell-history, incident #3501, 2d old$/m);
+  assert.match(result.stdout, /^ {2}- KB-2 rev 1 failed: .*, retry with apply_runbook_update \(git push failed remote: denied\)$/m);
+  assert.doesNotMatch(result.stdout, /KB-3/);
+});
+
+test("briefing says so when the proposal store is unreadable, and still succeeds", () => {
+  const db = scratchDb();
+  logIncident(db);
+  writeFileSync(join(dirname(db), "kedb-proposals.json"), "{ not json");
+  const result = run(db, "briefing");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Runbook proposals: .*kedb-proposals\.json is unreadable/m);
+});
+
+test("briefing has no proposal section when none is open or none was ever made", () => {
+  const db = scratchDb();
+  logIncident(db);
+  assert.doesNotMatch(run(db, "briefing").stdout, /Runbook proposals/);
+  writeProposals(db, [sampleProposal({ status: "applied" })]);
+  assert.doesNotMatch(run(db, "briefing").stdout, /Runbook proposals/);
 });

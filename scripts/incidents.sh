@@ -17,6 +17,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # INCIDENTS_DB exists so the tests can point at a scratch database; production uses the default
 DB="${INCIDENTS_DB:-$SCRIPT_DIR/../data/incidents.db}"
+# The runbook proposal store slack-sre keeps beside the database (channels/proposal-store.ts)
+KEDB_PROPOSALS="$(dirname "$DB")/kedb-proposals.json"
 
 # Every value reaching SQL goes through one of these two helpers, never string interpolation.
 # Arguments come from alert labels and sub-agent output, so they are attacker-influenced:
@@ -331,6 +333,31 @@ case "$CMD" in
                 fi
             fi
             echo ""
+        fi
+
+        # Runbook proposals still open (KEDB learning loop, plan §4). slack-sre writes the store;
+        # no file means no proposal was ever made. Unreadable, the briefing says so and goes on:
+        # the loop refuses to run on it too, and the agent must hear why.
+        if [ -f "$KEDB_PROPOSALS" ]; then
+            if PROPOSALS_OUT=$(jq -r --argjson now "$(date +%s)" --argjson max "$BRIEFING_CLASSES" '
+                [ .proposals | group_by(.id)[] | max_by(.rev)
+                  | select(.status == "pending" or .status == "approved" or .status == "failed" or .status == "stale") ]
+                | sort_by(.posted_at // .created_at)
+                | if length == 0 then empty else
+                    "Runbook proposals open (\(length)); approvers answer them in their Slack threads:",
+                    (.[:$max][]
+                      | "  - \(.id) rev \(.rev) \(.status)\(if .downgrade then " (downgrade)" else "" end): \(.entry_id), incident #\(.incident_id), \((($now * 1000 - (.posted_at // .created_at)) / 86400000) | floor)d old"
+                        + (if .status == "failed" then ", retry with apply_runbook_update" elif .status == "stale" then ", re-propose with supersedes" else "" end)
+                        + (if .status_reason then " (" + (.status_reason | gsub("[\r\n]+"; " ") | .[0:120]) + ")" else "" end)),
+                    (if length > $max then "  … and \(length - $max) more: list_runbook_proposals" else empty end)
+                  end' "$KEDB_PROPOSALS" 2>&1); then
+                if [ -n "$PROPOSALS_OUT" ]; then
+                    printf '%s\n\n' "$PROPOSALS_OUT"
+                fi
+            else
+                echo "Runbook proposals: ${KEDB_PROPOSALS} is unreadable (${PROPOSALS_OUT:0:200}); the learning loop is off until it is fixed."
+                echo ""
+            fi
         fi
 
         # An if, not `[ ... ] && echo`: as the last command that form made briefing exit 1
