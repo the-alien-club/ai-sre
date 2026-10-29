@@ -163,9 +163,9 @@ every alert against it. If the checkout is missing or broken, alerts still go ou
 `kedb_match=none`, and the channel logs `[kedb] unavailable` once.
 
 It has its **own key**, never `id_ed25519`. That key is a **write** deploy key on sre-kedb
-only, for the Slack approval loop (plan P2). Nothing on the VM writes to the checkout before P2
-lands, and `main` stays protected for Maintainers until then. The private key never leaves
-the VM.
+only, for the Slack approval loop (plan P2, since 0.9.0): when an approver answers `yes` to a
+runbook proposal, the slack-sre channel commits that one entry and pushes it to `main`. The
+private key never leaves the VM.
 
 On the VM, as `sre-agent`:
 
@@ -203,9 +203,42 @@ git ls-remote gitlab-kedb:alias3/datastreaming/tooling/sre-kedb.git   # lists re
 git clone gitlab-kedb:alias3/datastreaming/tooling/sre-kedb.git ~/kedb
 ```
 
-Set `SRE_KEDB_DIR` in `.env` only for a different path. Until plan P2 adds the code that pulls
-approved entries, update the checkout after an sre-kedb MR merges with
+Set `SRE_KEDB_DIR` in `.env` only for a different path.
+
+### The learning loop (0.9.0)
+
+The checkout belongs to the slack-sre channel from now on: before every proposal and every
+apply it runs `git fetch` and `git reset --hard origin/main`, so never edit it by hand. A
+merged sre-kedb MR reaches it at the next proposal or apply; to pick it up sooner, run
 `git -C ~/kedb pull --ff-only`. The channel picks up the new revision on the next alert.
+
+Four things must be in place, or the loop refuses (it never half-works):
+
+1. **The deploy key may push to `main`.** `main` is protected for Maintainers only. A project
+   owner adds the key in sre-kedb → Settings → Repository → Protected branches → `main` →
+   *Allowed to push and merge* → the `sre-agent-vm-kedb (write, sre-kedb only)` deploy key
+   (id 21924441), keeping Maintainers. Without it, applying fails with `git push failed`, the
+   thread says so, and nothing changes.
+2. **The lint's dependencies** (the loop runs sre-kedb's own `ci/lint.ts` before posting and
+   before committing): `cd ~/kedb && npm ci --no-audit --no-fund`. `node_modules` is untracked,
+   so the resets keep it; re-run it when sre-kedb's `package-lock.json` changes.
+3. **`SRE_KEDB_APPROVERS`** in `.env`: the Slack user IDs whose `yes` applies a proposal
+   (`U054PDMV69X`, Leo). Each must be in `SRE_OPERATORS`. Required: the Slack channel refuses
+   to start without it, and `start-agent.sh` checks it before stopping the running session.
+4. **A read-only sentinel clone**, which an entry's `auto_fix` is checked against
+   (`catalog/actions.yaml`, on sentinel's `dev` branch). Add `id_ed25519` as a read deploy key
+   on sentinel (project 88114219) like the repositories of §4, then:
+
+   ```bash
+   git clone --branch dev git@gitlab.com:alias3/datastreaming/tooling/sentinel.git ~/repos/sentinel
+   ```
+
+   Missing, only proposals that set an `auto_fix` are refused. `SRE_SENTINEL_DIR` overrides
+   the path.
+
+What the loop writes on the VM: `data/kedb-proposals.json` (the proposals, written atomically;
+if it is ever unreadable the loop turns itself off and the briefing says why, rather than
+reusing `KB-<n>` numbers) and `data/kedb-stage/` (scratch copies for diffs and lint runs).
 
 ## 5. Create RBAC-scoped kubeconfigs
 
