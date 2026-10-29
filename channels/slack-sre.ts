@@ -55,6 +55,7 @@ import { createKedbGit } from "./kedb-git.js";
 import { createKedbLoop, type KedbLoop, type ToolOutcome } from "./kedb-loop.js";
 import { createProposalStore } from "./proposal-store.js";
 import { parseApprovers } from "./kedb-approvers.js";
+import { createIncidentLookup } from "./incident-lookup.js";
 import { createOperatorWait } from "./operator-wait.js";
 
 // -- Configuration (env vars) -------------------------------------------------
@@ -395,6 +396,8 @@ try {
     teamUrl: () => SLACK_TEAM_URL,
     payloadDir: join(DATA_DIR, "alert-payloads"),
     sentinelDir: SENTINEL_DIR,
+    // The same database incidents.sh writes (its default path, relative to the repo)
+    incidents: createIncidentLookup({ dbPath: join(DATA_DIR, "incidents.db"), timeoutMs: KEDB_READ_TIMEOUT_MS }),
     urlPolicy: { signozHost: signozHost() },
     readTimeoutMs: KEDB_READ_TIMEOUT_MS,
     commitUrl: (sha) => `${KEDB_WEB_URL}/-/commit/${sha}`,

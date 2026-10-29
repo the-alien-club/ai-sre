@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createKedbGit, KEDB_COMMIT_AUTHOR } from "./kedb-git.js";
 import { createKedbLoop, EXPIRY_AFTER_MS, REMINDER_AFTER_MS, slackDiffBlock, type KedbLoop } from "./kedb-loop.js";
+import type { IncidentRecord } from "./incident-lookup.js";
 import { createProposalStore, type ProposalStore } from "./proposal-store.js";
 import { edit, FALCO_FAMILY, HISTORY_ENTRY, HISTORY_WITH_CAUSE } from "./kedb-test-entries.js";
 
@@ -23,6 +24,8 @@ const CHANNEL = "C09MWNB6WL8";
 const THREAD = "1793201688.848269";
 const ENTRY = "falco/delete-or-rename-shell-history";
 const ENTRY_PATH = `entries/${ENTRY}.md`;
+/** The 2026-10-28 Falco incident's fingerprint: no raw payload was ever kept for it. */
+const OLD_FP = "2ecf15e3f8af5ccc";
 
 const LINT = `import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -56,6 +59,10 @@ interface World {
   posts: Array<{ channel: string; text: string; thread_ts?: string; ts: string }>;
   notifications: Array<{ content: string; meta: Record<string, string> }>;
   clock: { now: number };
+  /** incidents.db: id → the fingerprint it was logged with (null: logged without one). */
+  incidents: Map<string, string | null>;
+  /** When set, reading incidents.db fails with this. */
+  incidentsError: { message: string | null };
   store: ProposalStore;
   loop: KedbLoop;
   /** A new loop over the same files, as after a restart. */
@@ -97,6 +104,20 @@ function setup(): World {
   const notifications: World["notifications"] = [];
   const clock = { now: 1_793_201_700_000 };
   const storePath = join(data, "kedb-proposals.json");
+  // 3501 is the incident fp1's payload belongs to; the others share it, for the tests that need
+  // several open proposals. 3600 is the 2026-10-28 Falco incident, older than the payload store.
+  const incidents = new Map<string, string | null>([
+    ["3501", "fp1"],
+    ["100", "fp1"],
+    ["101", "fp1"],
+    ["102", "fp1"],
+    ["200", "fp1"],
+    ["3600", OLD_FP],
+    ["3700", "9a8b7c6d5e4f3a2b"],
+    ["3800", null],
+    ["3900", "unknown"],
+  ]);
+  const incidentsError: World["incidentsError"] = { message: null };
 
   const build = (store: ProposalStore) =>
     createKedbLoop({
@@ -117,6 +138,13 @@ function setup(): World {
       teamUrl: () => "https://alien.slack.com/",
       payloadDir: join(data, "alert-payloads"),
       sentinelDir: join(root, "no-sentinel"),
+      incidents: {
+        async find(id): Promise<IncidentRecord | null> {
+          if (incidentsError.message !== null) throw new Error(incidentsError.message);
+          if (!incidents.has(id)) return null;
+          return { id, fingerprint: incidents.get(id) ?? null, alertName: "Falco Suspicious Process", createdAt: "2026-10-28T09:00:00Z" };
+        },
+      },
       urlPolicy: { signozHost: undefined },
       readTimeoutMs: 5_000,
       commitUrl: (sha) => `https://gitlab.com/alias3/datastreaming/tooling/sre-kedb/-/commit/${sha}`,
@@ -134,6 +162,8 @@ function setup(): World {
     posts,
     notifications,
     clock,
+    incidents,
+    incidentsError,
     store,
     loop: build(store),
     restart() {
@@ -333,7 +363,7 @@ test("propose refuses: payload copied verbatim, lint failure, big diffs, wrong o
 
   assert.match((await world.loop.propose(proposeArgs({ op: "create" }))).text, /already exists/);
   assert.match((await world.loop.propose(proposeArgs({ new_content: HISTORY_ENTRY }))).text, /identical/);
-  assert.match((await world.loop.propose(proposeArgs({ fingerprint: "unknown" }))).text, /no raw payload is kept/);
+  assert.match((await world.loop.propose(proposeArgs({ incident_id: "3900", fingerprint: "unknown" }))).text, /no raw payload is kept/);
   assert.match((await world.loop.propose(proposeArgs({ learned: "ping <!channel>" }))).text, /Slack mention/);
   assert.match((await world.loop.propose(proposeArgs({ entry_id: "../../etc" }))).text, /invalid arguments/);
   assert.equal(world.posts.length, 0, "nothing refused is ever posted");
@@ -397,3 +427,28 @@ test("the checkout path allowlist: nothing outside entries/<family>/<name>.md is
   }
   assert.equal(readFileSync(join(world.checkout, "ci", "lint.mjs"), "utf8"), LINT);
 });
+
+// -- Incident binding -------------------------------------------------------------------------
+
+test("the fingerprint must be the one incidents.db logged for the incident", async () => {
+  const world = setup();
+  // 2026-10-29: refused for KB-1's incident, the agent set out to retry with another incident's
+  // fingerprint. Another incident's fingerprint, with or without its payload, is refused.
+  const swapped = await world.loop.propose(proposeArgs({ incident_id: "3600", fingerprint: "fp1" }));
+  assert.equal(swapped.isError, true);
+  assert.match(swapped.text, /fingerprint fp1 is not the one incident #3600 was logged with/);
+  assert.match(swapped.text, /never pass another incident's fingerprint or id/);
+  assert.doesNotMatch(swapped.text, new RegExp(OLD_FP), "what incidents.db holds is never echoed");
+
+  assert.match((await world.loop.propose(proposeArgs({ incident_id: "3501", fingerprint: "9a8b7c6d5e4f3a2b" }))).text, /is not the one incident #3501 was logged with/);
+  assert.match((await world.loop.propose(proposeArgs({ incident_id: "4242" }))).text, /incident #4242 does not exist in incidents\.db/);
+  assert.match((await world.loop.propose(proposeArgs({ incident_id: "3800" }))).text, /incident #3800 was logged without a fingerprint/);
+
+  world.incidentsError.message = "database is locked";
+  assert.match((await world.loop.propose(proposeArgs())).text, /cannot check incident #3501 against incidents\.db: database is locked/);
+  world.incidentsError.message = null;
+
+  assert.equal(world.posts.length, 0, "nothing refused is ever posted");
+  assert.equal((await world.loop.propose(proposeArgs())).isError, false, "the incident's own fingerprint passes");
+});
+

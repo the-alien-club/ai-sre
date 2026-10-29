@@ -1,11 +1,15 @@
 // The KEDB learning loop (plan §4): the agent proposes a runbook change in Slack, an approver
 // answers, and code (never the agent) commits it to sre-kedb.
 //
-//   propose  → checks (schema, lint, guardrails §5b-§5d), posts the proposal, stores it
+//   propose  → checks (incident binding, schema, lint, guardrails §5b-§5d), posts the
+//              proposal, stores it
 //   approve  → a reply classified by kedb-approval.ts; the approval is bound to the content
 //              hash and to the revision's post
 //   apply    → fetch, reset, base-blob check, write, lint, commit with trailers, push
 //   sweep    → 24 h reminder, 7 day expiry, and resuming an approval a restart interrupted
+//
+// The incident binding: the fingerprint must be the one incidents.db logged for incident_id, so
+// a refusal about one incident can never be passed with another incident's alert.
 //
 // Every entry point returns an outcome and never throws, so neither a tool call nor the Slack
 // handler can be aborted by it (CLAUDE_ERROR_PATTERNS.md §15). Each failure is reported where
@@ -15,6 +19,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { classifyReply, compareSlackTs, slackPermalink, type InboundMessage } from "./kedb-approval.js";
 import type { KedbGit } from "./kedb-git.js";
+import type { IncidentLookup, IncidentRecord } from "./incident-lookup.js";
 import {
   addedLines,
   autoFixProblems,
@@ -70,6 +75,8 @@ export interface KedbLoopOptions {
   payloadDir: string;
   /** Read-only sentinel clone, for the auto_fix allowlist. */
   sentinelDir: string;
+  /** incidents.db: a proposal's fingerprint must be its incident's. */
+  incidents: IncidentLookup;
   urlPolicy: UrlPolicy;
   /** Bound on local file reads (payloads, sentinel catalog). */
   readTimeoutMs: number;
@@ -231,6 +238,30 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     downgrade: Downgrade | null;
   }
 
+  /**
+   * Null when the fingerprint is the one incidents.db logged for the incident, else why not.
+   * Never echoes what incidents.db holds: an alert's fingerprint is its sender's text.
+   */
+  async function incidentProblem(args: z.infer<typeof ProposeArgs>): Promise<string | null> {
+    let incident: IncidentRecord | null;
+    try {
+      incident = await options.incidents.find(args.incident_id);
+    } catch (err) {
+      return `cannot check incident #${args.incident_id} against incidents.db: ${message(err)}`;
+    }
+    if (incident === null) return `incident #${args.incident_id} does not exist in incidents.db`;
+    if (incident.fingerprint === null) {
+      return `incident #${args.incident_id} was logged without a fingerprint, so ${args.fingerprint} cannot be shown to be its alert`;
+    }
+    if (incident.fingerprint !== args.fingerprint) {
+      return (
+        `fingerprint ${args.fingerprint} is not the one incident #${args.incident_id} was logged with. A proposal is checked ` +
+        `against its own incident's alert: never pass another incident's fingerprint or id to get past a check`
+      );
+    }
+    return null;
+  }
+
   async function check(args: z.infer<typeof ProposeArgs>): Promise<Checked | string[]> {
     const path = entryPath(args.entry_id);
     let after: CandidateEntry;
@@ -322,6 +353,9 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     const sameIncident = open.find((p) => p.incident_id === args.incident_id);
     if (sameIncident) return refuse(`refused: ${sameIncident.id} is already open for incident #${args.incident_id}; one proposal per incident`);
     if (open.length >= MAX_OPEN_PROPOSALS) return refuse(`refused: ${open.length} proposals are already open (${open.map((p) => p.id).join(", ")}); at most ${MAX_OPEN_PROPOSALS}`);
+
+    const unbound = await incidentProblem(args);
+    if (unbound !== null) return refuse(`refused: ${unbound}`);
 
     let checked: Checked | string[];
     try {
