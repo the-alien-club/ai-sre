@@ -43,6 +43,15 @@ export function compareSlackTs(a: string, b: string): number {
 }
 
 /**
+ * The ts of the last message of a proposal's post: the header, or the last part of its diff
+ * when the diff followed in messages of its own. An approval counts only after it, once the
+ * whole proposal was visible. Null until the proposal is posted.
+ */
+export function lastPostTs(p: Proposal): string | null {
+  return p.post_ts === null ? null : (p.diff_post_ts.at(-1) ?? p.post_ts);
+}
+
+/**
  * A message's permalink, in the form Slack's chat.getPermalink returns, from the workspace
  * URL auth.test gives (e.g. https://alien.slack.com/).
  */
@@ -112,7 +121,8 @@ export function classifyReply(message: InboundMessage, options: ClassifyOptions)
 
   if (no) return { kind: "reject", proposal: target, reason: no[2].trim() };
 
-  if (target.post_ts === null || compareSlackTs(message.ts, target.post_ts) <= 0) {
+  const postedUntil = lastPostTs(target);
+  if (postedUntil === null || compareSlackTs(message.ts, postedUntil) <= 0) {
     return { kind: "notice", text: `:grey_question: That reply predates ${target.id} rev ${target.rev}; answer the current revision.` };
   }
   const saidDowngrade = yes?.[2] !== undefined;

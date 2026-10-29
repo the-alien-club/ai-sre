@@ -63,9 +63,20 @@ const Proposal = z
     slack_channel: z.string().regex(/^[CDG][A-Z0-9]{2,}$/),
     thread_ts: z.string().regex(SLACK_TS),
     thread_permalink: z.string().url(),
-    /** The ts and permalink of this revision's proposal message; null until it is posted. */
+    /**
+     * The ts and permalink of this revision's proposal message, its header: id, rev, what was
+     * learned, the downgrade and injection-check warnings and the Content-SHA256. The commit's
+     * Proposal-Post trailer links it, and sre-kedb verify-approvals checks those in it. Null
+     * until it is posted.
+     */
     post_ts: z.string().regex(SLACK_TS).nullable(),
     post_permalink: z.string().url().nullable(),
+    /**
+     * The ts of the messages after the header that show the diff, in order. An approval must
+     * postdate the last of them: nobody approves a diff before all of it is visible. Records
+     * written before 0.9.2 posted the diff inside the one proposal message, so they have none.
+     */
+    diff_post_ts: z.array(z.string().regex(SLACK_TS)).default([]),
     posted_at: z.number().int().nullable(),
     downgrade: z
       .object({ from: Action.nullable(), to: Action.nullable(), scope: z.array(z.string()).min(1) })

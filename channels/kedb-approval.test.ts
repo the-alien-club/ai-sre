@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyReply, compareSlackTs, slackPermalink, type InboundMessage } from "./kedb-approval.js";
+import { classifyReply, compareSlackTs, lastPostTs, slackPermalink, type InboundMessage } from "./kedb-approval.js";
 import { parseApprovers } from "./kedb-approvers.js";
 import { sampleProposal } from "./kedb-test-fixtures.js";
 
@@ -176,4 +176,16 @@ test("a formatted no rejects, with the reason", () => {
   const plain = classifyReply(msg("*no, wrong node pool*"), { approvers: APPROVERS, proposals: [pending] });
   assert.equal(plain.kind, "reject");
   if (plain.kind === "reject") assert.equal(plain.reason, "wrong node pool");
+});
+
+test("an approval counts only after the whole proposal is posted, header and diff", () => {
+  const split = sampleProposal({ ...kb1Downgrade, post_ts: "1793201700.000100", diff_post_ts: ["1793201700.000200", "1793201700.000300"] });
+  const options = { approvers: APPROVERS, proposals: [split] };
+  const between = classifyReply(msg("yes downgrade KB-1", { ts: "1793201700.000250" }), options);
+  assert.equal(between.kind, "notice");
+  if (between.kind === "notice") assert.match(between.text, /predates KB-1 rev 1/);
+  assert.equal(classifyReply(msg("yes downgrade KB-1", { ts: "1793201700.000301" }), options).kind, "approve");
+  assert.equal(lastPostTs(split), "1793201700.000300");
+  assert.equal(lastPostTs(sampleProposal()), "1793201700.000100", "a pre-0.9.2 record: the one post");
+  assert.equal(lastPostTs(sampleProposal({ post_ts: null })), null);
 });
