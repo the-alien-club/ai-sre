@@ -68,12 +68,21 @@ if ! wait_for_port_free "SigNoz webhook" "$SIGNOZ_PORT" 20 \
   exit 1
 fi
 
+# A known session id, so the startup prompt can be proven submitted from the session's own
+# transcript (submit-prompt.sh), and a nonce only that prompt carries.
+if ! SESSION_ID="$(cat /proc/sys/kernel/random/uuid)" || ! PROMPT_NONCE="$(cat /proc/sys/kernel/random/uuid)" \
+  || [[ ! "$SESSION_ID" =~ ^[0-9a-f-]{36}$ ]] || [[ ! "$PROMPT_NONCE" =~ ^[0-9a-f-]{36}$ ]]; then
+  echo "[start-agent] could not generate a session id" >&2
+  exit 1
+fi
+CLAUDE_PROJECTS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+
 # Start Claude Code in a tmux session. Without the user bus variables an SSH login may have
 # left in pm2's environment: with them, tmux puts the pane under that login's systemd user
 # manager, which kills it when the login ends (see session-cgroup.sh).
 env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR \
   tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
-  "cd $SRE_DIR && claude --dangerously-skip-permissions --dangerously-load-development-channels server:signoz-webhook server:slack-sre server:trivy-webhook"
+  "cd $SRE_DIR && claude --session-id $SESSION_ID --dangerously-skip-permissions --dangerously-load-development-channels server:signoz-webhook server:slack-sre server:trivy-webhook"
 # The channels run under this process; only a listener below it is this session's
 if ! SESSION_PID="$(tmux display-message -p -t "$SESSION_NAME" '#{pane_pid}')" \
   || [[ ! "$SESSION_PID" =~ ^[0-9]+$ ]]; then
@@ -154,17 +163,27 @@ ${DEPLOY_CONFIG}
 
 Use these real values when spawning sub-agents — they override any placeholders in CLAUDE.md.
 
-Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the ops team via slack-sre. Remember you are in a shared team channel, not a private DM — see \"Talking to the Ops Team\" in CLAUDE.md. Confirm you are ready by listing your kubectl contexts."
+Follow the runbook in CLAUDE.md. Wait for alerts from signoz-webhook and messages from the ops team via slack-sre. Remember you are in a shared team channel, not a private DM — see \"Talking to the Ops Team\" in CLAUDE.md. Confirm you are ready by listing your kubectl contexts.
 
-# Submit the prompt and prove it was sent. A failure is reported in the log and the team
-# channel, and the agent keeps running without its briefing (see submit-prompt.sh).
+(Startup prompt ${PROMPT_NONCE}: how the launcher proves you received this. Ignore it.)"
+
+# Submit the prompt and prove it was sent (see submit-prompt.sh). Not delivered, the session
+# is restarted to deliver it, at most BRIEFING_RETRY_MAX times an hour; past that it keeps
+# running without its briefing and the team channel is told.
 # shellcheck source=scripts/lib/submit-prompt.sh
 source "$SRE_DIR/scripts/lib/submit-prompt.sh"
-if submit_startup_prompt "$SESSION_NAME" "$PROMPT"; then
-  echo "[start-agent] Agent started with briefing, monitoring tmux session"
-else
-  echo "[start-agent] Agent started WITHOUT its briefing, monitoring tmux session" >&2
-fi
+BRIEFING_STATUS=0
+submit_startup_prompt "$SESSION_NAME" "$PROMPT" "$PROMPT_NONCE" "$CLAUDE_PROJECTS_DIR" "$SESSION_ID" \
+  "$SRE_DIR/data/briefing-restarts" || BRIEFING_STATUS=$?
+case "$BRIEFING_STATUS" in
+  0) echo "[start-agent] Agent started with briefing, monitoring tmux session" ;;
+  2)
+    tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+    echo "[start-agent] session stopped so pm2 starts a new one to deliver the briefing" >&2
+    exit 1
+    ;;
+  *) echo "[start-agent] Agent started WITHOUT its briefing, monitoring tmux session" >&2 ;;
+esac
 
 # Keep this script alive so pm2 considers the process running.
 # Monitor the tmux session — if it dies, this script exits and pm2 restarts.

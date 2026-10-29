@@ -7,6 +7,11 @@
 # STUB_SHOW_OTHER make it fail the way a real session can. Unknown flags are rejected, as
 # real tmux does, and so is a send-keys argument over tmux's message size, so typing a
 # large prompt instead of pasting it shows up in the tests.
+#
+# Like Claude Code, it records a submitted prompt in the session transcript $STUB_TRANSCRIPT
+# (one JSON line). STUB_QUEUED reproduces 2026-10-29 11:53: a turn is running, so the first
+# Enter queues the prompt (recorded as a queue-operation) while the input box keeps showing
+# it. STUB_LOST empties the input box without recording anything.
 command="$1"; shift
 target=""; buffer=""; literal=""; keys=()
 while [ $# -gt 0 ]; do
@@ -21,6 +26,12 @@ while [ $# -gt 0 ]; do
     *) keys+=("$1"); shift;;
   esac
 done
+
+# record <type>: append the typed prompt to the transcript as Claude Code would (JSON-escaped)
+record() {
+  mkdir -p "$(dirname "$STUB_TRANSCRIPT")"
+  printf '{"type":"%s","content":%s}\n' "$1" "$(node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(process.argv[1], "utf8")))' "$STUB_DIR/typed")" >> "$STUB_TRANSCRIPT"
+}
 
 require_session() {
   [ "$target" = sre-agent ] || { echo "can't find session: $target" >&2; exit 1; }
@@ -52,7 +63,15 @@ case "$command" in
       printf 'type:%s\n' "${keys[0]}" >> "$STUB_LOG"
     else
       printf 'key:%s\n' "${keys[0]}" >> "$STUB_LOG"
-      [ "${keys[0]}" = Enter ] && echo $(( $(cat "$STUB_DIR/enters") + 1 )) > "$STUB_DIR/enters"
+      if [ "${keys[0]}" = Enter ] && [ -f "$STUB_DIR/landed" ]; then
+        enters=$(( $(cat "$STUB_DIR/enters") + 1 ))
+        echo "$enters" > "$STUB_DIR/enters"
+        if [ -n "$STUB_QUEUED" ] && [ "$enters" -eq 1 ]; then
+          record queue-operation
+        elif [ -z "$STUB_LOST" ] && [ -z "$STUB_QUEUED" ] && [ "$enters" -ge "$STUB_ENTERS_NEEDED" ]; then
+          record user
+        fi
+      fi
     fi;;
   capture-pane)
     require_session
@@ -60,7 +79,7 @@ case "$command" in
     echo "  Listening for channel messages from: server:signoz-webhook"
     if [ -n "$STUB_NO_UI" ]; then echo "something else entirely"; exit 0; fi
     echo "────────────────────────────────"
-    if [ -f "$STUB_DIR/landed" ] && [ "$(cat "$STUB_DIR/enters")" -lt "$STUB_ENTERS_NEEDED" ]; then
+    if [ -f "$STUB_DIR/landed" ] && { [ -n "$STUB_QUEUED" ] || [ "$(cat "$STUB_DIR/enters")" -lt "$STUB_ENTERS_NEEDED" ]; }; then
       if [ -n "$STUB_SHOW_OTHER" ]; then
         printf '❯ someone else was typing here\n'
       elif [ -n "$STUB_SHOW_LITERAL" ]; then
