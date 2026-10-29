@@ -9,6 +9,7 @@
 # have yet. Checked here first, the missing names go to the log and the team channel, and
 # the session that is running is left alone. Since 0.5.0 the SigNoz channel needs the Rundeck
 # endpoint and token for sentinel's remediable alerts, which a VM upgraded in place lacks too.
+# Since 0.9.0 the Slack channel needs SRE_KEDB_APPROVERS for the runbook learning loop.
 #
 # Presence only: each channel still validates the values itself. channel-settings.test.ts
 # keeps this list in step with what the channels require.
@@ -23,6 +24,8 @@ REQUIRED_CHANNEL_SETTINGS=(
   SLACK_APP_TOKEN
   SRE_SLACK_CHANNEL
   SRE_OPERATORS
+  # slack-sre: who may approve the agent's runbook (KEDB) proposals (since 0.9.0)
+  SRE_KEDB_APPROVERS
   # trivy-webhook
   TRIVY_WEBHOOK_TOKEN
   JIRA_BASE_URL

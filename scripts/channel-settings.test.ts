@@ -25,6 +25,7 @@ const COMPLETE_SETTINGS: Record<string, string> = {
   SLACK_APP_TOKEN: "xapp-test-token",
   SRE_SLACK_CHANNEL: "C0TESTCHAN",
   SRE_OPERATORS: "U0TEST:Leo",
+  SRE_KEDB_APPROVERS: "U0TEST",
   TRIVY_WEBHOOK_TOKEN: "trivy-secret",
   JIRA_BASE_URL: "https://example.atlassian.net",
   JIRA_USER_EMAIL: "sre-agent@example.com",

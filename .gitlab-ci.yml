@@ -16,11 +16,11 @@ include:
 
 # Shared Node test job (npm test + typecheck). The tests also drive the real shell
 # scripts, so they need sqlite3 (incidents.sh), visudo (sudoers drop-in), make (rollback
-# target), ss (port wait), git (rollback sandbox) and tmux (startup prompt paste), which
-# node:*-slim does not ship.
+# target), ss (port wait), git (rollback sandbox, KEDB loop), tmux (startup prompt paste) and jq
+# (the briefing's runbook proposals), which node:*-slim does not ship.
 node-test:
   before_script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends sqlite3 sudo make iproute2 git tmux
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends sqlite3 sudo make iproute2 git tmux jq
     - !reference [.node-test-base, before_script]
 
 shellcheck:
