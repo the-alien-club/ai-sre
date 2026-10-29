@@ -33,6 +33,8 @@ source "$SRE_DIR/scripts/lib/wait-for-port.sh"
 source "$SRE_DIR/scripts/lib/channel-settings.sh"
 # shellcheck source=scripts/lib/notify-ops.sh
 source "$SRE_DIR/scripts/lib/notify-ops.sh"
+# shellcheck source=scripts/lib/session-cgroup.sh
+source "$SRE_DIR/scripts/lib/session-cgroup.sh"
 
 # A channel without its settings never binds its port, so the new session could not take
 # alert ingestion over. Refuse before stopping the running session (see
@@ -66,8 +68,11 @@ if ! wait_for_port_free "SigNoz webhook" "$SIGNOZ_PORT" 20 \
   exit 1
 fi
 
-# Start Claude Code in a tmux session
-tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
+# Start Claude Code in a tmux session. Without the user bus variables an SSH login may have
+# left in pm2's environment: with them, tmux puts the pane under that login's systemd user
+# manager, which kills it when the login ends (see session-cgroup.sh).
+env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR \
+  tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
   "cd $SRE_DIR && claude --dangerously-skip-permissions --dangerously-load-development-channels server:signoz-webhook server:slack-sre server:trivy-webhook"
 # The channels run under this process; only a listener below it is this session's
 if ! SESSION_PID="$(tmux display-message -p -t "$SESSION_NAME" '#{pane_pid}')" \
@@ -103,6 +108,15 @@ if ! wait_for_port "SigNoz webhook" "$SIGNOZ_PORT" 30 "$SESSION_PID" \
   || ! wait_for_port "Trivy webhook" "$TRIVY_PORT" 15 "$SESSION_PID"; then
   tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
   echo "[start-agent] a webhook channel did not start; check the channel's stderr in the tmux log" >&2
+  exit 1
+fi
+
+# The session must live and die with this script, in pm2's cgroup. The check runs once Claude
+# Code is up: tmux moves a pane into a scope between fork and exec.
+if ! same_cgroup "$SESSION_PID"; then
+  tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+  echo "[start-agent] the session was not started in pm2's cgroup; a tmux server started by another login" \
+    "(tmux ls) would cause this: stop it, then pm2 restart sre-agent" >&2
   exit 1
 fi
 
