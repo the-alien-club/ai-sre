@@ -342,6 +342,8 @@ cp .env.example .env
 # JIRA_BASE_URL / JIRA_USER_EMAIL / JIRA_API_TOKEN: an Atlassian API token for an account
 #   that can create and comment on SDS issues (the Trivy channel files one ticket per image)
 # TRIVY_DIGEST_HOUR_UTC: hour of the daily Trivy digest, 0-23 (default 7)
+# ACK_DELAY_MS / OPERATOR_FOLLOWUP_MS: when the channel posts "On it" for a quiet agent (default
+#   20000), and when after that it says there is still no answer (default 300000); see .env.example
 # RUNDECK_URL / RUNDECK_API_TOKEN: VM-A's Rundeck over WireGuard and the `sre-agent` token
 #   (required by the SigNoz channel; see "Sentinel remediation" below)
 ```

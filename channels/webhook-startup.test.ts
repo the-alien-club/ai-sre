@@ -155,3 +155,20 @@ test("channels/slack-sre.ts refuses an approver who is not an operator", () => {
   assert.notEqual(result.status, 0, "channel must exit non-zero");
   assert.match(result.stderr, /U0NOTANOP is not in SRE_OPERATORS/);
 });
+
+// The follow-up is what keeps an operator from waiting in silence; a typo must not turn it off.
+test("channels/slack-sre.ts refuses an OPERATOR_FOLLOWUP_MS that is not a positive integer", () => {
+  for (const value of ["5m", "0", "-1"]) {
+    const result = startSlack({ ...SLACK_ENV, OPERATOR_FOLLOWUP_MS: value });
+
+    assert.notEqual(result.status, 0, `channel must exit non-zero for ${value}`);
+    assert.match(result.stderr, /OPERATOR_FOLLOWUP_MS must be an integer number of ms, at least 1/);
+  }
+});
+
+test("channels/slack-sre.ts refuses an ACK_DELAY_MS that is not an integer", () => {
+  const result = startSlack({ ...SLACK_ENV, ACK_DELAY_MS: "20s" });
+
+  assert.notEqual(result.status, 0, "channel must exit non-zero");
+  assert.match(result.stderr, /ACK_DELAY_MS must be an integer number of ms, at least 0/);
+});

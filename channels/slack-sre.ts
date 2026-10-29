@@ -55,6 +55,7 @@ import { createKedbGit } from "./kedb-git.js";
 import { createKedbLoop, type KedbLoop, type ToolOutcome } from "./kedb-loop.js";
 import { createProposalStore } from "./proposal-store.js";
 import { parseApprovers } from "./kedb-approvers.js";
+import { createOperatorWait } from "./operator-wait.js";
 
 // -- Configuration (env vars) -------------------------------------------------
 
@@ -121,12 +122,35 @@ const SLACK_ONLY_INTERVAL_MS = parseInt(
   10
 );
 
+/**
+ * An optional integer setting in ms, or exit with an actionable message. A typo here must not
+ * quietly turn a timer off (parseInt("5m") is 5, parseInt("") is NaN).
+ */
+function msEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    console.error(`[slack-sre] ${name} must be an integer number of ms, at least ${min}; got ${JSON.stringify(raw)}`);
+    process.exit(1);
+  }
+  return value;
+}
+
 // How long an operator waits with no visible sign that their message landed before the
 // channel says so on the agent's behalf. The runbook requires the agent to delegate all
 // investigation to sub-agents, so a substantive question is silent for minutes by
 // construction — and from Slack that is indistinguishable from a dead bot. Set to 0 to
 // disable the acknowledgement entirely.
-const ACK_DELAY_MS = parseInt(process.env.ACK_DELAY_MS ?? "20000", 10);
+const ACK_DELAY_MS = msEnv("ACK_DELAY_MS", 20 * 1000, 0);
+
+// How long after that "On it" the channel says there is still no answer, and tells the agent
+// (type="operator_waiting"). 5 minutes: the agent runs investigations as background
+// sub-agents, so its main loop is free within seconds, and a first answer (the result, or
+// what it is waiting on) costs it one reply. The heartbeat that proves the loop is alive runs
+// on the same 5-minute cadence. Anything longer is the 2026-10-29 silence again. Cannot be
+// turned off.
+const OPERATOR_FOLLOWUP_MS = msEnv("OPERATOR_FOLLOWUP_MS", 5 * 60 * 1000, 1);
 
 // Where bookkeeping that only this process knows about is persisted. Relative to the repo
 // root so it lands in the same data/ directory as incidents.db.
@@ -273,52 +297,56 @@ const escalator = createEscalator({
   rememberThread: (ts) => threadOwnership.remember(ts),
 });
 
-// -- Receipt acknowledgement --------------------------------------------------
+// -- Operator wait: receipt acknowledgement and follow-up ----------------------
 //
-// Armed when a message is handed to the Claude session, cleared when the agent answers in
-// that thread. If it fires, the agent has been quiet long enough that an operator would
-// reasonably conclude nothing happened — so the channel says so on its behalf. Fast
-// answers never trigger it, which keeps a shared channel quiet.
+// Armed when an operator's message is handed to the Claude session, cleared when the agent
+// answers in that thread. After ACK_DELAY_MS the channel posts "On it" on the agent's behalf;
+// after OPERATOR_FOLLOWUP_MS more it says there is still no answer and tells the agent. Each
+// at most once per unanswered stretch of a thread (operator-wait.ts). Fast answers trigger
+// neither, which keeps a shared channel quiet.
 
-const pendingAcks = new Map<string, NodeJS.Timeout>(); // thread_ts -> timer
-
-function cancelReceiptAck(threadTs: string | undefined): void {
-  if (!threadTs) return;
-  const timer = pendingAcks.get(threadTs);
-  if (!timer) return;
-  clearTimeout(timer);
-  pendingAcks.delete(threadTs);
+/** Pushes one event into the Claude session, bounded (CLAUDE_ERROR_PATTERNS.md §14). */
+function notifyAgent(content: string, meta: Record<string, string>): Promise<void> {
+  return withTimeout(
+    mcp.notification({ method: "notifications/claude/channel", params: { content, meta } }),
+    AGENT_NOTIFY_TIMEOUT_MS,
+    "agent notification"
+  );
 }
 
-function armReceiptAck(
-  channel: string,
-  threadTs: string,
-  senderName: string
-): void {
-  if (ACK_DELAY_MS <= 0) return;
+// A thread whose follow-up went out and that the agent never answered is forgotten after a
+// day, so a new question there gets a fresh "On it" and follow-up.
+const OPERATOR_WAIT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-  cancelReceiptAck(threadTs);
-
-  const timer = setTimeout(() => {
-    pendingAcks.delete(threadTs);
-    void slackPoster
-      .post({
-        channel,
-        thread_ts: threadTs,
-        text: `:eyes: On it, ${senderName} — investigating. I'll answer in this thread.`,
-      })
-      .catch((err: unknown) => {
-        console.error(
-          `[slack-sre] failed to post receipt acknowledgement in ${threadTs}:`,
-          err instanceof Error ? err.message : String(err)
-        );
-      });
-  }, ACK_DELAY_MS);
-
-  // Never let a pending acknowledgement be the reason the process stays alive.
-  timer.unref();
-  pendingAcks.set(threadTs, timer);
-}
+const operatorWait = createOperatorWait({
+  ackDelayMs: ACK_DELAY_MS,
+  followUpMs: OPERATOR_FOLLOWUP_MS,
+  async postAck({ channel, threadTs, senderName }) {
+    await slackPoster.post({
+      channel,
+      thread_ts: threadTs,
+      text: `:eyes: On it, ${senderName} — investigating. I'll answer in this thread.`,
+    });
+  },
+  async postFollowUp({ channel, threadTs, senderName }, waitedMs) {
+    await slackPoster.post({
+      channel,
+      thread_ts: threadTs,
+      text:
+        `:hourglass: ${senderName}, still no answer after ${Math.round(waitedMs / 60_000)} min. ` +
+        "The agent has been told you are waiting. If nothing follows in the next few minutes, it is stuck " +
+        "and its session needs a look.",
+    });
+  },
+  async signalAgent({ channel, threadTs, senderName }, waitedMs) {
+    const minutes = String(Math.round(waitedMs / 60_000));
+    await notifyAgent(
+      `${senderName} has had no answer from you for ${minutes} min in thread ${threadTs}. Answer there now with "reply": ` +
+        "the result, what you are still waiting on, or what failed and why. Run investigations as background sub-agents.",
+      { type: "operator_waiting", channel, thread_ts: threadTs, sender_name: senderName, minutes_waiting: minutes }
+    );
+  },
+});
 
 // -- KEDB learning loop -------------------------------------------------------
 //
@@ -361,12 +389,7 @@ try {
       lintTimeoutMs: KEDB_LINT_TIMEOUT_MS,
     }),
     poster: slackPoster,
-    notifyAgent: (content, meta) =>
-      withTimeout(
-        mcp.notification({ method: "notifications/claude/channel", params: { content, meta } }),
-        AGENT_NOTIFY_TIMEOUT_MS,
-        "agent notification"
-      ),
+    notifyAgent,
     approvers: KEDB_APPROVERS,
     channel: SRE_SLACK_CHANNEL,
     teamUrl: () => SLACK_TEAM_URL,
@@ -436,11 +459,32 @@ function toolResult(outcome: ToolOutcome) {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
 }
 
+/**
+ * A proposal, as an answer in its thread: a posted one answers the operator who asked there;
+ * a refused one, while an operator waits there, comes back with the duty to tell them.
+ */
+async function proposeRunbookUpdate(loop: KedbLoop, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const outcome = await loop.propose(args);
+  const threadTs = typeof args.thread_ts === "string" ? args.thread_ts : undefined;
+  if (threadTs === undefined) return outcome;
+  if (!outcome.isError) {
+    operatorWait.answered(threadTs);
+    return outcome;
+  }
+  if (!operatorWait.isWaiting(threadTs)) return outcome;
+  return {
+    text:
+      `${outcome.text}\n\nAn operator is waiting for this in thread ${threadTs}. Tell them now, with "reply" in that thread, that it was ` +
+      "refused and why. Do not retry around the refusal: no other incident's fingerprint or id.",
+    isError: true,
+  };
+}
+
 async function callKedbTool(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
   if (kedbLoop === undefined) return { text: `the KEDB learning loop is off: ${kedbUnavailable}`, isError: true };
   switch (name) {
     case "propose_runbook_update":
-      return kedbLoop.propose(args);
+      return proposeRunbookUpdate(kedbLoop, args);
     case "apply_runbook_update":
       return kedbLoop.apply(args.id);
     case "list_runbook_proposals":
@@ -478,15 +522,15 @@ Escalations nag in-thread every 10 min (critical prod) or 1 hour (dev/staging) u
 operator replies, which stops the nagging. Say what broke, what you tried, what you need.
 
 Keep one alert in one thread: post the escalation, then reply in that thread as you learn
-more. Never open a new top-level message for something already in flight — this channel is
-shared with people who are not on the ops rotation. "escalate" holds you to this: for a
-fingerprint whose escalation is still waiting, it posts nothing and answers with that thread
-(deduplicated: true); post your update there with "reply".
+more. Never open a new top-level message for something already in flight; the channel is
+shared. "escalate" holds you to this: for a fingerprint whose escalation is still waiting, it
+posts nothing and answers with that thread (deduplicated: true); "reply" there.
 
-Three message types arrive automatically:
+Message types that arrive automatically:
 - type="escalation_timeout" final_agent_nag="false": nobody replied. Note it and stand by — do NOT re-investigate.
 - type="escalation_timeout" final_agent_nag="true": the team is offline. Say so ONCE, then ignore further nags; the channel drops to Slack-only automatically.
 - type="operator_reply": an operator replied in an escalation thread. Continue the conversation.
+- type="operator_waiting": an operator has had no answer in thread_ts for minutes. Answer there now.
 type="runbook_*" (feedback, applied, rejected, stale, failed) is about your runbook proposal proposal_id: CLAUDE.md "Learning loop".`;
 
 // Fail loudly if the instructions overrun. The overrun is invisible from the source —
@@ -650,7 +694,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       threadOwnership.remember(conversationTs);
 
       // The agent has spoken for itself — no need for the channel to do it.
-      cancelReceiptAck(conversationTs);
+      operatorWait.answered(conversationTs);
 
       return { content: [{ type: "text" as const, text: "sent" }] };
     } catch (err) {
@@ -924,7 +968,8 @@ slackApp.message(async ({ message }) => {
     const approved = permMatch[1].toLowerCase().startsWith("y");
     const replyThreadTs = parentThreadTs ?? message.ts;
 
-    if (!pendingPermissions.has(requestId)) {
+    const pending = pendingPermissions.get(requestId);
+    if (pending === undefined) {
       // Don't leave the operator wondering whether it landed. A restart is the common
       // cause and is worth naming: the tool call that asked is gone with the session, so
       // there is nothing left to approve and the agent will ask again if it still needs to.
@@ -947,13 +992,33 @@ slackApp.message(async ({ message }) => {
 
     pendingPermissions.delete(requestId);
 
-    await mcp.notification({
-      method: "notifications/claude/channel/permission",
-      params: {
-        request_id: requestId,
-        behavior: approved ? "allow" : "deny",
-      },
-    });
+    try {
+      await withTimeout(
+        mcp.notification({
+          method: "notifications/claude/channel/permission",
+          params: {
+            request_id: requestId,
+            behavior: approved ? "allow" : "deny",
+          },
+        }),
+        AGENT_NOTIFY_TIMEOUT_MS,
+        "permission verdict"
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`[slack-sre] could not pass ${senderName}'s verdict on ${requestId} to the agent: ${reason}`);
+      await postOrLog(
+        {
+          channel: channelId ?? SRE_SLACK_CHANNEL,
+          thread_ts: replyThreadTs,
+          text: `:x: Could not pass your verdict on \`${requestId}\` to the agent (${reason}). It may still be waiting; answer again.`,
+        },
+        `the failed permission verdict for ${requestId}`
+      );
+      // Still pending: a second answer must be accepted, not called unknown.
+      pendingPermissions.set(requestId, pending);
+      return;
+    }
 
     await postOrLog(
       {
@@ -1045,13 +1110,9 @@ slackApp.message(async ({ message }) => {
   const conversationThreadTs = parentThreadTs ?? message.ts;
   threadOwnership.remember(conversationThreadTs);
 
-  // The agent may spend minutes in sub-agents before it says anything. Promise the
-  // operator an answer if it stays quiet.
-  armReceiptAck(
-    channelId ?? SRE_SLACK_CHANNEL,
-    conversationThreadTs,
-    senderName
-  );
+  // Promise the operator an answer if the agent stays quiet, and chase it if it stays quiet
+  // for minutes.
+  operatorWait.messageReceived(channelId ?? SRE_SLACK_CHANNEL, conversationThreadTs, senderName);
 
   const meta: Record<string, string> = {
     sender: senderId,
@@ -1066,10 +1127,22 @@ slackApp.message(async ({ message }) => {
   }
   if (runbookMeta) Object.assign(meta, runbookMeta);
 
-  await mcp.notification({
-    method: "notifications/claude/channel",
-    params: { content, meta },
-  });
+  try {
+    await notifyAgent(content, meta);
+  } catch (err) {
+    // Most likely the agent never got it, so nobody is working on it: say so instead of "On it".
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[slack-sre] could not hand ${senderName}'s message in ${conversationThreadTs} to the agent: ${reason}`);
+    operatorWait.answered(conversationThreadTs);
+    await postOrLog(
+      {
+        channel: channelId ?? SRE_SLACK_CHANNEL,
+        thread_ts: conversationThreadTs,
+        text: `:x: ${senderName}, your message may not have reached the agent (${reason}). Send it again; if this repeats, the agent session needs a look.`,
+      },
+      `the undelivered-message notice in ${conversationThreadTs}`
+    );
+  }
 });
 
 // Start Slack Socket Mode
@@ -1087,6 +1160,7 @@ let sweeping = false;
 async function nagSweep(): Promise<void> {
   threadOwnership.prune();
   prunePendingPermissions();
+  operatorWait.prune(OPERATOR_WAIT_RETENTION_MS);
 
   const now = Date.now();
   let escalationsChanged = false;
