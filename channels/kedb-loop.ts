@@ -206,15 +206,15 @@ export function formatProposalPost(p: Proposal, change: string): string {
   if (p.downgrade !== null) {
     lines.push(
       `:warning: *SEVERITY DOWNGRADE:* ${p.downgrade.from ?? "none"} → ${p.downgrade.to ?? "none"} (${escapeSlackText(p.downgrade.scope.join("; "))}). ` +
-        `To accept, reply exactly \`yes downgrade ${p.id}\`.`
+        `To accept, reply exactly *yes downgrade ${p.id}*.`
     );
   }
   lines.push(slackDiffBlock(p.diff));
   lines.push(`Content-SHA256: \`${p.content_sha256}\``);
   lines.push(
     p.downgrade === null
-      ? `Reply \`yes\` to apply, \`no\` to drop, or tell me what to change.`
-      : `Reply \`yes downgrade ${p.id}\` to apply, \`no\` to drop, or tell me what to change.`
+      ? `Reply *yes* to apply, *no* to drop, or tell me what to change.`
+      : `Reply *yes downgrade ${p.id}* to apply, *no* to drop, or tell me what to change.`
   );
   return lines.join("\n");
 }
@@ -647,7 +647,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
         } else if (p.status === "pending" && p.reminded_at === null && age >= REMINDER_AFTER_MS) {
           update(p, { reminded_at: at });
           const phrase = p.downgrade ? `yes downgrade ${p.id}` : `yes ${p.id}`;
-          await postInThread(p, `:hourglass: ${p.id} (rev ${p.rev}) is still waiting for an answer: \`${phrase}\` applies it, \`no ${p.id}\` drops it. It expires in 6 days.`);
+          await postInThread(p, `:hourglass: ${p.id} (rev ${p.rev}) is still waiting for an answer: *${phrase}* applies it, *no ${p.id}* drops it. It expires in 6 days.`);
         }
       } catch (err) {
         log(`[kedb-loop] sweep of ${p.id} failed: ${message(err)}`);

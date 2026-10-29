@@ -229,7 +229,7 @@ test("KB-1 end to end: proposed as a downgrade, approved with the exact phrase, 
 
   // A plain yes is not enough for a downgrade, and Adrien cannot approve at all
   assert.deepEqual(await reply(world, "yes"), { handled: true });
-  assert.match(world.posts.at(-1)!.text, /reply exactly `yes downgrade KB-1`/);
+  assert.match(world.posts.at(-1)!.text, /reply exactly \*yes downgrade KB-1\*/);
   assert.deepEqual(await reply(world, "yes downgrade KB-1", ADRIEN), { handled: false, meta: { type: "runbook_feedback", proposal_id: "KB-1" } });
   assert.match(world.posts.at(-1)!.text, /Only Leo can approve/);
   assert.equal(world.store.get("KB-1")?.status, "pending");
@@ -401,7 +401,7 @@ test("24 h reminder once, expiry at 7 days, both in the thread", async () => {
   await world.loop.sweep();
   await world.loop.sweep();
   assert.equal(world.posts.length, count + 1, "one reminder");
-  assert.match(world.posts.at(-1)!.text, /KB-1 \(rev 1\) is still waiting.*`yes downgrade KB-1`/);
+  assert.match(world.posts.at(-1)!.text, /KB-1 \(rev 1\) is still waiting.*\*yes downgrade KB-1\*/);
   assert.equal(world.posts.at(-1)!.thread_ts, THREAD);
 
   world.clock.now += EXPIRY_AFTER_MS;

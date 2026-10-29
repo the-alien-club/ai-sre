@@ -120,3 +120,60 @@ test("SRE_KEDB_APPROVERS: ids that are operators, named from the roster", () => 
   assert.throws(() => parseApprovers("leo", operators), /not a Slack user ID/);
   assert.throws(() => parseApprovers("U0NOTANOP", operators), /not in SRE_OPERATORS/);
 });
+
+// -- Slack formatting around a reply (2026-10-29) -------------------------------------------
+
+const kb1Downgrade = sampleProposal({ downgrade: { from: "page", to: "fyi", scope: ["new benign cause kapsule-serial-console-agent-update"] } });
+
+test("Leo's 2026-10-29 reply, '`yes downgrade KB-1`' with backticks, approves the KB-1 downgrade", () => {
+  const meaning = classifyReply(msg("`yes downgrade KB-1`"), { approvers: APPROVERS, proposals: [kb1Downgrade] });
+  assert.equal(meaning.kind, "approve");
+});
+
+test("formatting around the whole reply is ignored: code, bold, italic, quote, whitespace, a period", () => {
+  const options = { approvers: APPROVERS, proposals: [kb1Downgrade] };
+  for (const text of [
+    "```yes downgrade KB-1```",
+    "```\nyes downgrade KB-1\n```",
+    "*yes downgrade KB-1*",
+    "_yes downgrade KB-1_",
+    "*`yes downgrade KB-1`*",
+    "&gt; yes downgrade KB-1",
+    "> yes downgrade KB-1",
+    "  yes downgrade KB-1  ",
+    " yes downgrade KB-1 ",
+    "yes downgrade KB-1.",
+    "`yes downgrade KB-1`.",
+  ]) {
+    assert.equal(classifyReply(msg(text), options).kind, "approve", JSON.stringify(text));
+  }
+});
+
+test("the words themselves must still match: formatting is no way around the exact phrase", () => {
+  const options = { approvers: APPROVERS, proposals: [kb1Downgrade] };
+  for (const text of [
+    "~yes downgrade KB-1~", // struck out says the opposite
+    "`yes` downgrade KB-1", // formatting inside the reply is not peeled
+    "`yes downgrade KB-1` please",
+    "`yes KB-1`", // a downgrade still needs the word
+    "`yes downgrade`", // and the id
+    "yes downgrade KB-12",
+  ]) {
+    assert.notEqual(classifyReply(msg(text), options).kind, "approve", JSON.stringify(text));
+  }
+});
+
+test("a formatted approval still needs the approver, the thread and a later ts", () => {
+  const options = { approvers: APPROVERS, proposals: [kb1Downgrade] };
+  assert.equal(classifyReply(msg("`yes downgrade KB-1`", { user: ADRIEN }), options).kind, "feedback");
+  assert.equal(classifyReply(msg("`yes downgrade KB-1`", { channel: "C0OTHER0000" }), options).kind, "notice");
+  assert.equal(classifyReply(msg("`yes downgrade KB-1`", { ts: "1793201600.000001" }), options).kind, "notice");
+});
+
+test("a formatted no rejects, with the reason", () => {
+  const meaning = classifyReply(msg("`no KB-1` wrong node pool"), { approvers: APPROVERS, proposals: [pending] });
+  assert.notEqual(meaning.kind, "reject", "formatting inside the reply is not peeled");
+  const plain = classifyReply(msg("*no, wrong node pool*"), { approvers: APPROVERS, proposals: [pending] });
+  assert.equal(plain.kind, "reject");
+  if (plain.kind === "reject") assert.equal(plain.reason, "wrong node pool");
+});

@@ -43,6 +43,7 @@ import { createEscalationStore } from "./escalation-store.js";
 import { createEscalator } from "./escalator.js";
 import { createSlackPostClient, createSlackPoster, SlackPostRejected } from "./slack-poster.js";
 import { withTimeout } from "./with-timeout.js";
+import { normalizeReplyText } from "./slack-text.js";
 import { isTrivyEscalation, TRIVY_ESCALATION_REFUSED } from "./escalation-policy.js";
 import {
   operatorMentions,
@@ -865,7 +866,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
         "```\n" +
         preview +
         "\n```\n\n" +
-        `Any operator: reply \`yes ${params.request_id}\` to approve or \`no ${params.request_id}\` to deny.`,
+        `Any operator: reply *yes ${params.request_id}* to approve or *no ${params.request_id}* to deny.`,
     });
 
     threadOwnership.remember(ts);
@@ -964,8 +965,9 @@ slackApp.message(async ({ message }) => {
     "thread_ts" in message && message.thread_ts ? message.thread_ts : undefined;
 
   // Permission verdicts are accepted anywhere an operator can reach us — they are
-  // strictly formatted and deliberately frictionless, so no @-mention is required.
-  const permMatch = PERMISSION_REPLY_RE.exec(text);
+  // strictly formatted and deliberately frictionless, so no @-mention is required. Slack
+  // formatting around the reply (a copied `yes abcde`) does not change its words.
+  const permMatch = PERMISSION_REPLY_RE.exec(normalizeReplyText(text));
   if (permMatch) {
     const requestId = permMatch[2].toLowerCase();
     const approved = permMatch[1].toLowerCase().startsWith("y");

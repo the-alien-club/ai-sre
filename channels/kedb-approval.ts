@@ -6,6 +6,7 @@
 // acts on the answer. Only a fresh message counts: slack-sre already drops every edit.
 
 import type { Proposal } from "./proposal-store.js";
+import { normalizeReplyText } from "./slack-text.js";
 
 /** "yes", "ok" or "approve", then "downgrade" when the change lowers severity, then the id. */
 export const APPROVE_RE = /^\s*(yes|ok|approve)(\s+downgrade)?(\s+kb-(\d+))?\s*[.!]?\s*$/i;
@@ -64,8 +65,9 @@ function approverNames(approvers: ReadonlyMap<string, string>): string {
 
 export function classifyReply(message: InboundMessage, options: ClassifyOptions): ReplyMeaning {
   const { approvers, proposals } = options;
-  const yes = APPROVE_RE.exec(message.text);
-  const no = yes ? null : REJECT_RE.exec(message.text);
+  const words = normalizeReplyText(message.text);
+  const yes = APPROVE_RE.exec(words);
+  const no = yes ? null : REJECT_RE.exec(words);
   const namedNumber = yes?.[4] ?? no?.[1];
   const namedId = namedNumber === undefined ? undefined : `KB-${Number(namedNumber)}`;
 
@@ -90,7 +92,7 @@ export function classifyReply(message: InboundMessage, options: ClassifyOptions)
   } else {
     return {
       kind: "notice",
-      text: `:grey_question: ${inThread.length} runbook proposals are pending in this thread (${inThread.map((p) => p.id).join(", ")}). Name the one you mean, e.g. \`yes ${inThread[0].id}\`.`,
+      text: `:grey_question: ${inThread.length} runbook proposals are pending in this thread (${inThread.map((p) => p.id).join(", ")}). Name the one you mean, e.g. *yes ${inThread[0].id}*.`,
     };
   }
 
@@ -117,11 +119,11 @@ export function classifyReply(message: InboundMessage, options: ClassifyOptions)
   if (target.downgrade !== null && (!saidDowngrade || namedId === undefined)) {
     return {
       kind: "notice",
-      text: `:warning: ${target.id} is a severity downgrade. To accept it, reply exactly \`yes downgrade ${target.id}\`.`,
+      text: `:warning: ${target.id} is a severity downgrade. To accept it, reply exactly *yes downgrade ${target.id}*.`,
     };
   }
   if (target.downgrade === null && saidDowngrade) {
-    return { kind: "notice", text: `:grey_question: ${target.id} is not a severity downgrade. To accept it, reply \`yes ${target.id}\`.` };
+    return { kind: "notice", text: `:grey_question: ${target.id} is not a severity downgrade. To accept it, reply *yes ${target.id}*.` };
   }
   return { kind: "approve", proposal: target };
 }
