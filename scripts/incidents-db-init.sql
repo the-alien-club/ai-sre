@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS incidents (
     notes TEXT               -- free-form notes
 );
 
+-- The KEDB columns (kedb_id, kedb_rev, kedb_match, kedb_predicted_verdict,
+-- kedb_predicted_action, corroboration, operator_verdict, operator_verdict_by,
+-- operator_verdict_at) are added by scripts/incidents.sh on every run, so a fresh database and
+-- one created before they existed end up the same. See ensure_kedb_columns there.
+
 -- Index for the most common queries
 CREATE INDEX IF NOT EXISTS idx_incidents_alert ON incidents(alert_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_incidents_fingerprint ON incidents(fingerprint, created_at);

@@ -11,6 +11,7 @@
 #   ./scripts/incidents.sh patterns [--days 7]
 #   ./scripts/incidents.sh briefing [--days 7]
 #   ./scripts/incidents.sh resolve --id 42 --resolution "MR reverted"
+#   ./scripts/incidents.sh correct --id 42 --verdict noise --by Leo
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -60,6 +61,41 @@ more_classes() {
     fi
 }
 
+# Vocabularies the CLI validates. VERDICTS is incidents.verdict's; ACTION_LADDER is the KEDB's
+# (sre-kedb schema), lowest first; CORROBORATION_RESULTS are what a sub-agent reports per check.
+readonly VERDICTS="real noise false_positive known_issue flapping"
+readonly KEDB_MATCHES="exact family none"
+readonly ACTION_LADDER="ignore log fyi ticket escalate page"
+readonly CORROBORATION_RESULTS="pass fail not-run"
+readonly KEDB_ID_RE='^[a-z0-9][a-z0-9-]*/(_family|[a-z0-9][a-z0-9-]*)$'
+readonly KEDB_REV_RE='^[0-9a-f]{7,40}$'
+
+# one_of <name> <value> <allowed words>: the value, or a usage error naming what is allowed.
+one_of() {
+    local name="$1" value="$2" allowed="$3" word
+    for word in $allowed; do
+        if [ "$value" = "$word" ]; then printf '%s' "$value"; return 0; fi
+    done
+    echo "Invalid $name: expected one of: $allowed; got '$value'" >&2
+    exit 1
+}
+
+# matching <name> <value> <ERE>: the value when it matches the pattern, or a usage error.
+matching() {
+    local name="$1" value="$2" pattern="$3"
+    if [[ ! "$value" =~ $pattern ]]; then
+        echo "Invalid $name: '$value' does not match $pattern" >&2
+        exit 1
+    fi
+    printf '%s' "$value"
+}
+
+# SQL for an optional text value: NULL when empty, so "not reported" stays distinguishable
+# from an empty report in the KEDB columns.
+sql_text_or_null() {
+    if [ -z "$1" ]; then printf 'NULL'; else sql_text "$1"; fi
+}
+
 # Run SQL read from stdin against the database. The statement never travels as a
 # command-line argument: hex-encoded values double its size, and a long cause or note
 # would otherwise hit the kernel's argument length limit ("Argument list too long").
@@ -74,6 +110,26 @@ if [ ! -f "$DB" ]; then
     sqlite3 "$DB" < "$SCRIPT_DIR/incidents-db-init.sql"
 fi
 
+# KEDB columns on incidents (plan §6). The init SQL runs only when the file is missing, so an
+# existing database gains them here, on any command, idempotently: a column is added only when
+# pragma table_info does not list it. Two invocations racing may both try; the loser's ALTER
+# fails with "duplicate column", which is fine as long as the column exists afterwards.
+readonly KEDB_COLUMNS="kedb_id kedb_rev kedb_match kedb_predicted_verdict kedb_predicted_action corroboration operator_verdict operator_verdict_by operator_verdict_at"
+ensure_kedb_columns() {
+    local existing column error
+    existing="$(sql_run <<< "SELECT name FROM pragma_table_info('incidents');")" || return 1
+    for column in $KEDB_COLUMNS; do
+        grep -qx "$column" <<< "$existing" && continue
+        if ! error="$(sql_run <<< "ALTER TABLE incidents ADD COLUMN ${column} TEXT;" 2>&1)"; then
+            if ! sql_run <<< "SELECT name FROM pragma_table_info('incidents');" | grep -qx "$column"; then
+                echo "Could not add column ${column} to incidents in $DB: $error" >&2
+                return 1
+            fi
+        fi
+    done
+}
+ensure_kedb_columns || exit 1
+
 CMD="${1:-help}"
 shift || true
 
@@ -82,6 +138,7 @@ case "$CMD" in
         # Parse named arguments
         ALERT="" SEVERITY="" STATUS="" CLUSTER="" NAMESPACE="" SERVICE=""
         VERDICT="" ACTION="" CAUSE="" RESOLUTION="" RELATED_MR="" NOTES="" DURATION="" FP=""
+        KEDB_ID="" KEDB_REV="" KEDB_MATCH="" KEDB_PRED_VERDICT="" KEDB_PRED_ACTION="" CORROBORATION=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --alert) ALERT="$2"; shift 2;;
@@ -98,6 +155,12 @@ case "$CMD" in
                 --related-mr) RELATED_MR="$2"; shift 2;;
                 --notes) NOTES="$2"; shift 2;;
                 --duration) DURATION="$2"; shift 2;;
+                --kedb-id) KEDB_ID="$2"; shift 2;;
+                --kedb-rev) KEDB_REV="$2"; shift 2;;
+                --kedb-match) KEDB_MATCH="$2"; shift 2;;
+                --kedb-predicted-verdict) KEDB_PRED_VERDICT="$2"; shift 2;;
+                --kedb-predicted-action) KEDB_PRED_ACTION="$2"; shift 2;;
+                --corroboration) CORROBORATION="$2"; shift 2;;
                 *) echo "Unknown arg: $1"; exit 1;;
             esac
         done
@@ -107,12 +170,34 @@ case "$CMD" in
             exit 1
         fi
 
+        # The KEDB flags are copied from the alert's channel meta; each is optional, but a
+        # value given must be well formed, since the KEDB metrics are computed from them.
+        [ -n "$KEDB_MATCH" ] && { KEDB_MATCH="$(one_of --kedb-match "$KEDB_MATCH" "$KEDB_MATCHES")" || exit 1; }
+        [ -n "$KEDB_ID" ] && { KEDB_ID="$(matching --kedb-id "$KEDB_ID" "$KEDB_ID_RE")" || exit 1; }
+        [ -n "$KEDB_REV" ] && { KEDB_REV="$(matching --kedb-rev "$KEDB_REV" "$KEDB_REV_RE")" || exit 1; }
+        [ -n "$KEDB_PRED_VERDICT" ] && { KEDB_PRED_VERDICT="$(one_of --kedb-predicted-verdict "$KEDB_PRED_VERDICT" "$VERDICTS")" || exit 1; }
+        [ -n "$KEDB_PRED_ACTION" ] && { KEDB_PRED_ACTION="$(one_of --kedb-predicted-action "$KEDB_PRED_ACTION" "$ACTION_LADDER")" || exit 1; }
+        if [ -n "$KEDB_ID" ] && [ "$KEDB_MATCH" != "exact" ] && [ "$KEDB_MATCH" != "family" ]; then
+            echo "--kedb-id needs --kedb-match exact or family" >&2
+            exit 1
+        fi
+        if [ -n "$CORROBORATION" ]; then
+            # A JSON object of check id -> pass|fail|not-run, checked by SQLite's own JSON parser.
+            # CASE, not AND: SQLite may evaluate both sides of an AND, and json_type raises on
+            # malformed JSON where json_valid only returns 0.
+            VALID="$(sql_run <<< "SELECT CASE WHEN json_valid(v) THEN json_type(v) = 'object' AND NOT EXISTS (SELECT 1 FROM json_each(v) WHERE type != 'text' OR value NOT IN ('pass','fail','not-run') OR key NOT GLOB '[a-z0-9]*' OR key GLOB '*[^a-z0-9-]*') ELSE 0 END FROM (SELECT $(sql_text "$CORROBORATION") AS v);")" || exit 1
+            if [ "$VALID" != "1" ]; then
+                echo "Invalid --corroboration: expected a JSON object of check id -> one of: $CORROBORATION_RESULTS; got '$CORROBORATION'" >&2
+                exit 1
+            fi
+        fi
+
         DURATION_SQL="NULL"
         if [ -n "$DURATION" ]; then
             DURATION_SQL="$(sql_int --duration "$DURATION")" || exit 1
         fi
 
-        sql_run <<< "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec) VALUES ($(sql_text "$ALERT"), $(sql_text "$FP"), $(sql_text "$SEVERITY"), $(sql_text "${STATUS:-firing}"), $(sql_text "$CLUSTER"), $(sql_text "$NAMESPACE"), $(sql_text "$SERVICE"), $(sql_text "$VERDICT"), $(sql_text "$ACTION"), $(sql_text "$CAUSE"), $(sql_text "$RESOLUTION"), $(sql_text "$RELATED_MR"), $(sql_text "$NOTES"), ${DURATION_SQL});" || exit 1
+        sql_run <<< "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec, kedb_id, kedb_rev, kedb_match, kedb_predicted_verdict, kedb_predicted_action, corroboration) VALUES ($(sql_text "$ALERT"), $(sql_text "$FP"), $(sql_text "$SEVERITY"), $(sql_text "${STATUS:-firing}"), $(sql_text "$CLUSTER"), $(sql_text "$NAMESPACE"), $(sql_text "$SERVICE"), $(sql_text "$VERDICT"), $(sql_text "$ACTION"), $(sql_text "$CAUSE"), $(sql_text "$RESOLUTION"), $(sql_text "$RELATED_MR"), $(sql_text "$NOTES"), ${DURATION_SQL}, $(sql_text_or_null "$KEDB_ID"), $(sql_text_or_null "$KEDB_REV"), $(sql_text_or_null "$KEDB_MATCH"), $(sql_text_or_null "$KEDB_PRED_VERDICT"), $(sql_text_or_null "$KEDB_PRED_ACTION"), $(sql_text_or_null "$CORROBORATION"));" || exit 1
 
         echo "Incident logged: $ALERT ($VERDICT → $ACTION)"
         ;;
@@ -222,6 +307,32 @@ case "$CMD" in
             echo ""
         fi
 
+        # KEDB: how its predictions fared, and which entries got it wrong. An entry mispredicts
+        # when its predicted verdict differs from the final one: the operator's correction if
+        # there is one, else the agent's. Only exact matches predict anything.
+        KEDB_ROWS=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE kedb_match IS NOT NULL AND ${WINDOW};") || exit 1
+        if [ "$KEDB_ROWS" != "0" ]; then
+            FINAL="COALESCE(NULLIF(operator_verdict, ''), verdict)"
+            EXACT=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE kedb_match = 'exact' AND ${WINDOW};") || exit 1
+            FAMILY=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE kedb_match = 'family' AND ${WINDOW};") || exit 1
+            PREDICTED="kedb_match = 'exact' AND kedb_predicted_verdict IS NOT NULL AND ${WINDOW}"
+            PREDICTIONS=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE ${PREDICTED};") || exit 1
+            RIGHT=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE ${PREDICTED} AND kedb_predicted_verdict = ${FINAL};") || exit 1
+            CORRECTED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE operator_verdict IS NOT NULL AND ${WINDOW};") || exit 1
+            echo "KEDB: ${KEDB_ROWS} logged with a KEDB match field | ${EXACT} exact | ${FAMILY} family only | predictions right ${RIGHT}/${PREDICTIONS} | ${CORRECTED} corrected by an operator"
+
+            WRONG_CLASSES="SELECT kedb_id, COUNT(*) AS wrong, group_concat(DISTINCT kedb_predicted_verdict || '→' || ${FINAL}) AS how FROM incidents WHERE ${PREDICTED} AND kedb_predicted_verdict != ${FINAL} GROUP BY kedb_id"
+            WRONG_COUNT=$(sql_run <<< "SELECT COUNT(*) FROM (${WRONG_CLASSES});") || exit 1
+            if [ "$WRONG_COUNT" != "0" ]; then
+                echo "Entries that mispredicted (review them; 2+ is a wrong entry):"
+                sql_run <<< "SELECT '  - ' || $(sql_clip kedb_id "$BRIEFING_NAME_CHARS") || ' | ' || wrong || 'x (' || $(sql_clip how "$BRIEFING_NAME_CHARS") || ')' FROM (${WRONG_CLASSES}) ORDER BY wrong DESC, kedb_id LIMIT ${BRIEFING_CLASSES};" || exit 1
+                if (( WRONG_COUNT > BRIEFING_CLASSES )); then
+                    echo "  … and $(( WRONG_COUNT - BRIEFING_CLASSES )) more entries"
+                fi
+            fi
+            echo ""
+        fi
+
         # An if, not `[ ... ] && echo`: as the last command that form made briefing exit 1
         # whenever incidents existed, and start-agent.sh then appended its failure fallback
         if [ "$TOTAL" = "0" ]; then
@@ -309,6 +420,35 @@ case "$CMD" in
         echo "Incident $ID marked as resolved."
         ;;
 
+    correct)
+        # Record an operator's verdict when it differs from the agent's (e.g. Leo in the
+        # thread: "that was noise"). The agent's own verdict is kept; the KEDB metrics read
+        # COALESCE(operator_verdict, verdict).
+        ID="" VERDICT="" BY=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --id) ID="$2"; shift 2;;
+                --verdict) VERDICT="$2"; shift 2;;
+                --by) BY="$2"; shift 2;;
+                *) echo "Unknown arg: $1" >&2; exit 1;;
+            esac
+        done
+
+        if [ -z "$ID" ] || [ -z "$VERDICT" ] || [ -z "$BY" ]; then
+            echo "Required: --id, --verdict ($VERDICTS), --by <operator name>" >&2
+            exit 1
+        fi
+        ID="$(sql_int --id "$ID")" || exit 1
+        VERDICT="$(one_of --verdict "$VERDICT" "$VERDICTS")" || exit 1
+
+        UPDATED="$(sql_run <<< "UPDATE incidents SET operator_verdict = $(sql_text "$VERDICT"), operator_verdict_by = $(sql_text "$BY"), operator_verdict_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ${ID}; SELECT changes();")" || exit 1
+        if [ "$UPDATED" != "1" ]; then
+            echo "No incident with id $ID; nothing corrected" >&2
+            exit 1
+        fi
+        echo "Incident $ID: operator verdict $VERDICT (by $BY)."
+        ;;
+
     help|*)
         echo "SRE Agent Incident Memory"
         echo ""
@@ -321,6 +461,11 @@ case "$CMD" in
         echo "  context    Save investigation context (--fp, --phase, --content, [--author])"
         echo "  timeline   Full investigation timeline (--fp)"
         echo "  resolve    Mark escalation resolved (--id, --resolution)"
+        echo "  correct    Record an operator's verdict (--id, --verdict, --by)"
+        echo ""
+        echo "log also takes the KEDB fields from the alert's meta: --kedb-id, --kedb-rev,"
+        echo "  --kedb-match (exact|family|none), --kedb-predicted-verdict, --kedb-predicted-action,"
+        echo "  --corroboration '{\"<check id>\":\"pass|fail|not-run\"}'"
         echo ""
         echo "DB location: $DB"
         ;;
