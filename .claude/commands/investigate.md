@@ -19,7 +19,9 @@ skill. Pass the alert details as arguments, or use the channel event content.
 4. Pick the investigation guide:
    - `kedb_match` is `exact` or `family`: the KEDB entry at the `Full entry:` path.
    - `kedb_match` is `none`: the playbook in `playbooks/` for the alert name (CLAUDE.md mapping).
-5. Spawn the sub-agent with this prompt structure. Leave out the bracketed KEDB lines when
+5. Spawn the sub-agent **in the background** (`run_in_background: true`, `model: "sonnet"`) with
+   this prompt structure, then end your turn: its report arrives as a notification, and until
+   then you stay free for heartbeats and operators. Leave out the bracketed KEDB lines when
    `kedb_match` is `none`, and the playbook lines when it is not:
 
 ```
@@ -61,7 +63,7 @@ Save a note at EACH phase — this builds the investigation trail for the incide
 
 LAST: Log the result before returning:
   ./scripts/incidents.sh log --alert "<name>" --severity "<sev>" --status "<status>" \
-    --cluster "<cluster>" --service "<service>" \
+    --cluster "<cluster>" --service "<service>" --fingerprint "<fingerprint>" \
     --verdict "<real|noise|false_positive|known_issue|flapping>" \
     --action "<auto_fixed|escalated|ignored|monitoring>" \
     --cause "<brief cause>" \
@@ -83,8 +85,8 @@ Report back:
 Be concise.
 ```
 
-6. Read the sub-agent's report and decide:
+6. When the sub-agent's report arrives, read it and decide:
    - False positive / noise → done
-   - Auto-fixable → run the fix command, then spawn a verification sub-agent
+   - Auto-fixable → run the fix command, then spawn a verification sub-agent (background too)
    - Needs escalation → use the `escalate` tool with the sub-agent's findings
    - **Resolved** → invoke `/incident-report` to compile and publish the full report
