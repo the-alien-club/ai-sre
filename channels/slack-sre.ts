@@ -50,6 +50,11 @@ import {
   parseOperators,
   type OperatorRoster,
 } from "./operators.js";
+import { DEFAULT_KEDB_DIR } from "./kedb-index.js";
+import { createKedbGit } from "./kedb-git.js";
+import { createKedbLoop, type KedbLoop, type ToolOutcome } from "./kedb-loop.js";
+import { createProposalStore } from "./proposal-store.js";
+import { parseApprovers } from "./kedb-approvers.js";
 
 // -- Configuration (env vars) -------------------------------------------------
 
@@ -86,6 +91,14 @@ const SRE_SLACK_CHANNEL = requireEnv(
 const SRE_OPERATORS_RAW = requireEnv(
   "SRE_OPERATORS",
   '  Format: "U054PDMV69X:Leo,U059X19MH8U:Adrien,U09KNNY8GGJ:Ghislain"'
+);
+
+// Slack user IDs, comma-separated, of the only people whose "yes" applies a runbook
+// (KEDB) change the agent proposed. Each must also be in SRE_OPERATORS. No default: who may
+// change the agent's triage knowledge is never implicit.
+const SRE_KEDB_APPROVERS_RAW = requireEnv(
+  "SRE_KEDB_APPROVERS",
+  '  Slack user IDs, comma-separated, e.g. "U054PDMV69X" (Leo).'
 );
 
 // Escalation settings
@@ -128,6 +141,14 @@ try {
   console.error(
     `[slack-sre] ${err instanceof Error ? err.message : String(err)}`
   );
+  process.exit(1);
+}
+
+let KEDB_APPROVERS: Map<string, string>;
+try {
+  KEDB_APPROVERS = parseApprovers(SRE_KEDB_APPROVERS_RAW, OPERATORS);
+} catch (err) {
+  console.error(`[slack-sre] ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 }
 
@@ -230,6 +251,9 @@ async function postOrLog(message: { channel: string; text: string; thread_ts?: s
 
 // Resolved during startup validation — needed to detect @-mentions of the bot.
 let BOT_USER_ID = "";
+// The workspace URL (https://<workspace>.slack.com/), for the permalinks the KEDB loop writes
+// into its commits. Resolved during startup validation.
+let SLACK_TEAM_URL = "";
 
 // Answers "has the agent posted in this thread?" from Slack, with an in-memory cache.
 // Reads BOT_USER_ID lazily: startup validation resolves it after this object is built.
@@ -296,6 +320,138 @@ function armReceiptAck(
   pendingAcks.set(threadTs, timer);
 }
 
+// -- KEDB learning loop -------------------------------------------------------
+//
+// The agent proposes runbook changes with the tools below; an approver's reply in Slack is
+// applied by code (kedb-loop.ts), committed and pushed to sre-kedb. See plan §4.
+
+// The sre-kedb checkout the loop commits to; the same one signoz-webhook reads.
+const KEDB_DIR = process.env.SRE_KEDB_DIR ?? DEFAULT_KEDB_DIR;
+// Read-only sentinel clone: an entry's auto_fix must name an action and target it allows.
+const SENTINEL_DIR = process.env.SRE_SENTINEL_DIR ?? "/home/sre-agent/repos/sentinel";
+const KEDB_WEB_URL = "https://gitlab.com/alias3/datastreaming/tooling/sre-kedb";
+const KEDB_GIT_TIMEOUT_MS = 60 * 1000;
+const KEDB_LINT_TIMEOUT_MS = 90 * 1000;
+const KEDB_READ_TIMEOUT_MS = 10 * 1000;
+const KEDB_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+/** The SigNoz host links in an entry may point to, from the URL the SigNoz MCP uses. */
+function signozHost(): string | undefined {
+  const raw = process.env.SIGNOZ_URL;
+  if (!raw) return undefined;
+  try {
+    return new URL(raw).hostname;
+  } catch {
+    console.error("[slack-sre] SIGNOZ_URL is not a URL; KEDB proposals may not link to SigNoz");
+    return undefined;
+  }
+}
+
+// Undefined when the proposal store cannot be read: the loop is then off (its tools say why)
+// rather than restarting the KB-<n> counter, and the rest of the channel keeps working.
+let kedbLoop: KedbLoop | undefined;
+let kedbUnavailable = "";
+try {
+  kedbLoop = createKedbLoop({
+    store: createProposalStore({ path: join(DATA_DIR, "kedb-proposals.json") }),
+    git: createKedbGit({
+      dir: KEDB_DIR,
+      stageDir: join(DATA_DIR, "kedb-stage"),
+      timeoutMs: KEDB_GIT_TIMEOUT_MS,
+      lintTimeoutMs: KEDB_LINT_TIMEOUT_MS,
+    }),
+    poster: slackPoster,
+    notifyAgent: (content, meta) =>
+      withTimeout(
+        mcp.notification({ method: "notifications/claude/channel", params: { content, meta } }),
+        AGENT_NOTIFY_TIMEOUT_MS,
+        "agent notification"
+      ),
+    approvers: KEDB_APPROVERS,
+    channel: SRE_SLACK_CHANNEL,
+    teamUrl: () => SLACK_TEAM_URL,
+    payloadDir: join(DATA_DIR, "alert-payloads"),
+    sentinelDir: SENTINEL_DIR,
+    urlPolicy: { signozHost: signozHost() },
+    readTimeoutMs: KEDB_READ_TIMEOUT_MS,
+    commitUrl: (sha) => `${KEDB_WEB_URL}/-/commit/${sha}`,
+  });
+} catch (err) {
+  kedbUnavailable = err instanceof Error ? err.message : String(err);
+  console.error(`[slack-sre] KEDB learning loop is OFF: ${kedbUnavailable}`);
+}
+
+const KEDB_TOOLS = [
+  {
+    name: "propose_runbook_update",
+    description:
+      "Propose a change to one KEDB entry (sre-kedb). Code checks it (schema, lint, guardrails), posts it with its diff in thread_ts, " +
+      "and applies it only when an approver answers yes in Slack. Refused: diffs over 80 changed lines, copies of the alert payload " +
+      "outside ```evidence fences, a second open proposal for the entry or incident, more than 3 open. Returns the KB-<n> id.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        entry_id: { type: "string", description: "Entry id, the path under entries/ without .md, e.g. falco/delete-or-rename-shell-history." },
+        op: { type: "string", enum: ["create", "update", "retire"], description: "retire: new_content with status: retired." },
+        new_content: { type: "string", description: "The full new file: YAML front matter and Markdown body." },
+        learned: { type: "string", description: "1-3 sentences, one paragraph: what you learned, including what you got wrong." },
+        incident_id: { type: "string", description: "incidents.db id of the incident this comes from." },
+        fingerprint: { type: "string", description: "The alert fingerprint of that incident (its raw payload must still be kept)." },
+        thread_ts: { type: "string", description: "The incident's Slack thread; the proposal is posted there." },
+        supersedes: { type: "string", description: "KB-<n> this revises (after feedback, a rejection or a stale proposal)." },
+      },
+      required: ["entry_id", "op", "new_content", "learned", "incident_id", "fingerprint", "thread_ts"],
+    },
+  },
+  {
+    name: "apply_runbook_update",
+    description: "Retry applying an approved proposal whose apply failed (status failed). Code applies approvals itself; never call this otherwise.",
+    inputSchema: {
+      type: "object" as const,
+      properties: { id: { type: "string", description: "KB-<n>" } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_runbook_proposals",
+    description: "List runbook proposals (newest revision of each), optionally by status: pending, approved, applied, rejected, expired, superseded, stale, failed, withdrawn.",
+    inputSchema: {
+      type: "object" as const,
+      properties: { status: { type: "string" } },
+    },
+  },
+  {
+    name: "withdraw_runbook_proposal",
+    description: "Withdraw a pending, stale or failed proposal, with the reason posted in its thread.",
+    inputSchema: {
+      type: "object" as const,
+      properties: { id: { type: "string", description: "KB-<n>" }, reason: { type: "string" } },
+      required: ["id", "reason"],
+    },
+  },
+];
+const KEDB_TOOL_NAMES = new Set(KEDB_TOOLS.map((tool) => tool.name));
+
+function toolResult(outcome: ToolOutcome) {
+  return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
+}
+
+async function callKedbTool(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
+  if (kedbLoop === undefined) return { text: `the KEDB learning loop is off: ${kedbUnavailable}`, isError: true };
+  switch (name) {
+    case "propose_runbook_update":
+      return kedbLoop.propose(args);
+    case "apply_runbook_update":
+      return kedbLoop.apply(args.id);
+    case "list_runbook_proposals":
+      return kedbLoop.list(args.status);
+    case "withdraw_runbook_proposal":
+      return kedbLoop.withdraw(args);
+    default:
+      return { text: `unknown tool: ${name}`, isError: true };
+  }
+}
+
 // -- MCP Channel Server -------------------------------------------------------
 
 // MUST render under 2048 characters. Claude Code truncates server instructions at that
@@ -330,7 +486,8 @@ fingerprint whose escalation is still waiting, it posts nothing and answers with
 Three message types arrive automatically:
 - type="escalation_timeout" final_agent_nag="false": nobody replied. Note it and stand by — do NOT re-investigate.
 - type="escalation_timeout" final_agent_nag="true": the team is offline. Say so ONCE, then ignore further nags; the channel drops to Slack-only automatically.
-- type="operator_reply": an operator replied in an escalation thread. Continue the conversation.`;
+- type="operator_reply": an operator replied in an escalation thread. Continue the conversation.
+type="runbook_*" (feedback, applied, rejected, stale, failed) is about your runbook proposal proposal_id: CLAUDE.md "Learning loop".`;
 
 // Fail loudly if the instructions overrun. The overrun is invisible from the source —
 // SRE_OPERATORS is interpolated, so the roster's length is what decides whether the last
@@ -464,6 +621,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["alert_fingerprint", "resolution_message"],
       },
     },
+    ...KEDB_TOOLS,
   ],
 }));
 
@@ -622,6 +780,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 
+  if (KEDB_TOOL_NAMES.has(name)) return toolResult(await callKedbTool(name, args ?? {}));
+
   // Never throw out of a tool call (CLAUDE_ERROR_PATTERNS.md §15)
   return {
     content: [{ type: "text" as const, text: `unknown tool: ${name}` }],
@@ -687,6 +847,10 @@ async function validateSlackSetup(): Promise<void> {
     throw new Error("auth.test returned no bot user ID");
   }
   BOT_USER_ID = auth.user_id;
+  if (!auth.url) {
+    throw new Error("auth.test returned no workspace URL");
+  }
+  SLACK_TEAM_URL = auth.url;
   console.error(
     `[slack-sre] authenticated as ${auth.user ?? "unknown"} (${BOT_USER_ID}) in team ${auth.team ?? "unknown"}`
   );
@@ -802,6 +966,21 @@ slackApp.message(async ({ message }) => {
     return;
   }
 
+  // Runbook proposals: an approver's "yes"/"no" is acted on here, in code, and never reaches
+  // the agent as a message; other replies in a proposal's thread reach it as feedback.
+  let runbookMeta: Record<string, string> | undefined;
+  if (kedbLoop !== undefined && channelId !== undefined) {
+    const outcome = await kedbLoop.onMessage({
+      user: senderId,
+      text,
+      channel: channelId,
+      ts: message.ts,
+      threadTs: parentThreadTs,
+    });
+    if (outcome.handled) return;
+    runbookMeta = outcome.meta;
+  }
+
   // Channel gating — the agent's context window is its lifeline. A channel message
   // is only forwarded when it is addressed to the agent. See message-gate.ts.
   const addressing = classifyAddressing({
@@ -885,6 +1064,7 @@ slackApp.message(async ({ message }) => {
   if (channelId) {
     meta.channel = channelId;
   }
+  if (runbookMeta) Object.assign(meta, runbookMeta);
 
   await mcp.notification({
     method: "notifications/claude/channel",
@@ -988,6 +1168,25 @@ async function nagSweep(): Promise<void> {
   // One write per sweep rather than one per escalation: the nag counters only have to
   // survive a restart, and a restart cannot land mid-loop.
   if (escalationsChanged) persistEscalations();
+}
+
+// Runbook proposals: 24 h reminder, 7 day expiry, and applying an approval that a restart
+// interrupted. Its own guard: a sweep can include a fetch, a lint and a push.
+let kedbSweeping = false;
+if (kedbLoop !== undefined) {
+  const loop = kedbLoop;
+  setInterval(() => {
+    if (kedbSweeping) return;
+    kedbSweeping = true;
+    loop
+      .sweep()
+      .catch((err: unknown) => {
+        console.error(`[slack-sre] KEDB sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        kedbSweeping = false;
+      });
+  }, KEDB_SWEEP_INTERVAL_MS);
 }
 
 setInterval(() => {

@@ -122,3 +122,36 @@ test("channels/signoz-webhook.ts refuses to send the Rundeck token over plain ht
   assert.match(result.stderr, /plain http only to a private IPv4 address/);
   assert.doesNotMatch(result.stderr, /listening on/);
 });
+
+// The Slack channel applies runbook (KEDB) changes on an approver's "yes", so who may approve
+// is required, with no default, and must be someone the channel listens to at all. Both checks
+// run before the channel touches Slack, so a fake token is enough to reach them.
+const SLACK_ENV = {
+  SLACK_BOT_TOKEN: "xoxb-test",
+  SLACK_APP_TOKEN: "xapp-test",
+  SRE_SLACK_CHANNEL: "C0TEST",
+  SRE_OPERATORS: "U054PDMV69X:Leo,U059X19MH8U:Adrien",
+  SRE_KEDB_APPROVERS: "U054PDMV69X",
+};
+
+function startSlack(env: Record<string, string | undefined>) {
+  return spawnSync(process.execPath, ["--import", "tsx", "channels/slack-sre.ts"], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+}
+
+test("channels/slack-sre.ts refuses to start without SRE_KEDB_APPROVERS", () => {
+  const result = startSlack({ ...SLACK_ENV, SRE_KEDB_APPROVERS: undefined });
+
+  assert.notEqual(result.status, 0, "channel must exit non-zero");
+  assert.match(result.stderr, /SRE_KEDB_APPROVERS is required/);
+});
+
+test("channels/slack-sre.ts refuses an approver who is not an operator", () => {
+  const result = startSlack({ ...SLACK_ENV, SRE_KEDB_APPROVERS: "U0NOTANOP" });
+
+  assert.notEqual(result.status, 0, "channel must exit non-zero");
+  assert.match(result.stderr, /U0NOTANOP is not in SRE_OPERATORS/);
+});
