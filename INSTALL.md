@@ -154,6 +154,59 @@ for PID in 81385797 70690979 75857737 75857792 75857874 75858254 77561397 775631
 done
 ```
 
+## 4b. Clone the KEDB (sre-kedb)
+
+The Known Error Database is its own GitLab project, `alias3/datastreaming/tooling/sre-kedb`,
+cloned outside `~/sre-agent` so that no deploy of the agent can overwrite it. The
+signoz-webhook channel reads it at `SRE_KEDB_DIR` (default `/home/sre-agent/kedb`) and matches
+every alert against it. If the checkout is missing or broken, alerts still go out, with
+`kedb_match=none`, and the channel logs `[kedb] unavailable` once.
+
+It has its **own key**, never `id_ed25519`. That key is a **write** deploy key on sre-kedb
+only, for the Slack approval loop (plan P2). Nothing on the VM writes to the checkout before P2
+lands, and `main` stays protected for Maintainers until then. The private key never leaves
+the VM.
+
+On the VM, as `sre-agent`:
+
+```bash
+ssh-keygen -t ed25519 -C "sre-agent@alien kedb" -f ~/.ssh/kedb_ed25519 -N ""
+
+# Its own host alias. IdentitiesOnly matters: if ssh also offered id_ed25519, GitLab would
+# authenticate as that read-only key and refuse sre-kedb.
+cat >> ~/.ssh/config <<'EOF'
+
+Host gitlab-kedb
+  HostName gitlab.com
+  User git
+  IdentityFile ~/.ssh/kedb_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+EOF
+
+cat ~/.ssh/kedb_ed25519.pub
+```
+
+From a machine with `glab` authenticated as an owner of the project, add the public key as
+a deploy key **on sre-kedb only** (project id 88247659):
+
+```bash
+PUB_KEY="$(ssh sre-agent@$SRE_IP 'cat ~/.ssh/kedb_ed25519.pub')"
+glab api -X POST "projects/88247659/deploy_keys" --raw-field "title=sre-agent-vm-kedb (write, sre-kedb only)" \
+  --raw-field "key=$PUB_KEY" --raw-field "can_push=true"
+```
+
+GitLab can take a minute to accept a new deploy key. Then, on the VM:
+
+```bash
+git ls-remote gitlab-kedb:alias3/datastreaming/tooling/sre-kedb.git   # lists refs/heads/main
+git clone gitlab-kedb:alias3/datastreaming/tooling/sre-kedb.git ~/kedb
+```
+
+Set `SRE_KEDB_DIR` in `.env` only for a different path. Until plan P2 adds the code that pulls
+approved entries, update the checkout after an sre-kedb MR merges with
+`git -C ~/kedb pull --ff-only`. The channel picks up the new revision on the next alert.
+
 ## 5. Create RBAC-scoped kubeconfigs
 
 The agent should NOT have cluster-admin access. Create a scoped ServiceAccount on each cluster.
