@@ -412,8 +412,21 @@ function collectStrings(value: unknown, into: string[]): void {
 }
 
 /**
+ * No raw payload is kept for the fingerprint: expired after 7 days, or older than the store
+ * itself (0.8.0). Distinct from a failure to read one, which is always a refusal: kedb-loop
+ * lets an approver's explicit request through this one case, and only this one.
+ */
+export class NoRetainedPayloadError extends Error {
+  constructor(readonly fingerprint: string) {
+    super(`no raw payload is kept for fingerprint ${fingerprint} (kept 7 days), so the injection check cannot run`);
+    this.name = "NoRetainedPayloadError";
+  }
+}
+
+/**
  * Every string in the payloads signoz-webhook kept for `fingerprint` (alert-payload-store.ts).
- * @throws when none is kept: the check cannot run, so the proposal is refused (fail closed).
+ * @throws NoRetainedPayloadError when none is kept: the check cannot run (fail closed).
+ * @throws on any other read failure.
  */
 export async function retainedPayloadStrings(payloadDir: string, fingerprint: string, timeoutMs: number): Promise<string[]> {
   const dir = join(payloadDir, fingerprintDir(fingerprint));
@@ -426,7 +439,7 @@ export async function retainedPayloadStrings(payloadDir: string, fingerprint: st
       else throw err;
     }
     if (names.length === 0) {
-      throw new Error(`no raw payload is kept for fingerprint ${fingerprint} (kept 7 days), so the injection check cannot run`);
+      throw new NoRetainedPayloadError(fingerprint);
     }
     const strings: string[] = [];
     for (const name of names) {

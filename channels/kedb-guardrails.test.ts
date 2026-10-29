@@ -14,6 +14,7 @@ import {
   learnedProblems,
   loadSentinelAllowlist,
   machineFieldProblems,
+  NoRetainedPayloadError,
   parseCandidate,
   retainedPayloadStrings,
   securityProblems,
@@ -211,5 +212,5 @@ test("the payload check reads every kept payload of the fingerprint, and fails c
   writeFileSync(join(dir, "fp1", "1-000-firing.json"), JSON.stringify({ alert: { labels: { rule: "R" }, annotations: { description: "desc text" } } }));
   const strings = await retainedPayloadStrings(dir, "fp1", 5000);
   assert.ok(strings.includes("desc text") && strings.includes("R"));
-  await assert.rejects(retainedPayloadStrings(dir, "fp2", 5000), /no raw payload is kept/);
+  await assert.rejects(retainedPayloadStrings(dir, "fp2", 5000), (err: unknown) => err instanceof NoRetainedPayloadError && /no raw payload is kept for fingerprint fp2/.test(err.message));
 });

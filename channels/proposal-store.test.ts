@@ -88,3 +88,21 @@ test("the file is written atomically, with no temp file left behind", () => {
   assert.equal(existsSync(`${path}.tmp`), false);
   assert.equal(JSON.parse(readFileSync(path, "utf8")).proposals.length, 1);
 });
+
+test("a record written before payload_gap existed loads with payload_gap null; a gap round-trips", () => {
+  const path = tempPath();
+  createProposalStore({ path }).allocateId(); // creates the directory
+  const { payload_gap: _absentBefore091, ...before091 } = sampleProposal();
+  writeFileSync(path, JSON.stringify({ version: 1, next_number: 3, proposals: [before091] }));
+  const store = createProposalStore({ path });
+  assert.equal(store.get("KB-1")?.payload_gap, null);
+
+  const gap = {
+    fingerprint: "2ecf15e3f8af5ccc",
+    requested_by: { user: "U054PDMV69X", name: "Leo", ts: "1793201690.000100", permalink: "https://alien.slack.com/archives/C09MWNB6WL8/p1793201690000100" },
+  };
+  store.put(sampleProposal({ id: "KB-2", payload_gap: gap }));
+  assert.deepEqual(createProposalStore({ path }).get("KB-2")?.payload_gap, gap);
+  // A fingerprint that would need escaping in a commit trailer is never stored as a gap
+  assert.throws(() => store.put(sampleProposal({ id: "KB-2", payload_gap: { ...gap, fingerprint: "fp\nInjected: x" } })), ProposalStoreError);
+});

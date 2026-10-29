@@ -240,6 +240,14 @@ What the loop writes on the VM: `data/kedb-proposals.json` (the proposals, writt
 if it is ever unreadable the loop turns itself off and the briefing says why, rather than
 reusing `KB-<n>` numbers) and `data/kedb-stage/` (scratch copies for diffs and lint runs).
 
+Since 0.9.1 the loop also reads `data/incidents.db` (read-only, through `sqlite3`): a
+proposal's `fingerprint` must be the one its incident was logged with. A proposal whose
+fingerprint has no kept raw payload (older than 7 days, or than 0.8.0) is refused unless an
+approver asked for it in its thread; it is then posted and committed with the statement that
+the injection check did not run (`Injection-Check:` trailer). sre-kedb's verify-approvals
+passes such a commit with or without its Injection-Check support; with it, it also proves from
+Slack that an approver asked in the proposal's thread and that the post showed the warning.
+
 ## 5. Create RBAC-scoped kubeconfigs
 
 The agent should NOT have cluster-admin access. Create a scoped ServiceAccount on each cluster.
@@ -342,6 +350,8 @@ cp .env.example .env
 # JIRA_BASE_URL / JIRA_USER_EMAIL / JIRA_API_TOKEN: an Atlassian API token for an account
 #   that can create and comment on SDS issues (the Trivy channel files one ticket per image)
 # TRIVY_DIGEST_HOUR_UTC: hour of the daily Trivy digest, 0-23 (default 7)
+# ACK_DELAY_MS / OPERATOR_FOLLOWUP_MS: when the channel posts "On it" for a quiet agent (default
+#   20000), and when after that it says there is still no answer (default 300000); see .env.example
 # RUNDECK_URL / RUNDECK_API_TOKEN: VM-A's Rundeck over WireGuard and the `sre-agent` token
 #   (required by the SigNoz channel; see "Sentinel remediation" below)
 ```

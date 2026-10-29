@@ -12,6 +12,7 @@ by the main agent for manual logging.
   --status "firing|resolved" \
   --cluster "kubectl-context" \
   --service "service-name" \
+  --fingerprint "alert-fingerprint" \
   --verdict "real|noise|false_positive|known_issue|flapping" \
   --action "auto_fixed|escalated|ignored|monitoring" \
   --cause "Brief root cause description"

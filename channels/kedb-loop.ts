@@ -1,11 +1,21 @@
 // The KEDB learning loop (plan §4): the agent proposes a runbook change in Slack, an approver
 // answers, and code (never the agent) commits it to sre-kedb.
 //
-//   propose  → checks (schema, lint, guardrails §5b-§5d), posts the proposal, stores it
+//   propose  → checks (incident binding, schema, lint, guardrails §5b-§5d), posts the
+//              proposal, stores it
 //   approve  → a reply classified by kedb-approval.ts; the approval is bound to the content
 //              hash and to the revision's post
 //   apply    → fetch, reset, base-blob check, write, lint, commit with trailers, push
 //   sweep    → 24 h reminder, 7 day expiry, and resuming an approval a restart interrupted
+//
+// The incident binding: the fingerprint must be the one incidents.db logged for incident_id, so
+// a refusal about one incident can never be passed with another incident's alert.
+//
+// The injection check (§5d) fails closed when no raw payload is kept for the fingerprint, with
+// one exception: an approver asked for the proposal, in its thread. That request is taken from
+// the Slack event (noteRequest: the sender's user id, the channel, the thread), never from the
+// agent, so the agent cannot claim it. The proposal post and the commit then say the check did
+// not run (Injection-Check trailer), and sre-kedb's verify-approvals checks both from Slack.
 //
 // Every entry point returns an outcome and never throws, so neither a tool call nor the Slack
 // handler can be aborted by it (CLAUDE_ERROR_PATTERNS.md §15). Each failure is reported where
@@ -15,6 +25,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { classifyReply, compareSlackTs, slackPermalink, type InboundMessage } from "./kedb-approval.js";
 import type { KedbGit } from "./kedb-git.js";
+import type { IncidentLookup, IncidentRecord } from "./incident-lookup.js";
 import {
   addedLines,
   autoFixProblems,
@@ -24,6 +35,7 @@ import {
   learnedProblems,
   loadSentinelAllowlist,
   machineFieldProblems,
+  NoRetainedPayloadError,
   parseCandidate,
   retainedPayloadStrings,
   securityProblems,
@@ -33,7 +45,7 @@ import {
   type UrlPolicy,
 } from "./kedb-guardrails.js";
 import { ENTRY_ID, KEDB_MAX_ENTRY_BYTES } from "./kedb-index.js";
-import { OPEN_STATUSES, PROPOSAL_ID, SLACK_TS, type Proposal, type ProposalStore } from "./proposal-store.js";
+import { GAP_FINGERPRINT, OPEN_STATUSES, PROPOSAL_ID, SLACK_TS, type Proposal, type ProposalStore } from "./proposal-store.js";
 import { escapeSlackText } from "./slack-text.js";
 
 /** A diff longer than this is refused: Leo must always be able to read all of it. */
@@ -44,6 +56,16 @@ export const MAX_DIFF_CHARS = 15_000;
 export const MAX_OPEN_PROPOSALS = 3;
 export const REMINDER_AFTER_MS = 24 * 60 * 60 * 1000;
 export const EXPIRY_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * An approver's message that asks for a runbook proposal. Deliberately loose about the wording
+ * ("propose the KB-1 Falco downgrade please", "can you write a runbook entry for this"): what
+ * makes it a request is who sent it and where, both from Slack. sre-kedb ci/verify-approvals.ts
+ * REQUEST_RE re-checks the message; keep the two equal.
+ */
+export const REQUEST_RE = /\b(?:propos(?:e|al|als|ing)|runbook|kedb|kb-\d+)\b/i;
+/** How long an approver's request lets a payload-less proposal through in its thread. */
+export const REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface ToolOutcome {
   text: string;
@@ -70,6 +92,8 @@ export interface KedbLoopOptions {
   payloadDir: string;
   /** Read-only sentinel clone, for the auto_fix allowlist. */
   sentinelDir: string;
+  /** incidents.db: a proposal's fingerprint must be its incident's. */
+  incidents: IncidentLookup;
   urlPolicy: UrlPolicy;
   /** Bound on local file reads (payloads, sentinel catalog). */
   readTimeoutMs: number;
@@ -92,6 +116,12 @@ export interface KedbLoop {
   list(status: unknown): ToolOutcome;
   withdraw(args: unknown): Promise<ToolOutcome>;
   onMessage(message: InboundMessage): Promise<MessageOutcome>;
+  /**
+   * An operator's message that reached the agent. When an approver asks for a proposal in it,
+   * the request is remembered for its thread (REQUEST_TTL_MS). Call it only with messages
+   * straight from Slack: the user id is what makes it a request.
+   */
+  noteRequest(message: InboundMessage): void;
   sweep(): Promise<void>;
 }
 
@@ -158,12 +188,21 @@ function describeChange(op: Proposal["op"], entryId: string, before: CandidateEn
   return parts.join("; ");
 }
 
+/** The proposal post's line for a payload gap. sre-kedb verify-approvals looks for its words. */
+export function payloadGapNotice(gap: NonNullable<Proposal["payload_gap"]>): string {
+  return (
+    `:warning: *injection check NOT run: no raw payload kept for ${gap.fingerprint}*. This change was not compared ` +
+    `with the alert's own text; read the diff as untrusted. Proposed because ${escapeSlackText(gap.requested_by.name)} asked: ${gap.requested_by.permalink}`
+  );
+}
+
 export function formatProposalPost(p: Proposal, change: string): string {
   const lines = [
     `:books: *Runbook proposal ${p.id}* (rev ${p.rev}): incident #${p.incident_id}, entry \`${p.entry_id}\``,
     `*What I learned:* ${escapeSlackText(p.learned)}`,
     `*Change:* ${change}`,
   ];
+  if (p.payload_gap !== null) lines.push(payloadGapNotice(p.payload_gap));
   if (p.downgrade !== null) {
     lines.push(
       `:warning: *SEVERITY DOWNGRADE:* ${p.downgrade.from ?? "none"} → ${p.downgrade.to ?? "none"} (${escapeSlackText(p.downgrade.scope.join("; "))}). ` +
@@ -191,6 +230,10 @@ export function commitMessage(p: Proposal, approverName: string): string {
     `Approved-by: ${approverName} ${p.approval.user} ${p.approval.permalink}`,
   ];
   if (p.downgrade !== null) trailers.push(`Severity-Downgrade: ${p.downgrade.from ?? "none"}→${p.downgrade.to ?? "none"}`);
+  if (p.payload_gap !== null) {
+    const by = p.payload_gap.requested_by;
+    trailers.push(`Injection-Check: not-run; no raw payload kept for ${p.payload_gap.fingerprint}; requested-by ${by.name} ${by.user} ${by.permalink}`);
+  }
   trailers.push(`Content-SHA256: ${p.content_sha256}`);
   return `kedb(${p.entry_id}): ${verb} (${p.id} rev ${p.rev})\n\n${p.learned}\n\n${trailers.join("\n")}\n`;
 }
@@ -198,6 +241,8 @@ export function commitMessage(p: Proposal, approverName: string): string {
 export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
   const { store, git, poster, approvers, channel, now = Date.now, log = (line) => console.error(line) } = options;
   const applying = new Set<string>();
+  /** Thread ts → the latest approver request in it (team channel only). */
+  const requests = new Map<string, { request: NonNullable<Proposal["payload_gap"]>["requested_by"]; at: number }>();
 
   function update(p: Proposal, changes: Partial<Proposal>): Proposal {
     const next = { ...p, ...changes, updated_at: now() };
@@ -229,9 +274,44 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     baseBlob: string | null;
     diff: string;
     downgrade: Downgrade | null;
+    payloadGap: Proposal["payload_gap"];
   }
 
-  async function check(args: z.infer<typeof ProposeArgs>): Promise<Checked | string[]> {
+  /**
+   * Null when the fingerprint is the one incidents.db logged for the incident, else why not.
+   * Never echoes what incidents.db holds: an alert's fingerprint is its sender's text.
+   */
+  async function incidentProblem(args: z.infer<typeof ProposeArgs>): Promise<string | null> {
+    let incident: IncidentRecord | null;
+    try {
+      incident = await options.incidents.find(args.incident_id);
+    } catch (err) {
+      return `cannot check incident #${args.incident_id} against incidents.db: ${message(err)}`;
+    }
+    if (incident === null) return `incident #${args.incident_id} does not exist in incidents.db`;
+    if (incident.fingerprint === null) {
+      return `incident #${args.incident_id} was logged without a fingerprint, so ${args.fingerprint} cannot be shown to be its alert`;
+    }
+    if (incident.fingerprint !== args.fingerprint) {
+      return (
+        `fingerprint ${args.fingerprint} is not the one incident #${args.incident_id} was logged with. A proposal is checked ` +
+        `against its own incident's alert: never pass another incident's fingerprint or id to get past a check`
+      );
+    }
+    return null;
+  }
+
+  /** The approver's request that lets a payload-less proposal in this thread through, if any. */
+  function requestFor(args: z.infer<typeof ProposeArgs>, superseded: Proposal | undefined): NonNullable<Proposal["payload_gap"]>["requested_by"] | null {
+    const live = requests.get(args.thread_ts);
+    if (live !== undefined && now() - live.at <= REQUEST_TTL_MS) return live.request;
+    // A revision after feedback carries the request its first revision was posted under.
+    if (superseded === undefined || superseded.payload_gap === null) return null;
+    const gap = superseded.payload_gap;
+    return superseded.thread_ts === args.thread_ts && gap.fingerprint === args.fingerprint ? gap.requested_by : null;
+  }
+
+  async function check(args: z.infer<typeof ProposeArgs>, superseded: Proposal | undefined): Promise<Checked | string[]> {
     const path = entryPath(args.entry_id);
     let after: CandidateEntry;
     try {
@@ -285,10 +365,24 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
       if (diff.length > MAX_DIFF_CHARS) return [`the diff is ${diff.length} characters; at most ${MAX_DIFF_CHARS}. Split it.`];
 
       let payload: string[];
+      let payloadGap: Proposal["payload_gap"] = null;
       try {
         payload = await retainedPayloadStrings(options.payloadDir, args.fingerprint, options.readTimeoutMs);
       } catch (err) {
-        return [message(err)];
+        if (!(err instanceof NoRetainedPayloadError)) return [message(err)];
+        const request = requestFor(args, superseded);
+        if (request === null) {
+          return [
+            `${err.message}. Only an approver (${[...approvers.values()].join(" or ")}) asking for this proposal in thread ` +
+              `${args.thread_ts} lets it through without the check. Report this refusal; never retry with another incident's fingerprint`,
+          ];
+        }
+        if (!GAP_FINGERPRINT.test(args.fingerprint)) {
+          return [`${err.message}, and fingerprint ${JSON.stringify(args.fingerprint.slice(0, 80))} cannot be written into the commit that would record it`];
+        }
+        // Copy check vacuous, links still checked. The post and the commit say it did not run.
+        payload = [];
+        payloadGap = { fingerprint: args.fingerprint, requested_by: request };
       }
       const injected = injectionProblems(addedLines(diff), evidenceLines(args.new_content), payload, options.urlPolicy);
       if (injected.length > 0) return injected;
@@ -296,7 +390,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
       const linted = await git.lintCandidate(path, args.new_content);
       if (!linted.ok) return [`the sre-kedb lint rejects it:\n${linted.output}`];
 
-      return { before, after, baseBlob, diff, downgrade: detectDowngrade(before?.fm ?? null, after.fm, family?.fm ?? null) };
+      return { before, after, baseBlob, diff, downgrade: detectDowngrade(before?.fm ?? null, after.fm, family?.fm ?? null), payloadGap };
     });
   }
 
@@ -323,9 +417,12 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     if (sameIncident) return refuse(`refused: ${sameIncident.id} is already open for incident #${args.incident_id}; one proposal per incident`);
     if (open.length >= MAX_OPEN_PROPOSALS) return refuse(`refused: ${open.length} proposals are already open (${open.map((p) => p.id).join(", ")}); at most ${MAX_OPEN_PROPOSALS}`);
 
+    const unbound = await incidentProblem(args);
+    if (unbound !== null) return refuse(`refused: ${unbound}`);
+
     let checked: Checked | string[];
     try {
-      checked = await check(args);
+      checked = await check(args, superseded);
     } catch (err) {
       return refuse(`could not check the proposal: ${message(err)}`);
     }
@@ -354,6 +451,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
         post_permalink: null,
         posted_at: null,
         downgrade: checked.downgrade,
+        payload_gap: checked.payloadGap,
         status: "pending",
         status_reason: null,
         approval: null,
@@ -388,11 +486,16 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     } catch (err) {
       return refuse(`${record.id} was posted but could not be stored (${message(err)}); an approval of it cannot be applied. Withdraw it.`);
     }
-    log(`[kedb-loop] posted ${record.id} rev ${record.rev} for ${record.entry_id}${record.downgrade ? " (downgrade)" : ""}`);
+    const gap = record.payload_gap;
+    log(
+      `[kedb-loop] posted ${record.id} rev ${record.rev} for ${record.entry_id}${record.downgrade ? " (downgrade)" : ""}` +
+        (gap ? ` WITHOUT the injection check (no payload for ${gap.fingerprint}; requested by ${gap.requested_by.name} ${gap.requested_by.user})` : "")
+    );
     return {
       text:
         `posted ${record.id} rev ${record.rev} in thread ${args.thread_ts}. Code applies it when ${[...approvers.values()].join(" or ")} answers ` +
-        `${record.downgrade ? `"yes downgrade ${record.id}"` : '"yes"'}; you will get type="runbook_applied" or "runbook_rejected".`,
+        `${record.downgrade ? `"yes downgrade ${record.id}"` : '"yes"'}; you will get type="runbook_applied" or "runbook_rejected".` +
+        (gap ? ` The injection check did NOT run (no raw payload kept for ${gap.fingerprint}); ${gap.requested_by.name} asked for it, and the post says so.` : ""),
       isError: false,
     };
   }
@@ -526,6 +629,9 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
   async function sweep(): Promise<void> {
     const at = now();
+    for (const [thread, { at: requestedAt }] of requests) {
+      if (at - requestedAt > REQUEST_TTL_MS) requests.delete(thread);
+    }
     for (const p of store.latest()) {
       try {
         if (p.status === "approved" && !applying.has(p.id)) {
@@ -604,6 +710,17 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
         log(`[kedb-loop] handling a reply failed: ${message(err)}`);
         return { handled: false };
       }
+    },
+
+    noteRequest(msg) {
+      const name = approvers.get(msg.user);
+      if (name === undefined || msg.channel !== channel || !REQUEST_RE.test(msg.text)) return;
+      const thread = msg.threadTs ?? msg.ts;
+      requests.set(thread, {
+        request: { user: msg.user, name, ts: msg.ts, permalink: slackPermalink(options.teamUrl(), msg.channel, msg.ts, msg.threadTs) },
+        at: now(),
+      });
+      log(`[kedb-loop] ${name} asked for a runbook proposal in thread ${thread}`);
     },
 
     sweep,
