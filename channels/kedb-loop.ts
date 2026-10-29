@@ -23,7 +23,7 @@
 
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { classifyReply, compareSlackTs, slackPermalink, type InboundMessage } from "./kedb-approval.js";
+import { classifyReply, compareSlackTs, lastPostTs, slackPermalink, type InboundMessage } from "./kedb-approval.js";
 import type { KedbGit } from "./kedb-git.js";
 import type { IncidentLookup, IncidentRecord } from "./incident-lookup.js";
 import {
@@ -50,8 +50,18 @@ import { escapeSlackText } from "./slack-text.js";
 
 /** A diff longer than this is refused: Leo must always be able to read all of it. */
 export const MAX_DIFF_CHANGED_LINES = 80;
-/** And no diff may be longer than this many characters, so the post fits one Slack message. */
+/** And no diff may be longer than this many characters: at most five diff messages. */
 export const MAX_DIFF_CHARS = 15_000;
+/**
+ * The longest message the loop posts. Slack splits a message whose text is longer than about
+ * 4000 characters into several and answers chat.postMessage with the ts of the LAST one. On
+ * 2026-10-29 KB-1 rev 1 (5758 characters) became a 3975-character header and a 1783-character
+ * tail; the loop recorded the tail as the proposal post, the commit's Proposal-Post linked it,
+ * and sre-kedb verify-approvals, finding no header and no downgrade warning in it, raised a
+ * false "KEDB Unapproved Commit". So no message here comes near Slack's limit: the header is
+ * one message and the diff follows in parts.
+ */
+export const MAX_SLACK_POST_CHARS = 3_500;
 /** Proposals that may be open (pending, approved, failed or stale) at once. */
 export const MAX_OPEN_PROPOSALS = 3;
 export const REMINDER_AFTER_MS = 24 * 60 * 60 * 1000;
@@ -78,6 +88,11 @@ export interface SlackPost {
 
 export interface KedbLoopOptions {
   store: ProposalStore;
+  /**
+   * The channel answered in this thread itself (an approval taken, a rejection, an applied,
+   * stale or failed proposal): an operator waiting there has had an answer.
+   */
+  answered(threadTs: string): void;
   git: KedbGit;
   poster: SlackPost;
   /** Pushes an event into the Claude session. Rejections are logged, never thrown. */
@@ -166,11 +181,46 @@ function changedLines(diff: string): number {
  * The diff as it shows in a Slack code block: &, < and > escaped (Slack's rule), and a ```
  * inside it, which would close the block early, shown as ''' with a note saying so.
  */
-export function slackDiffBlock(diff: string): string {
-  const fenced = diff.includes("```");
-  const shown = escapeSlackText(diff.replace(/```/g, "'''")).trimEnd();
-  const note = fenced ? "\n_(Code fences ``` in the entry show as ''' in this preview.)_" : "";
-  return "```\n" + shown + "\n```" + note;
+/** A diff line as shown in Slack: escaped, and with code fences that would end the block defused. */
+function shownDiffLine(line: string): string {
+  return escapeSlackText(line.replace(/```/g, "'''"));
+}
+
+/** The lines of a diff block's body, none longer than `max` characters; a longer line is cut into pieces. */
+function diffLinePieces(diff: string, max: number): string[] {
+  const pieces: string[] = [];
+  for (const line of diff.trimEnd().split("\n").map(shownDiffLine)) {
+    if (line.length === 0) pieces.push(line);
+    for (let at = 0; at < line.length; at += max) pieces.push(line.slice(at, at + max));
+  }
+  return pieces;
+}
+
+/**
+ * The diff of a proposal as Slack messages, each at most MAX_SLACK_POST_CHARS: a title naming
+ * the proposal and the part, then a code block. A diff line too long for one message is cut
+ * across messages, never dropped: Leo must be able to read all of it.
+ */
+export function formatDiffPosts(p: Pick<Proposal, "id" | "rev" | "diff">): string[] {
+  const note = p.diff.includes("```") ? "\n_(Code fences ``` in the entry show as ''' in this preview.)_" : "";
+  // Room for the title (with up to two-digit part numbers), the fences and the note
+  const title = (part: number, parts: number) => `*${p.id} rev ${p.rev}, diff part ${part}/${parts}*`;
+  const overhead = title(99, 99).length + "\n```\n".length + "\n```".length + note.length;
+  const budget = MAX_SLACK_POST_CHARS - overhead;
+  const bodies: string[] = [];
+  let current: string[] = [];
+  let size = 0;
+  for (const piece of diffLinePieces(p.diff, budget)) {
+    if (current.length > 0 && size + 1 + piece.length > budget) {
+      bodies.push(current.join("\n"));
+      current = [];
+      size = 0;
+    }
+    size += (current.length === 0 ? 0 : 1) + piece.length;
+    current.push(piece);
+  }
+  bodies.push(current.join("\n"));
+  return bodies.map((body, i) => `${title(i + 1, bodies.length)}\n\`\`\`\n${body}\n\`\`\`${i === bodies.length - 1 ? note : ""}`);
 }
 
 function causeIds(entry: CandidateEntry | null): string[] {
@@ -196,7 +246,13 @@ export function payloadGapNotice(gap: NonNullable<Proposal["payload_gap"]>): str
   );
 }
 
-export function formatProposalPost(p: Proposal, change: string): string {
+/**
+ * The proposal's header: everything an approver and sre-kedb verify-approvals check, in one
+ * message (id and rev, the warnings, the Content-SHA256), with the diff in the messages that
+ * follow it (formatDiffPosts). The reply phrases are bold, not code: either can be copied, as
+ * Slack formatting around a reply is ignored (normalizeReplyText), but bold reads as words.
+ */
+export function formatProposalPost(p: Proposal, change: string, diffParts: number): string {
   const lines = [
     `:books: *Runbook proposal ${p.id}* (rev ${p.rev}): incident #${p.incident_id}, entry \`${p.entry_id}\``,
     `*What I learned:* ${escapeSlackText(p.learned)}`,
@@ -206,15 +262,15 @@ export function formatProposalPost(p: Proposal, change: string): string {
   if (p.downgrade !== null) {
     lines.push(
       `:warning: *SEVERITY DOWNGRADE:* ${p.downgrade.from ?? "none"} → ${p.downgrade.to ?? "none"} (${escapeSlackText(p.downgrade.scope.join("; "))}). ` +
-        `To accept, reply exactly \`yes downgrade ${p.id}\`.`
+        `To accept, reply exactly *yes downgrade ${p.id}*.`
     );
   }
-  lines.push(slackDiffBlock(p.diff));
   lines.push(`Content-SHA256: \`${p.content_sha256}\``);
+  lines.push(`The diff follows in ${diffParts} message${diffParts === 1 ? "" : "s"} below.`);
   lines.push(
     p.downgrade === null
-      ? `Reply \`yes\` to apply, \`no\` to drop, or tell me what to change.`
-      : `Reply \`yes downgrade ${p.id}\` to apply, \`no\` to drop, or tell me what to change.`
+      ? `Reply *yes* to apply, *no* to drop, or tell me what to change.`
+      : `Reply *yes downgrade ${p.id}* to apply, *no* to drop, or tell me what to change.`
   );
   return lines.join("\n");
 }
@@ -250,12 +306,24 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     return next;
   }
 
-  async function postInThread(p: Proposal, text: string): Promise<void> {
+  /** Posts in the proposal's thread; failures are logged. True when it was posted. */
+  async function postInThread(p: Proposal, text: string): Promise<boolean> {
     try {
       await poster.post({ channel: p.slack_channel, thread_ts: p.thread_ts, text });
+      return true;
     } catch (err) {
       log(`[kedb-loop] could not post in the thread of ${p.id}: ${message(err)}`);
+      return false;
     }
+  }
+
+  /**
+   * Posts the outcome of something an operator is waiting on in the proposal's thread (applied,
+   * stale, failed, withdrawn). Posted, it is the answer there: the "On it" and follow-up timers
+   * of that thread stop, as they would for the agent's own reply.
+   */
+  async function answerInThread(p: Proposal, text: string): Promise<void> {
+    if (await postInThread(p, text)) options.answered(p.thread_ts);
   }
 
   async function notify(content: string, meta: Record<string, string>): Promise<void> {
@@ -430,6 +498,8 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
     const created = now();
     let record: Proposal;
+    let header: string;
+    let diffPosts: string[];
     try {
       const id = superseded?.id ?? store.allocateId();
       record = {
@@ -449,6 +519,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
         thread_permalink: slackPermalink(options.teamUrl(), channel, args.thread_ts),
         post_ts: null,
         post_permalink: null,
+        diff_post_ts: [],
         posted_at: null,
         downgrade: checked.downgrade,
         payload_gap: checked.payloadGap,
@@ -460,29 +531,41 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
         updated_at: created,
         reminded_at: null,
       };
+      diffPosts = formatDiffPosts(record);
+      header = formatProposalPost(record, describeChange(args.op, args.entry_id, checked.before, checked.after), diffPosts.length);
+      if (header.length > MAX_SLACK_POST_CHARS) {
+        return refuse(`refused: the proposal's header is ${header.length} characters; at most ${MAX_SLACK_POST_CHARS}. Shorten learned.`);
+      }
       store.put(record);
       if (superseded !== undefined) update(superseded, { status: "superseded", status_reason: `replaced by rev ${record.rev}` });
     } catch (err) {
       return refuse(`could not store the proposal, nothing was posted: ${message(err)}`);
     }
 
-    let postTs: string;
+    // The header first, then the diff in order, each its own message. A failure part-way leaves
+    // a proposal nobody can see whole: it is withdrawn, and the thread is told.
+    const posted: string[] = [];
     try {
-      postTs = await poster.post({
-        channel,
-        thread_ts: args.thread_ts,
-        text: formatProposalPost(record, describeChange(args.op, args.entry_id, checked.before, checked.after)),
-      });
+      for (const text of [header, ...diffPosts]) posted.push(await poster.post({ channel, thread_ts: args.thread_ts, text }));
     } catch (err) {
       try {
         update(record, { status: "withdrawn", status_reason: `the proposal post failed: ${message(err)}` });
       } catch (storeErr) {
         log(`[kedb-loop] could not withdraw ${record.id} after its post failed: ${message(storeErr)}`);
       }
-      return refuse(`${record.id} rev ${record.rev} was not posted (${message(err)}); it is withdrawn. Propose again.`);
+      if (posted.length > 0) {
+        await postInThread(record, `:leftwards_arrow_with_hook: ${record.id} rev ${record.rev} is withdrawn: only ${posted.length} of its ${1 + diffPosts.length} messages could be posted. Do not approve it.`);
+      }
+      return refuse(`${record.id} rev ${record.rev} was not posted in full (${message(err)}); it is withdrawn. Propose again.`);
     }
+    const [postTs, ...diffTs] = posted;
     try {
-      update(record, { post_ts: postTs, post_permalink: slackPermalink(options.teamUrl(), channel, postTs, args.thread_ts), posted_at: now() });
+      update(record, {
+        post_ts: postTs,
+        post_permalink: slackPermalink(options.teamUrl(), channel, postTs, args.thread_ts),
+        diff_post_ts: diffTs,
+        posted_at: now(),
+      });
     } catch (err) {
       return refuse(`${record.id} was posted but could not be stored (${message(err)}); an approval of it cannot be applied. Withdraw it.`);
     }
@@ -508,7 +591,8 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
     if (p.status !== "approved" && p.status !== "failed") return refuse(`${id} rev ${p.rev} is ${p.status}; only an approved (or failed) proposal is applied`);
     const approval = p.approval;
     if (approval === null || !approvers.has(approval.user)) return refuse(`${id} has no approval from ${[...approvers.values()].join(" or ")}`);
-    if (p.post_ts === null || compareSlackTs(approval.ts, p.post_ts) <= 0) return refuse(`${id}'s approval does not postdate its rev ${p.rev} post`);
+    const postedUntil = lastPostTs(p);
+    if (postedUntil === null || compareSlackTs(approval.ts, postedUntil) <= 0) return refuse(`${id}'s approval does not postdate its rev ${p.rev} post`);
     if (sha256(p.content) !== p.content_sha256) return refuse(`${id}'s content does not match its approved hash; refusing`);
     if (applying.has(id)) return refuse(`${id} is being applied right now`);
 
@@ -527,7 +611,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
       if (outcome.kind === "stale") {
         update(p, { status: "stale", status_reason: "main changed since the proposal" });
-        await postInThread(p, `:arrows_counterclockwise: ${p.id} not applied: \`${p.entry_id}\` changed on main since I proposed it. I will re-propose it against the new version.`);
+        await answerInThread(p, `:arrows_counterclockwise: ${p.id} not applied: \`${p.entry_id}\` changed on main since I proposed it. I will re-propose it against the new version.`);
         await notify(`${p.id} rev ${p.rev} is stale: ${p.entry_id} changed on main. Re-propose against the current entry with supersedes "${p.id}".`, {
           type: "runbook_stale",
           proposal_id: p.id,
@@ -539,7 +623,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
       update(p, { status: "applied", status_reason: null, commit_sha: outcome.sha });
       const url = options.commitUrl(outcome.sha);
-      await postInThread(p, `:white_check_mark: Applied ${p.id}: ${url}`);
+      await answerInThread(p, `:white_check_mark: Applied ${p.id}: ${url}`);
       await notify(`${p.id} rev ${p.rev} is applied to ${p.entry_id}: ${url}`, {
         type: "runbook_applied",
         proposal_id: p.id,
@@ -556,7 +640,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
       } catch (storeErr) {
         log(`[kedb-loop] could not record the failure of ${p.id}: ${message(storeErr)}`);
       }
-      await postInThread(p, `:x: Could not apply ${p.id}: ${escapeSlackText(reason.slice(0, 500))}. Nothing changed on main; the agent can retry with apply_runbook_update.`);
+      await answerInThread(p, `:x: Could not apply ${p.id}: ${escapeSlackText(reason.slice(0, 500))}. Nothing changed on main; the agent can retry with apply_runbook_update.`);
       await notify(`${p.id} rev ${p.rev} failed to apply: ${reason}. Retry with apply_runbook_update once the cause is fixed.`, {
         type: "runbook_failed",
         proposal_id: p.id,
@@ -573,7 +657,17 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
 
   async function onMessage(msg: InboundMessage): Promise<MessageOutcome> {
     const meaning = classifyReply(msg, { approvers, proposals: store.latest() });
-    const reply = (text: string) => poster.post({ channel: msg.channel, thread_ts: msg.threadTs ?? msg.ts, text }).catch((err: unknown) => log(`[kedb-loop] could not answer in ${msg.threadTs ?? msg.ts}: ${message(err)}`));
+    const thread = msg.threadTs ?? msg.ts;
+    // The channel's own answer in the thread is the answer there (see answerInThread)
+    const reply = async (text: string): Promise<void> => {
+      try {
+        await poster.post({ channel: msg.channel, thread_ts: thread, text });
+      } catch (err) {
+        log(`[kedb-loop] could not answer in ${thread}: ${message(err)}`);
+        return;
+      }
+      options.answered(thread);
+    };
 
     switch (meaning.kind) {
       case "none":
@@ -647,7 +741,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
         } else if (p.status === "pending" && p.reminded_at === null && age >= REMINDER_AFTER_MS) {
           update(p, { reminded_at: at });
           const phrase = p.downgrade ? `yes downgrade ${p.id}` : `yes ${p.id}`;
-          await postInThread(p, `:hourglass: ${p.id} (rev ${p.rev}) is still waiting for an answer: \`${phrase}\` applies it, \`no ${p.id}\` drops it. It expires in 6 days.`);
+          await postInThread(p, `:hourglass: ${p.id} (rev ${p.rev}) is still waiting for an answer: *${phrase}* applies it, *no ${p.id}* drops it. It expires in 6 days.`);
         }
       } catch (err) {
         log(`[kedb-loop] sweep of ${p.id} failed: ${message(err)}`);
@@ -699,7 +793,7 @@ export function createKedbLoop(options: KedbLoopOptions): KedbLoop {
       } catch (err) {
         return refuse(`could not withdraw ${p.id}: ${message(err)}`);
       }
-      await postInThread(p, `:leftwards_arrow_with_hook: ${p.id} withdrawn by the agent: ${escapeSlackText(parsed.data.reason)}`);
+      await answerInThread(p, `:leftwards_arrow_with_hook: ${p.id} withdrawn by the agent: ${escapeSlackText(parsed.data.reason)}`);
       return { text: `withdrew ${p.id}`, isError: false };
     },
 

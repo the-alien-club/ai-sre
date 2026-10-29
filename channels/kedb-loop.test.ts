@@ -13,7 +13,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createKedbGit, KEDB_COMMIT_AUTHOR } from "./kedb-git.js";
-import { createKedbLoop, EXPIRY_AFTER_MS, REMINDER_AFTER_MS, REQUEST_TTL_MS, slackDiffBlock, type KedbLoop } from "./kedb-loop.js";
+import { createKedbLoop, EXPIRY_AFTER_MS, formatDiffPosts, MAX_SLACK_POST_CHARS, REMINDER_AFTER_MS, REQUEST_TTL_MS, type KedbLoop } from "./kedb-loop.js";
+import { createOperatorWait } from "./operator-wait.js";
 import type { IncidentRecord } from "./incident-lookup.js";
 import { createProposalStore, type ProposalStore } from "./proposal-store.js";
 import { edit, FALCO_FAMILY, HISTORY_ENTRY, HISTORY_WITH_CAUSE } from "./kedb-test-entries.js";
@@ -58,6 +59,10 @@ interface World {
   data: string;
   posts: Array<{ channel: string; text: string; thread_ts?: string; ts: string }>;
   notifications: Array<{ content: string; meta: Record<string, string> }>;
+  /** The threads the loop said it answered in, in order. */
+  answered: string[];
+  /** Hooks into the next poster call: throw to fail it. */
+  failPost: { when: ((text: string) => boolean) | null };
   clock: { now: number };
   /** incidents.db: id → the fingerprint it was logged with (null: logged without one). */
   incidents: Map<string, string | null>;
@@ -102,6 +107,8 @@ function setup(): World {
 
   const posts: World["posts"] = [];
   const notifications: World["notifications"] = [];
+  const answered: string[] = [];
+  const failPost: World["failPost"] = { when: null };
   const clock = { now: 1_793_201_700_000 };
   const storePath = join(data, "kedb-proposals.json");
   // 3501 is the incident fp1's payload belongs to; the others share it, for the tests that need
@@ -125,6 +132,7 @@ function setup(): World {
       git: createKedbGit({ dir: checkout, stageDir: join(data, "kedb-stage"), timeoutMs: 30_000, lintTimeoutMs: 60_000 }),
       poster: {
         async post(message) {
+          if (failPost.when?.(message.text)) throw new Error("slack chat.postMessage timed out");
           const ts = nextTs();
           posts.push({ ...message, ts });
           return ts;
@@ -132,6 +140,9 @@ function setup(): World {
       },
       notifyAgent: async (content, meta) => {
         notifications.push({ content, meta });
+      },
+      answered: (threadTs) => {
+        answered.push(threadTs);
       },
       approvers: new Map([[LEO, "Leo"]]),
       channel: CHANNEL,
@@ -161,6 +172,8 @@ function setup(): World {
     data,
     posts,
     notifications,
+    answered,
+    failPost,
     clock,
     incidents,
     incidentsError,
@@ -186,6 +199,13 @@ function proposeArgs(overrides: Record<string, unknown> = {}) {
     thread_ts: THREAD,
     ...overrides,
   };
+}
+
+/** The newest proposal header posted (the diff follows it in messages of its own). */
+function lastHeader(world: World): World["posts"][number] {
+  const header = [...world.posts].reverse().find((post) => post.text.includes("*Runbook proposal "));
+  if (header === undefined) throw new Error("no proposal header was posted");
+  return header;
 }
 
 /** Leo (or someone) replying in the incident thread, after everything posted so far. */
@@ -218,18 +238,24 @@ test("KB-1 end to end: proposed as a downgrade, approved with the exact phrase, 
   assert.equal(proposed.isError, false, proposed.text);
   assert.match(proposed.text, /posted KB-1 rev 1/);
 
-  const post = world.posts.at(-1)!;
+  // The header, then the diff in its own message
+  const [post, diffPost] = world.posts.slice(-2);
   assert.equal(post.thread_ts, THREAD);
+  assert.equal(diffPost.thread_ts, THREAD);
   assert.match(post.text, /\*Runbook proposal KB-1\* \(rev 1\): incident #3501/);
   assert.match(post.text, /SEVERITY DOWNGRADE:\* page → fyi/);
-  assert.match(post.text, /yes downgrade KB-1/);
-  assert.match(post.text, /\+  - id: kapsule-serial-console-agent-update/);
+  assert.match(post.text, /reply exactly \*yes downgrade KB-1\*/);
+  assert.doesNotMatch(post.text, /`yes/, "the reply phrase is not shown as code");
+  assert.match(post.text, /The diff follows in 1 message below/);
+  assert.match(diffPost.text, /^\*KB-1 rev 1, diff part 1\/1\*\n```\n/);
+  assert.match(diffPost.text, /\+  - id: kapsule-serial-console-agent-update/);
   const sha = createHash("sha256").update(HISTORY_WITH_CAUSE).digest("hex");
   assert.match(post.text, new RegExp(`Content-SHA256: \`${sha}\``));
+  assert.deepEqual(world.store.get("KB-1")?.diff_post_ts, [diffPost.ts]);
 
   // A plain yes is not enough for a downgrade, and Adrien cannot approve at all
   assert.deepEqual(await reply(world, "yes"), { handled: true });
-  assert.match(world.posts.at(-1)!.text, /reply exactly `yes downgrade KB-1`/);
+  assert.match(world.posts.at(-1)!.text, /reply exactly \*yes downgrade KB-1\*/);
   assert.deepEqual(await reply(world, "yes downgrade KB-1", ADRIEN), { handled: false, meta: { type: "runbook_feedback", proposal_id: "KB-1" } });
   assert.match(world.posts.at(-1)!.text, /Only Leo can approve/);
   assert.equal(world.store.get("KB-1")?.status, "pending");
@@ -281,7 +307,7 @@ test("feedback, then a revision that supersedes it: the old yes cannot approve t
 
   const second = await world.loop.propose(proposeArgs({ new_content: revised, supersedes: "KB-1" }));
   assert.equal(second.isError, false, second.text);
-  assert.match(world.posts.at(-1)!.text, /KB-1\* \(rev 2\)/);
+  assert.match(lastHeader(world).text, /KB-1\* \(rev 2\)/);
   assert.equal(world.store.get("KB-1")?.rev, 2);
 
   // A reply stamped before rev 2 was posted is refused
@@ -401,7 +427,7 @@ test("24 h reminder once, expiry at 7 days, both in the thread", async () => {
   await world.loop.sweep();
   await world.loop.sweep();
   assert.equal(world.posts.length, count + 1, "one reminder");
-  assert.match(world.posts.at(-1)!.text, /KB-1 \(rev 1\) is still waiting.*`yes downgrade KB-1`/);
+  assert.match(world.posts.at(-1)!.text, /KB-1 \(rev 1\) is still waiting.*\*yes downgrade KB-1\*/);
   assert.equal(world.posts.at(-1)!.thread_ts, THREAD);
 
   world.clock.now += EXPIRY_AFTER_MS;
@@ -421,7 +447,9 @@ test("withdraw and list", async () => {
 });
 
 test("a ``` in the diff cannot close the Slack code block early, and markup is escaped", () => {
-  const block = slackDiffBlock("+```bash\n+echo <@U1> & done\n+```\n");
+  const blocks = formatDiffPosts({ id: "KB-1", rev: 1, diff: "+```bash\n+echo <@U1> & done\n+```\n" });
+  assert.equal(blocks.length, 1);
+  const block = blocks[0];
   assert.equal(block.match(/```/g)?.length, 3, "the opening and closing fence, plus the note's literal");
   assert.match(block, /'''bash/);
   assert.match(block, /&lt;@U1&gt; &amp; done/);
@@ -497,7 +525,7 @@ test("approver-requested, no payload kept: allowed, labelled in the post, record
   assert.equal(proposed.isError, false, proposed.text);
   assert.match(proposed.text, new RegExp(`The injection check did NOT run \\(no raw payload kept for ${OLD_FP}\\); Leo asked for it`));
 
-  const post = world.posts.at(-1)!;
+  const post = lastHeader(world);
   assert.equal(post.thread_ts, THREAD);
   const requestLink = `https://alien.slack.com/archives/${CHANNEL}/p${requestTs.replace(".", "")}?thread_ts=${THREAD}&cid=${CHANNEL}`;
   assert.ok(post.text.includes(`injection check NOT run: no raw payload kept for ${OLD_FP}`), post.text);
@@ -521,7 +549,7 @@ test("a top-level request names its own thread; the proposal must be posted ther
   assert.match((await world.loop.propose(proposeArgs(OLD_INCIDENT))).text, /no raw payload is kept/, "not in the incident's thread");
   const proposed = await world.loop.propose(proposeArgs({ ...OLD_INCIDENT, thread_ts: requestTs }));
   assert.equal(proposed.isError, false, proposed.text);
-  assert.ok(world.posts.at(-1)!.text.includes(`Proposed because Leo asked: https://alien.slack.com/archives/${CHANNEL}/p${requestTs.replace(".", "")}`));
+  assert.ok(lastHeader(world).text.includes(`Proposed because Leo asked: https://alien.slack.com/archives/${CHANNEL}/p${requestTs.replace(".", "")}`));
 });
 
 test("under a payload gap the other guardrails still apply, and a revision keeps the request", async () => {
@@ -536,6 +564,165 @@ test("under a payload gap the other guardrails still apply, and a revision keeps
   world.clock.now += REQUEST_TTL_MS + 1;
   const revised = await world.loop.propose(proposeArgs({ ...OLD_INCIDENT, new_content: edit(HISTORY_WITH_CAUSE, "      proc.tty: 1088\n", ""), supersedes: "KB-1" }));
   assert.equal(revised.isError, false, revised.text);
-  assert.match(world.posts.at(-1)!.text, /KB-1\* \(rev 2\)[\s\S]*injection check NOT run/);
+  assert.match(lastHeader(world).text, /KB-1\* \(rev 2\)[\s\S]*injection check NOT run/);
   assert.equal(world.store.get("KB-1")?.payload_gap?.requested_by.user, LEO);
+});
+
+// -- A proposal longer than one Slack message (2026-10-29, KB-1 rev 1) ------------------------
+
+/** HISTORY_WITH_CAUSE with a History long enough that the old one-message post was ~5.8k characters. */
+const LONG_HISTORY = edit(
+  HISTORY_WITH_CAUSE,
+  "2026-10-28: first seen.\n",
+  Array.from({ length: 50 }, (_, i) => `- 2026-10-${String(i % 28 + 1).padStart(2, "0")}: serial-console agent update on pool node ${i}, confirmed from the node journal.`).join("\n") + "\n"
+);
+
+test("a proposal Slack would have split posts its header and diff as separate messages, each under Slack's limit", async () => {
+  const world = setup();
+  const proposed = await world.loop.propose(proposeArgs({ new_content: LONG_HISTORY }));
+  assert.equal(proposed.isError, false, proposed.text);
+
+  const stored = world.store.get("KB-1")!;
+  // What 0.9.1 sent as one message: Slack split it at ~4000 characters (3975 + 1783 on 2026-10-29)
+  assert.ok(stored.diff.length > 4_000, `the diff is ${stored.diff.length} characters`);
+  const posted = world.posts.slice(-1 - stored.diff_post_ts.length);
+  const [header, ...parts] = posted;
+  assert.equal(parts.length, 2, "two diff messages");
+  for (const post of posted) {
+    assert.ok(post.text.length <= MAX_SLACK_POST_CHARS, `${post.text.length} characters`);
+    assert.equal(post.thread_ts, THREAD);
+  }
+
+  // Everything verify-approvals checks is in the header, the message Proposal-Post links
+  assert.equal(stored.post_ts, header.ts);
+  assert.deepEqual(stored.diff_post_ts, parts.map((p) => p.ts));
+  assert.match(header.text, /\*Runbook proposal KB-1\* \(rev 1\)/);
+  assert.match(header.text, /SEVERITY DOWNGRADE/);
+  assert.ok(header.text.includes(`Content-SHA256: \`${stored.content_sha256}\``));
+  assert.match(header.text, /The diff follows in 2 messages below/);
+  assert.doesNotMatch(header.text, /```/, "no diff in the header");
+
+  // The parts, in order, are the whole diff: nothing cut away
+  assert.match(parts[0].text, /^\*KB-1 rev 1, diff part 1\/2\*\n```\n/);
+  assert.match(parts[1].text, /^\*KB-1 rev 1, diff part 2\/2\*\n```\n/);
+  const bodies = parts.map((p) => p.text.replace(/^\*[^\n]*\*\n```\n/, "").replace(/\n```$/, ""));
+  assert.equal(bodies.join("\n"), stored.diff.trimEnd());
+
+  // A yes stamped between the header and the last part is too early
+  const early = await world.loop.onMessage({ user: LEO, text: "yes downgrade KB-1", channel: CHANNEL, ts: `${parts[1].ts.split(".")[0]}.000050`, threadTs: THREAD });
+  assert.deepEqual(early, { handled: true });
+  assert.match(world.posts.at(-1)!.text, /predates KB-1 rev 1/);
+
+  // After it, Leo's copied phrase (backticks and all) applies it, and the trailer links the header
+  assert.deepEqual(await reply(world, "`yes downgrade KB-1`"), { handled: true });
+  await until(() => world.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  const log = remoteMainLog(world);
+  assert.ok(log.includes(`\nProposal-Post: https://alien.slack.com/archives/${CHANNEL}/p${header.ts.replace(".", "")}?thread_ts=${THREAD}&cid=${CHANNEL}\n`), log);
+});
+
+test("formatDiffPosts cuts a line longer than one message across messages instead of dropping it", () => {
+  const line = `+${"x".repeat(MAX_SLACK_POST_CHARS * 2)}`;
+  const parts = formatDiffPosts({ id: "KB-7", rev: 2, diff: `+a\n${line}\n+b\n` });
+  assert.ok(parts.length >= 3);
+  for (const part of parts) assert.ok(part.length <= MAX_SLACK_POST_CHARS, `${part.length} characters`);
+  const bodies = parts.map((p) => p.replace(/^\*[^\n]*\*\n```\n/, "").replace(/\n```$/, ""));
+  assert.equal(bodies.join("").replace(/\n/g, ""), `+a${line}+b`);
+  assert.match(parts[0], new RegExp(`^\\*KB-7 rev 2, diff part 1/${parts.length}\\*`));
+});
+
+test("a diff message that fails to post withdraws the proposal and says so in the thread", async () => {
+  const world = setup();
+  world.failPost.when = (text) => text.includes("diff part 2/2");
+  const proposed = await world.loop.propose(proposeArgs({ new_content: LONG_HISTORY }));
+  assert.equal(proposed.isError, true);
+  assert.match(proposed.text, /KB-1 rev 1 was not posted in full .*withdrawn/);
+  assert.equal(world.store.get("KB-1")?.status, "withdrawn");
+  assert.match(world.posts.at(-1)!.text, /KB-1 rev 1 is withdrawn: only 2 of its 3 messages could be posted. Do not approve it/);
+  world.failPost.when = null;
+  assert.deepEqual(await reply(world, "yes downgrade KB-1"), { handled: true });
+  assert.match(world.posts.at(-1)!.text, /KB-1 rev 1 is withdrawn; there is nothing to approve/);
+});
+
+// -- The channel's own answer stops the operator-wait timers (2026-10-29) ---------------------
+
+test("Leo's message, then his approval taken and applied by code: no 'still no answer' follow-up", async () => {
+  const world = setup();
+  // A fake clock for operator-wait: callbacks run when the test advances past them
+  let clock = 0;
+  const timers: Array<{ at: number; fn: () => void; cancelled: boolean }> = [];
+  const followUps: string[] = [];
+  const acks: string[] = [];
+  const wait = createOperatorWait({
+    ackDelayMs: 20_000,
+    followUpMs: 300_000,
+    postAck: async (thread) => {
+      acks.push(thread.threadTs);
+    },
+    postFollowUp: async (thread) => {
+      followUps.push(thread.threadTs);
+    },
+    signalAgent: async () => {},
+    now: () => clock,
+    schedule: (fn, ms) => {
+      const timer = { at: clock + ms, fn, cancelled: false };
+      timers.push(timer);
+      return () => {
+        timer.cancelled = true;
+      };
+    },
+    log: () => {},
+  });
+  const advance = (ms: number) => {
+    clock += ms;
+    for (const timer of timers.filter((t) => !t.cancelled && t.at <= clock)) {
+      timer.cancelled = true;
+      timer.fn();
+    }
+  };
+  // slack-sre's glue: the loop's answers answer the thread; an unhandled message arms the timers
+  const answeredBefore = world.answered.length;
+  const deliver = async (text: string) => {
+    const outcome = await reply(world, text);
+    for (const thread of world.answered.splice(answeredBefore)) wait.answered(thread);
+    if (!outcome.handled) wait.messageReceived(CHANNEL, THREAD, "Leo");
+    return outcome;
+  };
+
+  assert.equal((await world.loop.propose(proposeArgs())).isError, false);
+
+  // 11:54:03Z: a reply the loop does not consume reaches the agent and arms the timers; the
+  // agent says nothing in the thread
+  assert.equal((await deliver("looks right, one question first")).handled, false);
+  advance(20_000);
+  assert.deepEqual(acks, [THREAD], "the 'On it'");
+
+  // Leo's approval: consumed and answered by code, then applied by code
+  assert.deepEqual(await deliver("yes downgrade KB-1"), { handled: true });
+  await until(() => world.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  assert.match(world.posts.at(-1)!.text, /:white_check_mark: Applied KB-1/);
+  for (const thread of world.answered.splice(answeredBefore)) wait.answered(thread);
+
+  advance(300_000);
+  assert.deepEqual(followUps, [], "no 'still no answer' after the channel answered");
+  assert.equal(wait.isWaiting(THREAD), false);
+});
+
+test("the loop answers a thread only when its post there went out", async () => {
+  const world = setup();
+  assert.equal((await world.loop.propose(proposeArgs())).isError, false);
+  world.answered.length = 0;
+  world.failPost.when = (text) => text.includes("approved by Leo");
+  await reply(world, "yes downgrade KB-1");
+  await until(() => world.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  world.failPost.when = null;
+  // The approval's receipt failed; the applied post went out, and that answers the thread
+  assert.deepEqual(world.answered, [THREAD]);
+
+  const second = setup();
+  assert.equal((await second.loop.propose(proposeArgs())).isError, false);
+  second.answered.length = 0;
+  second.failPost.when = () => true;
+  await reply(second, "yes downgrade KB-1");
+  await until(() => second.store.get("KB-1")?.status === "applied", "KB-1 to be applied");
+  assert.deepEqual(second.answered, [], "nothing was posted, so nothing was answered");
 });

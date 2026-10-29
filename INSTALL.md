@@ -569,11 +569,19 @@ The start script (`scripts/start-agent.sh`) handles:
 - Refusing to restart, before stopping the running session, when `.env` lacks a setting a
   channel requires (named in the log and the team channel)
 - Waiting for the previous session's webhook ports to be released
-- Starting Claude Code in a tmux session with channels
+- Starting Claude Code in a tmux session with channels, without the systemd user-bus variables
+  (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`) an SSH login leaves in pm2's environment, and
+  refusing a session that is not in pm2's cgroup. With them, tmux put the session under the
+  login's systemd user manager, which killed it when the operator logged out (2026-10-29)
 - Auto-accepting the dev channels prompt
 - Waiting for this session's webhook channels to bind their ports
 - Pasting the initial prompt (briefing and `config/deployment.md`) and proving it was
-  submitted; a failure is logged and posted to the team channel (`SLACK_BOT_TOKEN`,
+  submitted: Claude Code is started with a known `--session-id`, and the prompt counts as
+  submitted only once its nonce is in that session's transcript
+  (`~/.claude/projects/<project>/<session id>.jsonl`), queued or not
+- When it cannot be proven, stopping the session so pm2 starts a fresh one to deliver it, at
+  most twice an hour (`data/briefing-restarts`); past that the agent keeps running without
+  its briefing, and the failure is logged and posted to the team channel (`SLACK_BOT_TOKEN`,
   `SRE_SLACK_CHANNEL`)
 
 ## 12. Set up daily restart cron

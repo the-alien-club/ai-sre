@@ -13,12 +13,19 @@
 # limit, and `paste-buffer` writes it into the pane as one paste.
 #
 # Success is never inferred from something being absent. Every tmux call is checked, the
-# input box must be recognised, the prompt must be seen landing in it, and only an input
-# box that is then empty again counts as submitted. A session that is gone, a UI this code
-# does not recognise, or a prompt that never lands are all failures, never successes.
+# input box must be recognised and the prompt must be seen landing in it. Submitted means
+# Claude Code wrote the prompt into the session's transcript: the session is started with a
+# known --session-id, and the prompt carries a nonce that only it contains. An input box
+# that empties is not proof: on 2026-10-29 at 11:53 an alert started a turn 4 s before the
+# prompt was pasted, Claude Code queued the prompt (it delivered it 32 s later), and the box
+# never showed empty, so the old check pressed Enter five times and reported a briefing
+# that had been delivered as lost. A session that is gone, a UI this code does not
+# recognise, or a prompt that never reaches the transcript are all failures, never successes.
 
 # shellcheck source=scripts/lib/notify-ops.sh
 source "$(dirname "${BASH_SOURCE[0]}")/notify-ops.sh"
+# shellcheck source=scripts/lib/briefing-retry.sh
+source "$(dirname "${BASH_SOURCE[0]}")/briefing-retry.sh"
 
 # The input box as rendered by Claude Code (checked on the VM, Claude Code 2.1.110, tmux
 # 3.4): the lines between the last two horizontal rules, the first of them starting with
@@ -79,9 +86,26 @@ paste_prompt() {
   fi
 }
 
-# submit_prompt <tmux-session> <prompt> [attempts]
+# transcript_has <projects-dir> <session-id> <nonce>: whether Claude Code recorded a message
+# carrying the nonce in this session's transcript, <projects-dir>/<project>/<session-id>.jsonl.
+# A queued prompt is recorded when it is queued, a submitted one when it is submitted.
+transcript_has() {
+  local projects="$1" id="$2" nonce="$3" transcript
+  transcript="$(find "$projects" -mindepth 2 -maxdepth 2 -type f -name "${id}.jsonl" -print -quit)"
+  [ -n "$transcript" ] && grep -qF -- "$nonce" "$transcript"
+}
+
+# submit_prompt <tmux-session> <prompt> <nonce> <projects-dir> <session-id> [attempts]
+# The prompt must contain the nonce, and the session must have been started with
+# `claude --session-id <session-id>`, whose transcript lives under <projects-dir>.
 submit_prompt() {
-  local session="$1" prompt="$2" attempts="${3:-5}" pause="${SUBMIT_PROMPT_PAUSE:-2}" box attempt
+  local session="$1" prompt="$2" nonce="$3" projects="$4" id="$5" attempts="${6:-5}"
+  local pause="${SUBMIT_PROMPT_PAUSE:-2}" box attempt
+
+  if [ -z "$nonce" ] || [[ "$prompt" != *"$nonce"* ]]; then
+    echo "[start-agent] the startup prompt does not carry its nonce; its submission could not be proven" >&2
+    return 1
+  fi
 
   paste_prompt "$session" "$prompt" || return 1
 
@@ -99,40 +123,52 @@ submit_prompt() {
     return 1
   fi
 
+  # Enter only while the input box still holds the prompt: once it has left the box, Claude
+  # Code has it (submitted or queued) and another Enter could submit something else.
   for (( attempt = 1; attempt <= attempts; attempt++ )); do
-    if ! tmux send-keys -t "$session" Enter; then
-      echo "[start-agent] could not send Enter to tmux session ${session}" >&2
-      return 1
-    fi
-    sleep "$pause"
     if ! box="$(input_box "$session")"; then
       echo "[start-agent] lost the Claude Code input box in tmux session ${session}" >&2
       return 1
     fi
-    if [ -z "$(input_box_text "$box")" ]; then
+    if prompt_landed "$box" "$prompt" && ! tmux send-keys -t "$session" Enter; then
+      echo "[start-agent] could not send Enter to tmux session ${session}" >&2
+      return 1
+    fi
+    sleep "$pause"
+    if transcript_has "$projects" "$id" "$nonce"; then
       echo "[start-agent] startup prompt submitted (attempt ${attempt})"
       return 0
     fi
   done
-  echo "[start-agent] startup prompt still unsubmitted after ${attempts} attempts" >&2
+  echo "[start-agent] startup prompt still not in session ${id}'s transcript after ${attempts} attempts" >&2
   return 1
 }
 
-# submit_startup_prompt <tmux-session> <prompt>: submit, and on failure say so loudly, in
-# the log and in the team channel, then fail. It is the caller's choice what a failure
-# means; start-agent.sh keeps the agent running, because it is useful without its briefing
-# (alerts and Slack still flow) and a restart loop would take its triage down with it.
+# submit_startup_prompt <tmux-session> <prompt> <nonce> <projects-dir> <session-id> <retry-state>
+# Submits the prompt (submit_prompt). On failure it decides, through the bounded retry in
+# <retry-state> (briefing-retry.sh), what the caller does:
+#   0  submitted.
+#   2  not submitted; restart the session to try again. Logged; the team channel is not
+#      paged for a retry that will most likely deliver it.
+#   1  not submitted and no retry left: the session keeps running without its briefing,
+#      because it is useful without it (alerts and Slack still flow). Logged, and the team
+#      channel is told.
 submit_startup_prompt() {
-  submit_prompt "$1" "$2" && return 0
+  local session="$1" retry_state="$6" verdict
+  submit_prompt "$1" "$2" "$3" "$4" "$5" && return 0
 
+  if verdict="$(briefing_retry_take "$retry_state" "$(date +%s)")"; then
+    echo "[start-agent] ERROR: the startup prompt was not delivered; restarting the session to deliver it" \
+      "(briefing restart ${verdict})" >&2
+    return 2
+  fi
   echo "[start-agent] ERROR: the agent is running WITHOUT its briefing and deployment config;" \
-    "see the error above. If the input box holds the prompt, tmux send-keys -t $1 Enter submits it;" \
-    "otherwise pm2 restart sre-agent" >&2
+    "see the error above. No restart for it: ${verdict}. pm2 restart sre-agent tries again" >&2
   notify_ops ":rotating_light: *SRE Agent Health Alert*
 
-*Startup briefing not delivered:* the agent restarted on ${HOSTNAME} at $(date -u '+%Y-%m-%d %H:%M UTC') and is running WITHOUT its incident briefing and deployment config.
+*Startup briefing not delivered:* the agent restarted on ${HOSTNAME} at $(date -u '+%Y-%m-%d %H:%M UTC') and is running WITHOUT its incident briefing and deployment config. Restarting the session did not deliver it either (${verdict}).
 *Impact:* alerts and Slack still reach it, but it triages without recent incident history and with the placeholder project IDs from CLAUDE.md.
-*Action needed:* read \`pm2 logs sre-agent --err --lines 20\` on the agent VM, then \`pm2 restart sre-agent\`." \
+*Action needed:* read \`pm2 logs sre-agent --err --lines 40\` on the agent VM and \`tmux capture-pane -t ${session} -p\`, then \`pm2 restart sre-agent\`." \
     || echo "[start-agent] ERROR: the team channel could not be told that the briefing was not delivered" >&2
   return 1
 }

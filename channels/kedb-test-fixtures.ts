@@ -20,6 +20,7 @@ export function sampleProposal(overrides: Partial<Proposal> = {}): Proposal {
     thread_permalink: "https://alien.slack.com/archives/C09MWNB6WL8/p1793201688848269",
     post_ts: "1793201700.000100",
     post_permalink: "https://alien.slack.com/archives/C09MWNB6WL8/p1793201700000100?thread_ts=1793201688.848269&cid=C09MWNB6WL8",
+    diff_post_ts: [],
     posted_at: 1_000,
     downgrade: null,
     status: "pending",
