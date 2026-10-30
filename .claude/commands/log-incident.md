@@ -14,7 +14,7 @@ by the main agent for manual logging.
   --service "service-name" \
   --fingerprint "alert-fingerprint" \
   --verdict "real|noise|false_positive|known_issue|flapping" \
-  --action "auto_fixed|escalated|ignored|monitoring" \
+  --action "auto_fixed|pending_escalation|escalated|ignored|monitoring" \
   --cause "Brief root cause description"
 ```
 
@@ -43,9 +43,27 @@ by the main agent for manual logging.
 | Action | When to use |
 |---|---|
 | `auto_fixed` | Agent fixed it autonomously (pod restart, workflow clear, etc.) |
-| `escalated` | Posted to the team channel via Slack |
+| `pending_escalation` | Needs escalation; a sub-agent's recommendation, which the main agent pages |
+| `escalated` | The operators were paged. Refused unless the escalate tool paged this fingerprint (below) |
 | `ignored` | No action needed (noise, resolved, known issue) |
 | `monitoring` | Real but not actionable yet — watching for escalation |
+
+## Recording a page
+
+`escalated` means the operators were paged. The CLI refuses it unless `slack-escalations.json`
+holds a live (not superseded) escalation of the incident's fingerprint that the `escalate` tool was
+called for in the last 120 minutes, or `--escalation-of <fingerprint>` names a live **critical**
+escalation posted in that window (the page this incident rides on). The refusal says what to do.
+
+```bash
+# Main agent, after escalate returned for the alert:
+./scripts/incidents.sh mark-escalated --id <incident id>
+# Or, when it rides on an outage already paged as critical minutes ago:
+./scripts/incidents.sh mark-escalated --id <incident id> --escalation-of <paged fingerprint>
+```
+
+Never use `--escalation-of` to avoid paging a new prod critical: call `escalate` for it instead.
+It joins the outage thread and pages there when that thread is fresh.
 
 ## Marking escalations as resolved
 

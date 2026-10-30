@@ -65,7 +65,7 @@ LAST: Log the result before returning:
   ./scripts/incidents.sh log --alert "<name>" --severity "<sev>" --status "<status>" \
     --cluster "<cluster>" --service "<service>" --fingerprint "<fingerprint>" \
     --verdict "<real|noise|false_positive|known_issue|flapping>" \
-    --action "<auto_fixed|escalated|ignored|monitoring>" \
+    --action "<auto_fixed|pending_escalation|ignored|monitoring>" \
     --cause "<brief cause>" \
     --kedb-match "<kedb_match>" [--kedb-id "<kedb_id>" --kedb-rev "<kedb_rev>"] \
     [--kedb-predicted-verdict "<v>" --kedb-predicted-action "<a>"] \
@@ -81,12 +81,18 @@ Report back:
 - Was a recent MR merged that could have caused this?
 - Recommended action (auto-fix / escalate / ignore)
 - If auto-fix: exact command to run
-- If escalate: summary for the ops team
+- If escalate: summary for the ops team, the severity the impact deserves (critical for user-facing
+  prod impact, even when the alert says warning), and the incident id `log` printed
 Be concise.
+
+Recommend escalation with --action pending_escalation, never escalated: escalated is recorded
+by the main agent once the operators are paged, and the CLI refuses it before that.
 ```
 
 6. When the sub-agent's report arrives, read it and decide:
    - False positive / noise → done
    - Auto-fixable → run the fix command, then spawn a verification sub-agent (background too)
-   - Needs escalation → use the `escalate` tool with the sub-agent's findings
+   - Needs escalation → use the `escalate` tool with the sub-agent's findings, for this alert's
+     own fingerprint, even when an outage thread already covers it (see CLAUDE.md "Every real
+     prod critical is paged"). Then `./scripts/incidents.sh mark-escalated --id <incident id>`.
    - **Resolved** → invoke `/incident-report` to compile and publish the full report

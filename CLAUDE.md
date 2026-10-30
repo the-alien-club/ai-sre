@@ -120,7 +120,8 @@ unrelated alerts, and silently retried a refused tool call. So every sub-agent r
 5. YOU decide based on the summary:
    - False positive → log briefly, done
    - Auto-fixable → run the ONE fix command yourself, then confirm via another sub-agent
-   - Needs escalation → use the escalate tool with the sub-agent's findings
+   - Needs escalation → use the escalate tool with the sub-agent's findings, then
+     `./scripts/incidents.sh mark-escalated --id <incident id>` (see "Every real prod critical is paged")
 6. ALWAYS log the outcome: the sub-agent must call `./scripts/incidents.sh log` before returning
 ```
 
@@ -157,9 +158,12 @@ Every sub-agent MUST log the outcome before returning:
   --service "<service>" \
   --fingerprint "<the alert's fingerprint>" \
   --verdict "<real|noise|false_positive|known_issue|flapping>" \
-  --action "<auto_fixed|escalated|ignored|monitoring>" \
+  --action "<auto_fixed|pending_escalation|ignored|monitoring>" \
   --cause "<brief root cause>"
 ```
+
+A sub-agent never logs `escalated`: it cannot page, and the CLI refuses `escalated` until a page
+exists (below). It logs `pending_escalation` and reports the incident id `log` printed.
 
 Always pass `--fingerprint`: it is what binds a runbook proposal to its incident, and an incident
 logged without one can never be the source of a proposal.
@@ -227,6 +231,7 @@ fewer false investigations and faster response to real incidents.
 ./scripts/incidents.sh briefing [--days 7]                                # Generate briefing
 ./scripts/incidents.sh resolve --id 42 --resolution "what fixed it"      # Mark resolved
 ./scripts/incidents.sh correct --id 42 --verdict noise --by Leo           # Operator's verdict
+./scripts/incidents.sh mark-escalated --id 42 [--escalation-of <fp>]      # After escalate paged
 ```
 
 ### Sub-Agent Prompt Template
@@ -267,7 +272,7 @@ LAST: Log the result before returning:
   ./scripts/incidents.sh log --alert "<name>" --severity "<sev>" --status "<status>" \
     --cluster "<cluster>" --service "<service>" --fingerprint "<fp>" \
     --verdict "<real|noise|false_positive|known_issue>" \
-    --action "<auto_fixed|escalated|ignored|monitoring>" \
+    --action "<auto_fixed|pending_escalation|ignored|monitoring>" \
     --cause "<brief cause>" \
     --kedb-match "<kedb_match>" [--kedb-id "<kedb_id>"] [--kedb-rev "<kedb_rev>"] \
     [--kedb-predicted-verdict "<v>" --kedb-predicted-action "<a>"] \
@@ -283,7 +288,8 @@ Report back in this format:
 - Was a recent MR merged that could have caused this?
 - Recommended action (auto-fix / escalate / ignore)
 - If auto-fix: exact command to run
-- If escalate: summary for the ops team
+- If escalate: summary for the ops team, the severity the impact deserves (critical for
+  user-facing prod impact, even when the alert says warning), and the incident id `log` printed
 Keep your report concise.
 ```
 
@@ -332,8 +338,9 @@ can approve one, and the channel handles their `yes`/`no` itself. See "Learning 
 1. **One alert, one thread.** Post the escalation, then keep every update, question and
    resolution as a reply in that thread. Never open a new top-level message for an
    update to something already in flight. `escalate` enforces it: for a fingerprint whose
-   escalation is still unacknowledged it posts nothing and returns that thread
-   (`deduplicated: true`), so post your update there with `reply`.
+   escalation is still waiting and fresh it posts no new thread and returns that one, so post
+   your update there with `reply`. It decides when a thread has gone stale, not you (next
+   section).
 
 2. **Only speak when you have something to say — about alerts.** A shared channel is not
    a log file. Resolved alerts that needed no action get logged internally, not posted.
@@ -342,10 +349,45 @@ can approve one, and the channel handles their `yes`/`no` itself. See "Learning 
 
 3. **Page deliberately.** The `escalate` tool @-mentions every operator when severity is
    `critical` and stays quiet otherwise. That is the intended behaviour — do not add your
-   own `<@...>` mentions to warning or info messages to get attention faster.
+   own `<@...>` mentions to warning or info messages to get attention faster. Severity is the
+   impact's, not the label's: see "Every real prod critical is paged".
 
 4. **Assume a cold reader.** Someone opening the thread hours later should understand
    what broke, what you checked, and what you need — without scrolling back.
+
+### Every real prod critical is paged
+
+On 2026-10-30 prod Postgres went read-only for 1 h 40. You diagnosed every alert correctly and
+logged each one `escalated`, "already escalated", "part of cascading outage". Nobody was paged:
+the only escalate call joined a 27-hour-old warning thread that had no mention, and the other
+alerts never called `escalate` at all. These rules exist so that cannot happen again.
+
+1. **Call `escalate` for every real prod critical, with its own fingerprint.** Even when an
+   outage thread seems to cover it. You do not decide that something is "already escalated":
+   the tool does, and it pages correctly in every case:
+   - no waiting thread, or an acknowledged one → a new top-level escalation (critical pages);
+   - a waiting thread, fresh and at least as severe → joined; a **prod critical is paged in it**
+     (your message with every operator mentioned, broadcast to the channel);
+   - a waiting thread that is less severe, or older than 2 h (critical; 24 h for warnings), or
+     retired → a **new top-level page** that links it and replaces it (`superseded`). A reply in
+     either thread acknowledges.
+2. **Raise the severity to the impact.** A prod warning that is user-facing impact, or the cause
+   of an outage, is critical: "disk at 98%, cause of the read-only outage" is critical whatever
+   the rule's label says. Pass `severity: "critical"`, `raised_from: "warning"` and a
+   `raise_reason` saying what the impact is. Never raise for a warning without impact.
+3. **Then record it:** `./scripts/incidents.sh mark-escalated --id <incident id>`. The CLI refuses
+   `escalated` unless the tool's records show the page: a live escalation of that fingerprint
+   that you called `escalate` for in the last 120 min. `--escalation-of <fingerprint>` instead
+   links it to a live **critical** escalation posted in that window; use it only for an alert
+   that is not a prod critical itself (a dependent warning, a hop-down). A refusal tells you what
+   to do; do it, never route around it.
+4. **"Part of an ongoing outage" rides on a paged thread.** If the outage's thread is not a
+   critical page from the last 2 h, the next prod critical re-pages it; do not hold it back.
+
+What the operators see after that: critical escalations nag in their thread every 10 min (prod;
+hourly in dev and staging), every 3rd prod nag broadcast to the channel. Warnings and info are
+never nagged in-thread; one top-level digest a day (07:00 UTC, no mention) lists everything still
+unacknowledged. At startup, escalations older than 24 h are retired (superseded).
 
 ### How messages reach you
 
@@ -503,7 +545,8 @@ See config/deployment.md for the real project IDs for this environment.
 
 **If auto-fixing:** Run the ONE fix command yourself (e.g., `kubectl rollout restart`).
 Then spawn another background sub-agent to verify the fix worked. Report to Slack.
-**If escalating:** Use the `escalate` tool with the sub-agent's findings.
+**If escalating:** Use the `escalate` tool with the sub-agent's findings, at the severity of the
+impact, then `./scripts/incidents.sh mark-escalated --id <incident id>`.
 
 ---
 
@@ -578,7 +621,8 @@ These require human judgment. Always use the `escalate` tool:
 ### Dev Clusters (platform-dev, data-cluster-dev)
 - **Tone**: Casual, brief
 - **Auto-fix threshold**: Liberal — these are dev, breakage is acceptable
-- **Escalation**: Single message, no nagging. The team will see it when they see it.
+- **Escalation**: Single message, no mention for warnings (they wait for the daily digest);
+  a critical one is nagged in its thread hourly, without mentions.
 - **Known noise**:
   - `tenant-test-*` heartbeat 401s — always ignore
   - openaire-test / tixmltest-operator-test latency spikes — usually transient, just monitor
@@ -587,7 +631,8 @@ These require human judgment. Always use the `escalate` tool:
 ### Production Clusters (platform-prod, data-cluster-biorxiv, data-cluster-alien-hosted)
 - **Tone**: Urgent, precise
 - **Auto-fix threshold**: Conservative — only the safest operations
-- **Escalation**: Full context, nag every 10 minutes for critical alerts
+- **Escalation**: Full context; every real critical is paged (see "Every real prod critical is
+  paged"), nagged every 10 minutes, every 3rd nag broadcast to the channel
 - **Extra verification**: Always double-check before executing any fix
 - **BioRxiv note**: This is a real client with real data. Extra caution.
 
