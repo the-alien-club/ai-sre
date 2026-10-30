@@ -3,8 +3,9 @@
 #
 # Usage:
 #   ./scripts/incidents.sh log --alert "High Error Rate" --severity critical --status firing \
-#       --cluster platform-dev --service backend --verdict real --action escalated \
-#       --cause "MR !432 caused OOM" --related-mr "https://gitlab.com/..."
+#       --cluster platform-dev --service backend --fingerprint abc123 --verdict real \
+#       --action pending_escalation --cause "MR !432 caused OOM" --related-mr "https://gitlab.com/..."
+#   ./scripts/incidents.sh mark-escalated --id 42 [--escalation-of <paged fingerprint>]
 #
 #   ./scripts/incidents.sh check --alert "High Error Rate" [--cluster platform-dev] [--days 7]
 #   ./scripts/incidents.sh fingerprint --fp abc123def
@@ -19,6 +20,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DB="${INCIDENTS_DB:-$SCRIPT_DIR/../data/incidents.db}"
 # The runbook proposal store slack-sre keeps beside the database (channels/proposal-store.ts)
 KEDB_PROPOSALS="$(dirname "$DB")/kedb-proposals.json"
+# The escalations slack-sre keeps beside the database (channels/escalation-store.ts): what was
+# actually paged. `escalated` is recorded only against it; see require_page.
+ESCALATIONS="$(dirname "$DB")/slack-escalations.json"
+# How recent the page behind an `escalated` incident must be: the agent's own escalate call for
+# that fingerprint, or the critical escalation --escalation-of names. Matches the escalate tool's
+# 2 h staleness window for critical (ESCALATION_STALE_CRITICAL_MS).
+readonly ESCALATION_LINK_WINDOW_MIN=120
 
 # Every value reaching SQL goes through one of these two helpers, never string interpolation.
 # Arguments come from alert labels and sub-agent output, so they are attacker-influenced:
@@ -120,7 +128,8 @@ fi
 # existing database gains them here, on any command, idempotently: a column is added only when
 # pragma table_info does not list it. Two invocations racing may both try; the loser's ALTER
 # fails with "duplicate column", which is fine as long as the column exists afterwards.
-readonly KEDB_COLUMNS="kedb_id kedb_rev kedb_match kedb_predicted_verdict kedb_predicted_action corroboration operator_verdict operator_verdict_by operator_verdict_at"
+# escalation_of: the fingerprint of the paged escalation an incident rode on (mark-escalated).
+readonly KEDB_COLUMNS="kedb_id kedb_rev kedb_match kedb_predicted_verdict kedb_predicted_action corroboration operator_verdict operator_verdict_by operator_verdict_at escalation_of"
 ensure_kedb_columns() {
     local existing column error
     existing="$(sql_run <<< "SELECT name FROM pragma_table_info('incidents');")" || return 1
@@ -136,6 +145,57 @@ ensure_kedb_columns() {
 }
 ensure_kedb_columns || exit 1
 
+# require_page <fingerprint> [<escalation_of fingerprint>]: succeed only when the operators were
+# paged for this incident, else say on stderr what to do and fail.
+#
+# 2026-10-30: prod Postgres went read-only and every alert of it was logged "escalated" with
+# causes like "Already escalated", while the only Slack activity was replies in stale, quiet
+# threads. Nobody was paged. So `escalated` now needs one of:
+# - a live (not superseded) escalation of this fingerprint, and the escalate tool called for it
+#   within ESCALATION_LINK_WINDOW_MIN, so it went through the re-page rules; or
+# - --escalation-of naming a live critical escalation posted within that window: the page this
+#   incident rides on.
+require_page() {
+    local fp="$1" link="${2:-}" target mode state now_ms
+    local how="Call the escalate tool for ${fp} first (it pages a prod critical even inside an outage's thread, and re-pages a stale one), then: incidents.sh mark-escalated --id <incident id>. A sub-agent logs --action pending_escalation and leaves the page to the main agent."
+    if [ -n "$link" ]; then target="$link" mode=link; else target="$fp" mode=own; fi
+
+    if [ ! -f "$ESCALATIONS" ]; then
+        echo "Refused: nothing has been paged; there is no escalation store at $ESCALATIONS. $how" >&2
+        return 1
+    fi
+    now_ms=$(( $(date +%s) * 1000 ))
+    if ! state="$(jq -r --arg fp "$target" --arg mode "$mode" --argjson now "$now_ms" --argjson window "$(( ESCALATION_LINK_WINDOW_MIN * 60000 ))" '
+        if type != "array" then error("not an array") else . end
+        | (map(select(.alertFingerprint == $fp)) | first) as $e
+        | if $e == null then "none"
+          elif $e.superseded == true then "superseded"
+          elif $mode == "own" then
+            (($now - ($e.lastRequestedAt // $e.escalatedAt)) / 60000 | floor) as $age
+            | if $age > ($window / 60000) then "stale \($age)" else "ok" end
+          elif $e.severity != "critical" then "not_critical \($e.severity)"
+          else
+            (($now - $e.escalatedAt) / 60000 | floor) as $age
+            | if $age > ($window / 60000) then "stale \($age)" else "ok" end
+          end' "$ESCALATIONS" 2>&1)"; then
+        echo "Refused: the escalation store $ESCALATIONS is unreadable (${state:0:200}), so no page can be confirmed. Tell the operators in Slack directly." >&2
+        return 1
+    fi
+
+    case "$mode:$state" in
+        *:ok) return 0 ;;
+        own:none) echo "Refused: nothing was paged for fingerprint ${fp}. $how If it rides on an outage already paged as critical in the last ${ESCALATION_LINK_WINDOW_MIN} min, pass --escalation-of <that escalation's fingerprint>." >&2 ;;
+        own:superseded) echo "Refused: the escalation of ${fp} was superseded (replaced, or retired unanswered), so it pages nobody. $how" >&2 ;;
+        own:stale*) echo "Refused: escalate was last called for ${fp} ${state#stale } min ago, more than ${ESCALATION_LINK_WINDOW_MIN}. $how" >&2 ;;
+        link:none) echo "Refused: --escalation-of ${link}: no escalation of that fingerprint exists. Escalate this alert itself. $how" >&2 ;;
+        link:superseded) echo "Refused: --escalation-of ${link} was superseded and pages nobody. Escalate this alert itself. $how" >&2 ;;
+        link:not_critical*) echo "Refused: --escalation-of ${link} is a ${state#not_critical } escalation, which paged nobody. Escalate this alert itself as critical (with raised_from and raise_reason when its label is lower). $how" >&2 ;;
+        link:stale*) echo "Refused: --escalation-of ${link} was posted ${state#stale } min ago, more than ${ESCALATION_LINK_WINDOW_MIN}: page the operators now. Escalate this alert itself. $how" >&2 ;;
+        *) echo "Refused: unexpected escalation state '${state}' for ${target}" >&2 ;;
+    esac
+    return 1
+}
+
 CMD="${1:-help}"
 shift || true
 
@@ -144,7 +204,7 @@ case "$CMD" in
         # Parse named arguments
         ALERT="" SEVERITY="" STATUS="" CLUSTER="" NAMESPACE="" SERVICE=""
         VERDICT="" ACTION="" CAUSE="" RESOLUTION="" RELATED_MR="" NOTES="" DURATION="" FP=""
-        KEDB_ID="" KEDB_REV="" KEDB_MATCH="" KEDB_PRED_VERDICT="" KEDB_PRED_ACTION="" CORROBORATION=""
+        KEDB_ID="" KEDB_REV="" KEDB_MATCH="" KEDB_PRED_VERDICT="" KEDB_PRED_ACTION="" CORROBORATION="" ESCALATION_OF=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --alert) ALERT="$2"; shift 2;;
@@ -167,6 +227,7 @@ case "$CMD" in
                 --kedb-predicted-verdict) KEDB_PRED_VERDICT="$2"; shift 2;;
                 --kedb-predicted-action) KEDB_PRED_ACTION="$2"; shift 2;;
                 --corroboration) CORROBORATION="$2"; shift 2;;
+                --escalation-of) ESCALATION_OF="$2"; shift 2;;
                 *) echo "Unknown arg: $1"; exit 1;;
             esac
         done
@@ -174,6 +235,19 @@ case "$CMD" in
         if [ -z "$ALERT" ] || [ -z "$SEVERITY" ] || [ -z "$VERDICT" ] || [ -z "$ACTION" ]; then
             echo "Required: --alert, --severity, --verdict, --action"
             exit 1
+        fi
+
+        # `escalated` means the operators were paged; see require_page.
+        if [ -n "$ESCALATION_OF" ] && [ "$ACTION" != "escalated" ]; then
+            echo "--escalation-of goes with --action escalated only" >&2
+            exit 1
+        fi
+        if [ "$ACTION" = "escalated" ]; then
+            if [ -z "$FP" ]; then
+                echo "Refused: --action escalated needs --fingerprint, the alert's, so the page behind it can be checked" >&2
+                exit 1
+            fi
+            require_page "$FP" "$ESCALATION_OF" || exit 1
         fi
 
         # The KEDB flags are copied from the alert's channel meta; each is optional, but a
@@ -203,9 +277,9 @@ case "$CMD" in
             DURATION_SQL="$(sql_int --duration "$DURATION")" || exit 1
         fi
 
-        sql_run <<< "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec, kedb_id, kedb_rev, kedb_match, kedb_predicted_verdict, kedb_predicted_action, corroboration) VALUES ($(sql_text "$ALERT"), $(sql_text "$FP"), $(sql_text "$SEVERITY"), $(sql_text "${STATUS:-firing}"), $(sql_text "$CLUSTER"), $(sql_text "$NAMESPACE"), $(sql_text "$SERVICE"), $(sql_text "$VERDICT"), $(sql_text "$ACTION"), $(sql_text "$CAUSE"), $(sql_text "$RESOLUTION"), $(sql_text "$RELATED_MR"), $(sql_text "$NOTES"), ${DURATION_SQL}, $(sql_text_or_null "$KEDB_ID"), $(sql_text_or_null "$KEDB_REV"), $(sql_text_or_null "$KEDB_MATCH"), $(sql_text_or_null "$KEDB_PRED_VERDICT"), $(sql_text_or_null "$KEDB_PRED_ACTION"), $(sql_text_or_null "$CORROBORATION"));" || exit 1
+        ID="$(sql_run <<< "INSERT INTO incidents (alert_name, fingerprint, severity, status, cluster, namespace, service, verdict, action, cause, resolution, related_mr, notes, investigation_duration_sec, kedb_id, kedb_rev, kedb_match, kedb_predicted_verdict, kedb_predicted_action, corroboration, escalation_of) VALUES ($(sql_text "$ALERT"), $(sql_text "$FP"), $(sql_text "$SEVERITY"), $(sql_text "${STATUS:-firing}"), $(sql_text "$CLUSTER"), $(sql_text "$NAMESPACE"), $(sql_text "$SERVICE"), $(sql_text "$VERDICT"), $(sql_text "$ACTION"), $(sql_text "$CAUSE"), $(sql_text "$RESOLUTION"), $(sql_text "$RELATED_MR"), $(sql_text "$NOTES"), ${DURATION_SQL}, $(sql_text_or_null "$KEDB_ID"), $(sql_text_or_null "$KEDB_REV"), $(sql_text_or_null "$KEDB_MATCH"), $(sql_text_or_null "$KEDB_PRED_VERDICT"), $(sql_text_or_null "$KEDB_PRED_ACTION"), $(sql_text_or_null "$CORROBORATION"), $(sql_text_or_null "$ESCALATION_OF")); SELECT last_insert_rowid();")" || exit 1
 
-        echo "Incident logged: $ALERT ($VERDICT → $ACTION)"
+        echo "Incident logged: #$ID $ALERT ($VERDICT → $ACTION)"
         ;;
 
     check)
@@ -310,6 +384,20 @@ case "$CMD" in
             echo "Pending escalations (unacknowledged, last 3 days: ${PENDING} in ${PENDING_COUNT} alert classes, latest first):"
             sql_run <<< "SELECT '  - [' || date(p.created_at) || '] ' || ${NAME} || ' — ' || p.fires || 'x' || COALESCE(' on ' || $(sql_clip c.clusters "$BRIEFING_NAME_CHARS"), '') || ' (latest #' || p.id || ')' || ${CAUSE} FROM (${PENDING_CLASSES}) AS p JOIN (${PENDING_CLUSTERS}) AS c USING (alert_name) WHERE p.latest = 1 ORDER BY p.created_at DESC, p.id DESC LIMIT ${BRIEFING_CLASSES};" || exit 1
             more_classes "$PENDING_COUNT" "./scripts/incidents.sh patterns --days 3"
+            echo ""
+        fi
+
+        # Recommended for escalation and never paged: the 2026-10-30 failure, made visible. A
+        # sub-agent logs pending_escalation; the main agent pages and runs mark-escalated within
+        # minutes. One still pending after 15 minutes was dropped.
+        UNPAGED_WINDOW="action = 'pending_escalation' AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-3 days') AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-15 minutes')"
+        UNPAGED=$(sql_run <<< "SELECT COUNT(*) FROM incidents WHERE ${UNPAGED_WINDOW};") || exit 1
+        if [ "$UNPAGED" != "0" ]; then
+            echo "Recommended for escalation but never paged (${UNPAGED}, last 3 days; escalate them or log why not):"
+            sql_run <<< "SELECT '  - #' || id || ' [' || created_at || '] ' || ${NAME} || ' on ' || ${LOCATION} || ${CAUSE} FROM incidents WHERE ${UNPAGED_WINDOW} ORDER BY created_at DESC, id DESC LIMIT ${BRIEFING_CLASSES};" || exit 1
+            if (( UNPAGED > BRIEFING_CLASSES )); then
+                echo "  … and $(( UNPAGED - BRIEFING_CLASSES )) more: ./scripts/incidents.sh patterns --days 3"
+            fi
             echo ""
         fi
 
@@ -426,6 +514,40 @@ case "$CMD" in
         sql_run -separator '' <<< "SELECT '[' || created_at || '] [' || phase || '] (' || author || ') ' || content FROM incident_context WHERE fingerprint = $(sql_text "$FP") ORDER BY created_at;"
         ;;
 
+    mark-escalated)
+        # The main agent, after the escalate tool paged for an incident a sub-agent logged as
+        # pending_escalation: record it as escalated, which require_page holds to a real page.
+        ID="" ESCALATION_OF=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --id) ID="$2"; shift 2;;
+                --escalation-of) ESCALATION_OF="$2"; shift 2;;
+                *) echo "Unknown arg: $1" >&2; exit 1;;
+            esac
+        done
+
+        if [ -z "$ID" ]; then
+            echo "Required: --id <incident id> [--escalation-of <paged fingerprint>]" >&2
+            exit 1
+        fi
+        ID="$(sql_int --id "$ID")" || exit 1
+
+        ROW="$(sql_run <<< "SELECT COUNT(*) || ' ' || COALESCE(MAX(fingerprint), '') FROM incidents WHERE id = ${ID};")" || exit 1
+        if [ "${ROW%% *}" != "1" ]; then
+            echo "No incident with id $ID; nothing marked" >&2
+            exit 1
+        fi
+        FP="${ROW#* }"
+        if [ -z "$FP" ]; then
+            echo "Refused: incident $ID was logged without a fingerprint, so no page can be tied to it. Log the alert again with --fingerprint." >&2
+            exit 1
+        fi
+        require_page "$FP" "$ESCALATION_OF" || exit 1
+
+        sql_run <<< "UPDATE incidents SET action = 'escalated', escalation_of = $(sql_text_or_null "$ESCALATION_OF") WHERE id = ${ID};" || exit 1
+        echo "Incident $ID marked escalated${ESCALATION_OF:+ (rides on the page for $ESCALATION_OF)}."
+        ;;
+
     resolve)
         # Mark an escalation as acknowledged/resolved
         ID="" RESOLUTION=""
@@ -485,6 +607,7 @@ case "$CMD" in
         echo ""
         echo "Commands:"
         echo "  log        Log a new incident (--alert, --severity, --verdict, --action, ...)"
+        echo "  mark-escalated  Record a paged incident as escalated (--id, [--escalation-of <fp>])"
         echo "  check      Check history for an alert (--alert, [--cluster], [--days])"
         echo "  fingerprint  Check a fingerprint (--fp)"
         echo "  patterns   Show recurring patterns ([--days])"
@@ -497,6 +620,10 @@ case "$CMD" in
         echo "log also takes the KEDB fields from the alert's meta: --kedb-id, --kedb-rev,"
         echo "  --kedb-match (exact|family|none), --kedb-predicted-verdict, --kedb-predicted-action,"
         echo "  --corroboration '{\"<check id>\":\"pass|fail|not-run\"}'"
+        echo ""
+        echo "--action escalated (log) and mark-escalated need a page: a live escalation of the incident's"
+        echo "  fingerprint the escalate tool was called for in the last ${ESCALATION_LINK_WINDOW_MIN} min, or --escalation-of"
+        echo "  naming a critical escalation posted in that window. Sub-agents log pending_escalation."
         echo ""
         echo "DB location: $DB"
         ;;
