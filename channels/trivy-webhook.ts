@@ -26,6 +26,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { requireLoopbackHost } from "./bind-address.js";
+import { parseHourUtc } from "./daily-slot.js";
 import { createJiraClient, readJiraConfig } from "./jira-client.js";
 import { operatorMentions, parseOperators } from "./operators.js";
 import { readBodyWithLimit, RequestBodyTooLarge } from "./request-body.js";
@@ -77,7 +78,7 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 // Same data/ directory as slack-sre.ts and incidents.db
 const DATA_DIR = process.env.SRE_DATA_DIR ?? join(dirname(dirname(resolve(fileURLToPath(import.meta.url)))), "data");
 // The daily digest goes out at this UTC hour (07:00 UTC is 08:00 or 09:00 in Paris)
-const DIGEST_HOUR_UTC = readHourUtc(process.env.TRIVY_DIGEST_HOUR_UTC ?? "7");
+const DIGEST_HOUR_UTC = parseHourUtc("TRIVY_DIGEST_HOUR_UTC", process.env.TRIVY_DIGEST_HOUR_UTC ?? "7");
 const DIGEST_CHECK_INTERVAL_MS = 60 * 1000;
 
 // Bounds on everything this process waits for (CLAUDE_ERROR_PATTERNS.md §14)
@@ -113,14 +114,6 @@ function requireSetting(name: string, what: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is not set; the Trivy channel needs ${what}`);
   return value;
-}
-
-function readHourUtc(raw: string): number {
-  const hour = Number(raw);
-  if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
-    throw new Error(`TRIVY_DIGEST_HOUR_UTC must be an integer hour from 0 to 23, got "${raw}"`);
-  }
-  return hour;
 }
 
 function errorMessage(err: unknown): string {
