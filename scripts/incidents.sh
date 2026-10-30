@@ -106,6 +106,10 @@ sql_run() {
     sqlite3 -bail "$@" "$DB"
 }
 
+# Time windows compare created_at, which is stored as strftime('%Y-%m-%dT%H:%M:%SZ'), against a
+# bound in the same format. datetime('now', ...) gives "YYYY-MM-DD HH:MM:SS", and as text "T"
+# sorts after " ": every row of the bound's own day compared as later than it, whatever its time.
+
 # Ensure DB exists
 mkdir -p "$(dirname "$DB")"
 if [ ! -f "$DB" ]; then
@@ -217,7 +221,7 @@ case "$CMD" in
         done
 
         DAYS="$(sql_int --days "$DAYS")" || exit 1
-        WHERE="alert_name = $(sql_text "$ALERT") AND created_at > datetime('now', '-${DAYS} days')"
+        WHERE="alert_name = $(sql_text "$ALERT") AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${DAYS} days')"
         [ -n "$CLUSTER" ] && WHERE="$WHERE AND cluster = $(sql_text "$CLUSTER")"
 
         sql_run -header -column <<< "SELECT created_at, verdict, action, cause, resolution FROM incidents WHERE $WHERE ORDER BY created_at DESC LIMIT 10;"
@@ -243,11 +247,11 @@ case "$CMD" in
         DAYS="$(sql_int --days "$DAYS")" || exit 1
 
         echo "=== Recurring Alerts (last ${DAYS} days) ==="
-        sql_run -header -column <<< "SELECT alert_name, cluster, service, COUNT(*) as fires, SUM(CASE WHEN verdict IN ('noise','false_positive','known_issue') THEN 1 ELSE 0 END) as noise, SUM(CASE WHEN verdict = 'real' THEN 1 ELSE 0 END) as real, SUM(CASE WHEN action = 'escalated' THEN 1 ELSE 0 END) as escalated, MAX(created_at) as last_seen FROM incidents WHERE created_at > datetime('now', '-${DAYS} days') GROUP BY alert_name, cluster, service HAVING COUNT(*) > 1 ORDER BY fires DESC;"
+        sql_run -header -column <<< "SELECT alert_name, cluster, service, COUNT(*) as fires, SUM(CASE WHEN verdict IN ('noise','false_positive','known_issue') THEN 1 ELSE 0 END) as noise, SUM(CASE WHEN verdict = 'real' THEN 1 ELSE 0 END) as real, SUM(CASE WHEN action = 'escalated' THEN 1 ELSE 0 END) as escalated, MAX(created_at) as last_seen FROM incidents WHERE created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${DAYS} days') GROUP BY alert_name, cluster, service HAVING COUNT(*) > 1 ORDER BY fires DESC;"
 
         echo ""
         echo "=== Pending Escalations ==="
-        sql_run -header -column <<< "SELECT id, created_at, alert_name, cluster, cause FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days') ORDER BY created_at DESC;"
+        sql_run -header -column <<< "SELECT id, created_at, alert_name, cluster, cause FROM incidents WHERE action = 'escalated' AND escalation_acknowledged = 0 AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-3 days') ORDER BY created_at DESC;"
         ;;
 
     briefing)
@@ -260,9 +264,9 @@ case "$CMD" in
         DAYS=7
         [ "${1:-}" = "--days" ] && DAYS="$2"
         DAYS="$(sql_int --days "$DAYS")" || exit 1
-        WINDOW="created_at > datetime('now', '-${DAYS} days')"
+        WINDOW="created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${DAYS} days')"
         NOISY="verdict IN ('noise','false_positive','known_issue')"
-        PENDING_WINDOW="action = 'escalated' AND escalation_acknowledged = 0 AND created_at > datetime('now', '-3 days')"
+        PENDING_WINDOW="action = 'escalated' AND escalation_acknowledged = 0 AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-3 days')"
         NAME="$(sql_clip alert_name "$BRIEFING_NAME_CHARS")"
         LOCATION="$(sql_clip "COALESCE(service || ' @ ' || cluster, service, cluster, '?')" "$BRIEFING_NAME_CHARS")"
         CAUSE="CASE WHEN cause IS NOT NULL AND cause != '' THEN ': ' || $(sql_clip cause "$BRIEFING_CAUSE_CHARS") ELSE '' END"

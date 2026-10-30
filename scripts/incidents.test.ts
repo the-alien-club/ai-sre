@@ -396,3 +396,17 @@ test("briefing has no proposal section when none is open or none was ever made",
   writeProposals(db, [sampleProposal({ status: "applied" })]);
   assert.doesNotMatch(run(db, "briefing").stdout, /Runbook proposals/);
 });
+
+test("the day windows end at the exact time, not at the start of the bound's day", () => {
+  // created_at is "YYYY-MM-DDTHH:MM:SSZ"; compared with datetime()'s "YYYY-MM-DD HH:MM:SS",
+  // every row of the bound's day sorted as inside the window
+  const db = scratchDb();
+  assert.equal(logIncident(db).status, 0);
+  assert.equal(logIncident(db, { "--fingerprint": "fp-old" }).status, 0);
+  query(db, "UPDATE incidents SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days', '-1 minute') WHERE id = 2;");
+
+  const result = run(db, "briefing", "--days", "7");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Total: 1 alerts processed/);
+});
