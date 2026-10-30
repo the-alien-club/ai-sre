@@ -12,6 +12,10 @@
 // The file is written atomically (temp file + rename) because the process can be killed
 // mid-write by pm2 at any moment, and a half-written JSON file on startup would be worse
 // than no file at all.
+//
+// scripts/incidents.sh reads this file too: it refuses to record an incident as escalated
+// unless a live record here shows the operators were told (see `mark-escalated` there).
+// Field names are therefore an interface, not an implementation detail.
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -19,7 +23,7 @@ import { dirname } from "node:path";
 export interface Escalation {
   alertFingerprint: string;
   alertName: string;
-  severity: string;
+  severity: Severity;
   environment: string; // "dev", "staging", "prod"
   slackThreadTs: string | undefined; // thread to nag in
   slackChannel: string | undefined; // channel to nag in
@@ -28,6 +32,33 @@ export interface Escalation {
   acknowledged: boolean; // an operator replied
   acknowledgedBy: string | undefined; // display name of whoever acknowledged
   nagCount: number;
+  /**
+   * No longer nags and no longer absorbs new escalations of its fingerprint: either a newer
+   * top-level escalation replaced it (escalator.ts), or it outlived SUPERSEDE_AFTER_MS.
+   * Kept so a reply in its thread still acknowledges, and so incidents.sh can tell it apart
+   * from a live page.
+   */
+  superseded: boolean;
+  /** Threads (in slackChannel) of earlier escalations of this fingerprint that this one replaced. */
+  earlierThreadTs: string[];
+  /** When the escalate tool was last called for this fingerprint, posting or not. */
+  lastRequestedAt: number;
+}
+
+/**
+ * The severities, lowest first. The escalate tool accepts only these, so a record carrying
+ * anything else was written by hand and is dropped on load.
+ */
+export const SEVERITIES = ["info", "warning", "critical"] as const;
+export type Severity = (typeof SEVERITIES)[number];
+
+export function isSeverity(value: string): value is Severity {
+  return SEVERITIES.some((severity) => severity === value);
+}
+
+/** Positive when `a` is more severe than `b`. */
+export function compareSeverity(a: Severity, b: Severity): number {
+  return SEVERITIES.indexOf(a) - SEVERITIES.indexOf(b);
 }
 
 export interface EscalationStoreOptions {
@@ -46,7 +77,19 @@ export interface EscalationStore {
 
 const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-function isEscalation(value: unknown): value is Escalation {
+/**
+ * An escalation older than this is superseded at startup (supersedeOlderThan). On 2026-10-30
+ * 42 records, several nagged 17-26 times in-thread and never answered, kept absorbing new
+ * alerts of their fingerprints, so the read-only Postgres outage paged nobody.
+ */
+export const SUPERSEDE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/** The fields 0.10.0 added. A record written before it has none of them. */
+type AddedIn010 = "superseded" | "earlierThreadTs" | "lastRequestedAt";
+
+type StoredEscalation = Omit<Escalation, AddedIn010> & Partial<Pick<Escalation, AddedIn010>>;
+
+function isStoredEscalation(value: unknown): value is StoredEscalation {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
 
@@ -54,6 +97,7 @@ function isEscalation(value: unknown): value is Escalation {
     typeof candidate.alertFingerprint === "string" &&
     typeof candidate.alertName === "string" &&
     typeof candidate.severity === "string" &&
+    isSeverity(candidate.severity) &&
     typeof candidate.environment === "string" &&
     (candidate.slackThreadTs === undefined ||
       typeof candidate.slackThreadTs === "string") &&
@@ -64,8 +108,37 @@ function isEscalation(value: unknown): value is Escalation {
     typeof candidate.acknowledged === "boolean" &&
     (candidate.acknowledgedBy === undefined ||
       typeof candidate.acknowledgedBy === "string") &&
-    typeof candidate.nagCount === "number"
+    typeof candidate.nagCount === "number" &&
+    (candidate.superseded === undefined || typeof candidate.superseded === "boolean") &&
+    (candidate.earlierThreadTs === undefined ||
+      (Array.isArray(candidate.earlierThreadTs) && candidate.earlierThreadTs.every((ts) => typeof ts === "string"))) &&
+    (candidate.lastRequestedAt === undefined || typeof candidate.lastRequestedAt === "number")
   );
+}
+
+/**
+ * The escalations a reply in `threadTs` acknowledges: the one posted there, and the one that
+ * replaced it (an operator answering the earlier, quieter thread has still answered).
+ */
+export function escalationsForThread(escalations: Map<string, Escalation>, threadTs: string): Escalation[] {
+  return [...escalations.values()].filter((e) => e.slackThreadTs === threadTs || e.earlierThreadTs.includes(threadTs));
+}
+
+/**
+ * Marks every live escalation posted before `now - ageMs` as superseded, and returns how many
+ * it marked. Idempotent: a superseded one stays as it is. Run once at startup, so the nightly
+ * restart retires what nobody answered in a day; the escalate tool's staleness window
+ * (escalator.ts) is what stops a stale thread from absorbing a new alert in between.
+ */
+export function supersedeOlderThan(escalations: Map<string, Escalation>, now: number, ageMs: number): number {
+  const cutoff = now - ageMs;
+  let marked = 0;
+  for (const escalation of escalations.values()) {
+    if (escalation.superseded || escalation.escalatedAt >= cutoff) continue;
+    escalation.superseded = true;
+    marked++;
+  }
+  return marked;
 }
 
 export function createEscalationStore(
@@ -116,7 +189,7 @@ export function createEscalationStore(
       let dropped = 0;
 
       for (const entry of parsed) {
-        if (!isEscalation(entry)) {
+        if (!isStoredEscalation(entry)) {
           dropped++;
           continue;
         }
@@ -127,7 +200,9 @@ export function createEscalationStore(
         // Rebuild rather than adopt the parsed object: JSON.stringify omits undefined
         // properties, so a round-tripped entry is missing the optional keys the type
         // declares. Copying field by field also drops anything the file has that the
-        // current shape does not.
+        // current shape does not. A record from before 0.10.0 lacks the fields it added: it was
+        // live (nothing superseded anything then), replaced no thread, and was last asked for
+        // when it was posted.
         restored.set(entry.alertFingerprint, {
           alertFingerprint: entry.alertFingerprint,
           alertName: entry.alertName,
@@ -140,6 +215,9 @@ export function createEscalationStore(
           acknowledged: entry.acknowledged,
           acknowledgedBy: entry.acknowledgedBy,
           nagCount: entry.nagCount,
+          superseded: entry.superseded ?? false,
+          earlierThreadTs: [...(entry.earlierThreadTs ?? [])],
+          lastRequestedAt: entry.lastRequestedAt ?? entry.escalatedAt,
         });
       }
 

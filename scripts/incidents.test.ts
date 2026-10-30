@@ -35,7 +35,7 @@ function logIncident(db: string, overrides: Record<string, string> = {}) {
     "--alert": "High Error Rate",
     "--severity": "critical",
     "--verdict": "real",
-    "--action": "escalated",
+    "--action": "pending_escalation",
     "--cluster": "platform-prod",
     "--fingerprint": "fp-1",
     ...overrides,
@@ -50,7 +50,7 @@ test("a logged incident is stored and found by check", () => {
   assert.equal(logIncident(db).status, 0);
   const out = run(db, "check", "--alert", "High Error Rate", "--cluster", "platform-prod");
   assert.equal(out.status, 0);
-  assert.match(out.stdout, /escalated/);
+  assert.match(out.stdout, /pending_escalation/);
 });
 
 test("a hostile fingerprint is stored verbatim and the table survives", () => {
@@ -85,7 +85,7 @@ test("a hostile cluster filter in check matches nothing and drops nothing", () =
   logIncident(db);
   const out = run(db, "check", "--alert", "High Error Rate", "--cluster", "' OR '1'='1");
   assert.equal(out.status, 0);
-  assert.doesNotMatch(out.stdout, /escalated/);
+  assert.doesNotMatch(out.stdout, /pending_escalation/);
   assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "1");
 });
 
@@ -228,7 +228,7 @@ test("briefing tells the same noisy alert on different clusters apart", () => {
 
 // -- KEDB columns, flags, correct and briefing (plan §6) --
 
-const KEDB_COLUMNS = ["kedb_id", "kedb_rev", "kedb_match", "kedb_predicted_verdict", "kedb_predicted_action", "corroboration", "operator_verdict", "operator_verdict_by", "operator_verdict_at"];
+const KEDB_COLUMNS = ["kedb_id", "kedb_rev", "kedb_match", "kedb_predicted_verdict", "kedb_predicted_action", "corroboration", "operator_verdict", "operator_verdict_by", "operator_verdict_at", "escalation_of"];
 
 function columns(db: string): string[] {
   return query(db, "SELECT name FROM pragma_table_info('incidents');").split("\n");
@@ -395,4 +395,196 @@ test("briefing has no proposal section when none is open or none was ever made",
   assert.doesNotMatch(run(db, "briefing").stdout, /Runbook proposals/);
   writeProposals(db, [sampleProposal({ status: "applied" })]);
   assert.doesNotMatch(run(db, "briefing").stdout, /Runbook proposals/);
+});
+
+// -- No "escalated" without a page (2026-10-30) ---------------------------------------------
+//
+// Every alert of the read-only Postgres outage was logged "escalated", "already escalated",
+// while nobody was paged. `escalated` now needs a live escalation that the escalate tool was
+// called for, or --escalation-of naming a fresh critical page.
+
+const MINUTE = 60 * 1000;
+
+interface StoredEscalation {
+  alertFingerprint: string;
+  severity: string;
+  escalatedAt: number;
+  superseded?: boolean;
+  lastRequestedAt?: number;
+}
+
+/** Writes slack-escalations.json beside the database, as slack-sre does. */
+function writeEscalations(db: string, escalations: StoredEscalation[]): void {
+  const full = escalations.map((e) => ({
+    alertName: "Database Errors",
+    environment: "prod",
+    slackThreadTs: "1790000001.000100",
+    slackChannel: "C0TEAM",
+    lastNagAt: e.escalatedAt,
+    acknowledged: false,
+    nagCount: 0,
+    earlierThreadTs: [],
+    ...e,
+  }));
+  writeFileSync(join(dirname(db), "slack-escalations.json"), JSON.stringify(full));
+}
+
+function logEscalated(db: string, overrides: Record<string, string> = {}) {
+  return logIncident(db, { "--action": "escalated", ...overrides });
+}
+
+test("escalated is refused when nothing was paged, and nothing is logged", () => {
+  const db = scratchDb();
+
+  const noStore = logEscalated(db);
+  assert.notEqual(noStore.status, 0);
+  assert.match(noStore.stderr, /nothing has been paged/);
+
+  writeEscalations(db, [{ alertFingerprint: "other", severity: "critical", escalatedAt: Date.now() }]);
+  const unknown = logEscalated(db);
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stderr, /nothing was paged for fingerprint fp-1/);
+  assert.match(unknown.stderr, /Call the escalate tool/);
+  assert.match(unknown.stderr, /pending_escalation/);
+  assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "0");
+});
+
+test("escalated needs a fingerprint", () => {
+  const db = scratchDb();
+  const result = run(db, "log", "--alert", "X", "--severity", "critical", "--verdict", "real", "--action", "escalated");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /needs --fingerprint/);
+});
+
+test("escalated is logged against a live escalation the escalate tool was just called for", () => {
+  const db = scratchDb();
+  writeEscalations(db, [{ alertFingerprint: "fp-1", severity: "warning", escalatedAt: Date.now() - 30 * 60 * MINUTE, lastRequestedAt: Date.now() - MINUTE }]);
+
+  const result = logEscalated(db);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Incident logged: #1 /);
+  assert.equal(query(db, "SELECT action, escalation_of IS NULL FROM incidents;"), "escalated|1");
+});
+
+test("escalated is refused against a superseded escalation, or one escalate has not been called for lately", () => {
+  const db = scratchDb();
+  writeEscalations(db, [
+    { alertFingerprint: "fp-1", severity: "critical", escalatedAt: Date.now() - MINUTE, superseded: true },
+    // The disk alert: escalated 27 h earlier as a warning, never asked for again
+    { alertFingerprint: "7f100f271c9afa3b", severity: "warning", escalatedAt: Date.now() - 27 * 60 * MINUTE },
+  ]);
+
+  const superseded = logEscalated(db);
+  assert.notEqual(superseded.status, 0);
+  assert.match(superseded.stderr, /superseded/);
+
+  const stale = logEscalated(db, { "--fingerprint": "7f100f271c9afa3b" });
+  assert.notEqual(stale.status, 0);
+  assert.match(stale.stderr, /escalate was last called for 7f100f271c9afa3b 16(19|20) min ago, more than 120/);
+  assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "0");
+});
+
+test("--escalation-of links an incident to a fresh critical page, and is checked", () => {
+  const db = scratchDb();
+  writeEscalations(db, [
+    { alertFingerprint: "paged", severity: "critical", escalatedAt: Date.now() - 10 * MINUTE },
+    { alertFingerprint: "quiet", severity: "warning", escalatedAt: Date.now() - 10 * MINUTE },
+    { alertFingerprint: "old", severity: "critical", escalatedAt: Date.now() - 3 * 60 * MINUTE, lastRequestedAt: Date.now() },
+    { alertFingerprint: "retired", severity: "critical", escalatedAt: Date.now() - MINUTE, superseded: true },
+  ]);
+
+  const linked = logEscalated(db, { "--fingerprint": "e3ba31214e99b763", "--escalation-of": "paged" });
+  assert.equal(linked.status, 0, linked.stderr);
+  assert.equal(query(db, "SELECT escalation_of FROM incidents;"), "paged");
+
+  const refusals: Array<[string, RegExp]> = [
+    ["quiet", /is a warning escalation, which paged nobody/],
+    // Whole seconds in the script, milliseconds here: either side of the minute
+    ["old", /was posted 1(79|80) min ago, more than 120/],
+    ["retired", /was superseded/],
+    ["missing", /no escalation of that fingerprint exists/],
+  ];
+  for (const [target, reason] of refusals) {
+    const result = logEscalated(db, { "--fingerprint": "e3ba31214e99b763", "--escalation-of": target });
+    assert.notEqual(result.status, 0, target);
+    assert.match(result.stderr, reason, target);
+  }
+  assert.equal(query(db, "SELECT COUNT(*) FROM incidents;"), "1");
+});
+
+test("--escalation-of without --action escalated is a usage error", () => {
+  const db = scratchDb();
+  const result = logIncident(db, { "--escalation-of": "paged" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /goes with --action escalated only/);
+});
+
+test("an unreadable escalation store refuses escalated, saying so", () => {
+  const db = scratchDb();
+  writeFileSync(join(dirname(db), "slack-escalations.json"), "{ not json");
+  const result = logEscalated(db);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is unreadable/);
+});
+
+test("mark-escalated turns a sub-agent's pending_escalation into escalated once paged", () => {
+  const db = scratchDb();
+  assert.equal(logIncident(db).status, 0);
+
+  const before = run(db, "mark-escalated", "--id", "1");
+  assert.notEqual(before.status, 0);
+  assert.match(before.stderr, /nothing has been paged/);
+  assert.equal(query(db, "SELECT action FROM incidents;"), "pending_escalation");
+
+  writeEscalations(db, [{ alertFingerprint: "fp-1", severity: "critical", escalatedAt: Date.now() }]);
+  const after = run(db, "mark-escalated", "--id", "1");
+  assert.equal(after.status, 0, after.stderr);
+  assert.equal(query(db, "SELECT action FROM incidents;"), "escalated");
+});
+
+test("mark-escalated checks its id, the incident's fingerprint and the linked page", () => {
+  const db = scratchDb();
+  writeEscalations(db, [{ alertFingerprint: "paged", severity: "critical", escalatedAt: Date.now() }]);
+  assert.equal(logIncident(db, { "--fingerprint": "e3ba31214e99b763" }).status, 0);
+  assert.equal(run(db, "log", "--alert", "X", "--severity", "critical", "--verdict", "real", "--action", "pending_escalation").status, 0);
+
+  assert.match(run(db, "mark-escalated", "--id", "9").stderr, /No incident with id 9/);
+  assert.match(run(db, "mark-escalated", "--id", "2").stderr, /logged without a fingerprint/);
+  assert.match(run(db, "mark-escalated").stderr, /Required: --id/);
+  assert.match(run(db, "mark-escalated", "--id", "1; DROP TABLE incidents").stderr, /expected a non-negative integer/);
+
+  const linked = run(db, "mark-escalated", "--id", "1", "--escalation-of", "paged");
+  assert.equal(linked.status, 0, linked.stderr);
+  assert.equal(query(db, "SELECT action, escalation_of FROM incidents WHERE id = 1;"), "escalated|paged");
+});
+
+test("briefing lists incidents recommended for escalation that were never paged", () => {
+  const db = scratchDb();
+  // Logged just now: the main agent is still on it
+  assert.equal(logIncident(db).status, 0);
+  bulkInsert(db, 2, "SELECT 'Database Errors', 'critical', 'firing', 'platform-prod', 'backend', 'real', 'pending_escalation', 'Postgres read-only' FROM n");
+  query(db, "UPDATE incidents SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes') WHERE id > 1;");
+
+  const result = run(db, "briefing");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Recommended for escalation but never paged \(2, last 3 days/);
+  assert.match(result.stdout, /^ {2}- #3 \[.*\] Database Errors on backend @ platform-prod: Postgres read-only$/m);
+  assert.match(result.stdout, /^ {2}- #2 /m);
+  assert.doesNotMatch(result.stdout, /- #1 /);
+});
+
+test("the day windows end at the exact time, not at the start of the bound's day", () => {
+  // created_at is "YYYY-MM-DDTHH:MM:SSZ"; compared with datetime()'s "YYYY-MM-DD HH:MM:SS",
+  // every row of the bound's day sorted as inside the window
+  const db = scratchDb();
+  assert.equal(logIncident(db).status, 0);
+  assert.equal(logIncident(db, { "--fingerprint": "fp-old" }).status, 0);
+  query(db, "UPDATE incidents SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days', '-1 minute') WHERE id = 2;");
+
+  const result = run(db, "briefing", "--days", "7");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Total: 1 alerts processed/);
 });

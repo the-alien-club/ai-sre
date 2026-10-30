@@ -15,7 +15,7 @@ function database(): string {
     const result = spawnSync("bash", ["scripts/incidents.sh", "log", ...args], { env: { ...process.env, INCIDENTS_DB: db }, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   };
-  const base = ["--severity", "critical", "--verdict", "real", "--action", "escalated", "--cluster", "platform-prod"];
+  const base = ["--severity", "critical", "--verdict", "real", "--action", "pending_escalation", "--cluster", "platform-prod"];
   log(["--alert", "Falco Suspicious Process", "--fingerprint", "2ecf15e3f8af5ccc", ...base]);
   log(["--alert", "Postgres Disk Above 85%", "--fingerprint", "9a8b7c6d5e4f3a2b", ...base]);
   log(["--alert", "Logged without a fingerprint", ...base]);

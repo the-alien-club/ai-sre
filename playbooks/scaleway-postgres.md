@@ -22,6 +22,13 @@ The alert label `resource_name` is the Scaleway DB cluster name (e.g. `productio
 - **Replication lag**: needs Scaleway intervention (check status page) or capacity decision. Do not auto-anything.
 - **Disk pressure**: cannot expand RDB disk programmatically without a Scaleway console action (which causes brief downtime). Escalate with growth-rate forecast (days-to-full).
 
+**Disk pressure is critical when it is the impact, whatever the alert's label says.** The disk
+alert is labelled warning. Above ~95%, or as soon as anything reports the instance read-only
+(PG error `25006`, `cannot execute ... in a read-only transaction`), it is the cause of a prod
+outage. Recommend `escalate` with severity **critical**, `raised_from: warning` and a
+`raise_reason` such as "disk at 98%, cause of the read-only outage". On 2026-10-30 the label's
+warning severity is how a 1 h 40 min read-only outage of prod Postgres paged nobody.
+
 ## Escalation message template
 
 ```

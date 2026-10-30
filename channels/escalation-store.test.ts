@@ -11,6 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createEscalationStore,
+  escalationsForThread,
+  SUPERSEDE_AFTER_MS,
+  supersedeOlderThan,
   type Escalation,
 } from "./escalation-store.js";
 
@@ -31,6 +34,9 @@ function escalation(overrides: Partial<Escalation> = {}): Escalation {
     acknowledged: false,
     acknowledgedBy: undefined,
     nagCount: 3,
+    superseded: false,
+    earlierThreadTs: [],
+    lastRequestedAt: 1_790_056_749_000,
     ...overrides,
   };
 }
@@ -178,4 +184,80 @@ test("a save leaves no temp file behind", () => {
   assert.throws(() => readFileSync(`${path}.tmp`, "utf8"));
 
   rmSync(path, { force: true });
+});
+
+test("a record written before 0.10.0 loads as live, with no earlier threads, last requested when posted", () => {
+  const path = scratchPath();
+  const legacy: Record<string, unknown> = { ...escalation() };
+  delete legacy.superseded;
+  delete legacy.earlierThreadTs;
+  delete legacy.lastRequestedAt;
+  writeFileSync(path, JSON.stringify([legacy]), "utf8");
+
+  const restored = createEscalationStore({ path, now: () => 1_790_057_349_000 }).load();
+
+  assert.deepEqual(restored.get("fp-skupper-gateway-prod"), escalation({ lastRequestedAt: 1_790_056_749_000 }));
+  rmSync(path, { force: true });
+});
+
+test("the superseded state and earlier threads survive a round-trip", () => {
+  const path = scratchPath();
+  const store = createEscalationStore({ path, now: () => 1_790_057_349_000 });
+  const saved = escalation({ superseded: true, earlierThreadTs: ["1790000000.000100"], lastRequestedAt: 1_790_057_000_000 });
+
+  store.save(new Map([["fp-skupper-gateway-prod", saved]]));
+
+  assert.deepEqual(store.load().get("fp-skupper-gateway-prod"), saved);
+  rmSync(path, { force: true });
+});
+
+test("a record with an unknown severity or a malformed new field is dropped", () => {
+  const path = scratchPath();
+  writeFileSync(
+    path,
+    JSON.stringify([
+      { ...escalation({ alertFingerprint: "fp-page" }), severity: "page" },
+      { ...escalation({ alertFingerprint: "fp-threads" }), earlierThreadTs: [42] },
+      { ...escalation({ alertFingerprint: "fp-superseded" }), superseded: "yes" },
+      escalation({ alertFingerprint: "fp-good" }),
+    ]),
+    "utf8"
+  );
+
+  const restored = createEscalationStore({ path, now: () => 1_790_057_349_000 }).load();
+
+  assert.deepEqual([...restored.keys()], ["fp-good"]);
+  rmSync(path, { force: true });
+});
+
+test("the startup step supersedes escalations older than a day, once, and leaves the rest live", () => {
+  const now = 1_790_100_000_000;
+  const escalations = new Map([
+    ["old", escalation({ alertFingerprint: "old", escalatedAt: now - SUPERSEDE_AFTER_MS - 1 })],
+    ["old-acked", escalation({ alertFingerprint: "old-acked", escalatedAt: now - 3 * SUPERSEDE_AFTER_MS, acknowledged: true })],
+    ["young", escalation({ alertFingerprint: "young", escalatedAt: now - SUPERSEDE_AFTER_MS + 1 })],
+  ]);
+
+  assert.equal(supersedeOlderThan(escalations, now, SUPERSEDE_AFTER_MS), 2);
+  assert.equal(supersedeOlderThan(escalations, now, SUPERSEDE_AFTER_MS), 0, "idempotent");
+
+  assert.equal(escalations.get("old")?.superseded, true);
+  assert.equal(escalations.get("old-acked")?.superseded, true);
+  assert.equal(escalations.get("young")?.superseded, false);
+  // Nothing else about them changes: a reply in their thread still acknowledges
+  assert.equal(escalations.get("old")?.nagCount, 3);
+});
+
+test("a reply acknowledges the escalation posted in its thread and the one that re-paged it", () => {
+  const live = escalation({ alertFingerprint: "fp-live", slackThreadTs: "1790000002.000100", earlierThreadTs: ["1790000001.000100"] });
+  const other = escalation({ alertFingerprint: "fp-other", slackThreadTs: "1790000003.000100" });
+  const escalations = new Map([
+    ["fp-live", live],
+    ["fp-other", other],
+  ]);
+
+  assert.deepEqual(escalationsForThread(escalations, "1790000001.000100"), [live]);
+  assert.deepEqual(escalationsForThread(escalations, "1790000002.000100"), [live]);
+  assert.deepEqual(escalationsForThread(escalations, "1790000003.000100"), [other]);
+  assert.deepEqual(escalationsForThread(escalations, "1790000009.000100"), []);
 });

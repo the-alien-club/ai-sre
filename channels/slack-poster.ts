@@ -19,7 +19,7 @@ import { withTimeout } from "./with-timeout.js";
 /** The slice of @slack/web-api's WebClient this module needs. Narrow, so tests can stub it. */
 export interface ChatClient {
   chat: {
-    postMessage(args: { channel: string; text: string; thread_ts?: string }): Promise<{ ok?: boolean; ts?: string; error?: string }>;
+    postMessage(args: SlackMessage): Promise<{ ok?: boolean; ts?: string; error?: string }>;
   };
   conversations: {
     history(args: { channel: string; oldest: string; limit: number }): Promise<{
@@ -38,10 +38,18 @@ export class SlackPostRejected extends Error {
   }
 }
 
-export interface SlackMessage {
-  channel: string;
-  text: string;
-  thread_ts?: string;
+/**
+ * A message, top-level or in a thread. A broadcast reply ("Also send to #channel") needs its
+ * thread, which is the shape Slack's own ChatPostMessageArguments enforces.
+ */
+export type SlackMessage =
+  | { channel: string; text: string; thread_ts?: string; reply_broadcast?: false }
+  | { channel: string; text: string; thread_ts: string; reply_broadcast: true };
+
+/** A post failure as the agent or the log should read it: refused, or of unknown outcome. */
+export function describePostFailure(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return err instanceof SlackPostRejected ? message : `${message} (the message may or may not be visible)`;
 }
 
 export interface SlackPoster {

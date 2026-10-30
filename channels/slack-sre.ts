@@ -39,9 +39,18 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyAddressing, stripBotMention } from "./message-gate.js";
 import { createThreadOwnership } from "./thread-ownership.js";
-import { createEscalationStore } from "./escalation-store.js";
-import { createEscalator } from "./escalator.js";
-import { createSlackPostClient, createSlackPoster, SlackPostRejected } from "./slack-poster.js";
+import {
+  createEscalationStore,
+  escalationsForThread,
+  SUPERSEDE_AFTER_MS,
+  supersedeOlderThan,
+} from "./escalation-store.js";
+import { createEscalator, parseEscalateArgs, type EscalateOutcome } from "./escalator.js";
+import { dueNag, type NagSettings } from "./escalation-nag.js";
+import { buildEscalationDigest, createDigestClock } from "./escalation-digest.js";
+import { isDailySlotDue, parseHourUtc } from "./daily-slot.js";
+import { slackPermalink } from "./kedb-approval.js";
+import { createSlackPostClient, createSlackPoster, describePostFailure, SlackPostRejected } from "./slack-poster.js";
 import { withTimeout } from "./with-timeout.js";
 import { normalizeReplyText } from "./slack-text.js";
 import { isTrivyEscalation, TRIVY_ESCALATION_REFUSED } from "./escalation-policy.js";
@@ -104,40 +113,62 @@ const SRE_KEDB_APPROVERS_RAW = requireEnv(
   '  Slack user IDs, comma-separated, e.g. "U054PDMV69X" (Leo).'
 );
 
-// Escalation settings
-const ESCALATION_INTERVAL_MS = parseInt(
-  process.env.ESCALATION_INTERVAL_MS ?? String(10 * 60 * 1000), // 10 minutes
-  10
-);
-const DEV_ESCALATION_INTERVAL_MS = parseInt(
-  process.env.DEV_ESCALATION_INTERVAL_MS ?? String(60 * 60 * 1000), // 1 hour for dev
-  10
-);
-// After this many nags, stop pushing events into the Claude session (context preservation).
-// Slack nags continue at a slower rate (every 2h) so the team still gets poked.
-const MAX_AGENT_NAGS = parseInt(
-  process.env.MAX_AGENT_NAGS ?? "6", // 6 × 10min = 1h for prod; 6 × 1h = 6h for dev
-  10
-);
-const SLACK_ONLY_INTERVAL_MS = parseInt(
-  process.env.SLACK_ONLY_INTERVAL_MS ?? String(2 * 60 * 60 * 1000), // 2 hours
-  10
-);
-
 /**
- * An optional integer setting in ms, or exit with an actionable message. A typo here must not
- * quietly turn a timer off (parseInt("5m") is 5, parseInt("") is NaN).
+ * An optional integer setting, or exit with an actionable message. A typo here must not
+ * quietly turn a timer off (parseInt("5m") is 5, parseInt("") is NaN), and a value outside
+ * [min, max] is a misconfiguration, not something to clamp.
  */
-function msEnv(name: string, fallback: number, min: number): number {
+function intEnv(name: string, unit: string, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < min) {
-    console.error(`[slack-sre] ${name} must be an integer number of ms, at least ${min}; got ${JSON.stringify(raw)}`);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    const range = max === Number.MAX_SAFE_INTEGER ? `at least ${min}` : `from ${min} to ${max}`;
+    console.error(`[slack-sre] ${name} must be an integer ${unit}, ${range}; got ${JSON.stringify(raw)}`);
     process.exit(1);
   }
   return value;
 }
+
+function msEnv(name: string, fallback: number, min: number, max?: number): number {
+  return intEnv(name, "number of ms", fallback, min, max);
+}
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+
+// Escalation settings. Every value is validated; the effective ones are logged at startup.
+// Between nags of an unacknowledged critical escalation: prod, then dev and staging.
+const ESCALATION_INTERVAL_MS = msEnv("ESCALATION_INTERVAL_MS", 10 * MINUTE_MS, MINUTE_MS);
+const DEV_ESCALATION_INTERVAL_MS = msEnv("DEV_ESCALATION_INTERVAL_MS", HOUR_MS, MINUTE_MS);
+// After this many nags, stop pushing events into the Claude session (context preservation).
+// Slack nags continue at a slower rate (every 2h) so the team still gets poked.
+const MAX_AGENT_NAGS = intEnv("MAX_AGENT_NAGS", "count of nags", 6, 1); // 6 × 10min = 1h for prod
+const SLACK_ONLY_INTERVAL_MS = msEnv("SLACK_ONLY_INTERVAL_MS", 2 * HOUR_MS, MINUTE_MS);
+// Every Nth nag of a critical prod escalation is also broadcast to the channel: an in-thread
+// reply is invisible to anyone not following the thread.
+const ESCALATION_BROADCAST_EVERY = intEnv("ESCALATION_BROADCAST_EVERY", "count of nags", 3, 1);
+// How old a waiting escalation thread may be before a new escalation of its fingerprint posts
+// a fresh top-level page instead of joining it (escalator.ts). Critical: 2 h, so a quiet
+// thread from yesterday can never hide today's outage (2026-10-30). Bounded above by the 24 h
+// after which the startup step retires an escalation anyway.
+const ESCALATION_STALE_CRITICAL_MS = msEnv("ESCALATION_STALE_CRITICAL_MS", 2 * HOUR_MS, 10 * MINUTE_MS, SUPERSEDE_AFTER_MS);
+const ESCALATION_STALE_OTHER_MS = msEnv("ESCALATION_STALE_OTHER_MS", 24 * HOUR_MS, HOUR_MS, SUPERSEDE_AFTER_MS);
+// The UTC hour the daily digest of unacknowledged escalations goes out (warnings are not
+// nagged in-thread; this is their reminder). 07:00 UTC, with the Trivy digest.
+let ESCALATION_DIGEST_HOUR_UTC: number;
+try {
+  ESCALATION_DIGEST_HOUR_UTC = parseHourUtc("ESCALATION_DIGEST_HOUR_UTC", process.env.ESCALATION_DIGEST_HOUR_UTC ?? "7");
+} catch (err) {
+  console.error(`[slack-sre] ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+}
+console.error(
+  `[slack-sre] escalations: re-page a waiting thread after ${ESCALATION_STALE_CRITICAL_MS / MINUTE_MS} min (critical) / ` +
+    `${ESCALATION_STALE_OTHER_MS / MINUTE_MS} min (warning, info); critical nags every ${ESCALATION_INTERVAL_MS / MINUTE_MS} min ` +
+    `(prod) / ${DEV_ESCALATION_INTERVAL_MS / MINUTE_MS} min (dev, staging), each ${ESCALATION_BROADCAST_EVERY}th one broadcast in prod; ` +
+    `digest at ${ESCALATION_DIGEST_HOUR_UTC}:00 UTC`
+);
 
 // How long an operator waits with no visible sign that their message landed before the
 // channel says so on the agent's behalf. The runbook requires the agent to delegate all
@@ -182,6 +213,15 @@ try {
 const OPERATOR_MENTIONS = operatorMentions(OPERATORS);
 const OPERATOR_ROSTER = operatorRoster(OPERATORS);
 
+const NAG_SETTINGS: NagSettings = {
+  prodIntervalMs: ESCALATION_INTERVAL_MS,
+  nonProdIntervalMs: DEV_ESCALATION_INTERVAL_MS,
+  slackOnlyIntervalMs: SLACK_ONLY_INTERVAL_MS,
+  maxAgentNags: MAX_AGENT_NAGS,
+  broadcastEvery: ESCALATION_BROADCAST_EVERY,
+  operatorMentions: OPERATOR_MENTIONS,
+};
+
 // -- Escalation tracking ------------------------------------------------------
 //
 // Persisted: an unacknowledged alert must keep nagging across the nightly restart, and
@@ -201,6 +241,16 @@ if (activeEscalations.size > 0) {
 function persistEscalations(): void {
   escalationStore.save(activeEscalations);
 }
+
+// Retire what nobody answered in a day, so it stops nagging and stops absorbing new alerts.
+// Idempotent, and run on every start: the nightly restart makes it a daily sweep.
+const retiredEscalations = supersedeOlderThan(activeEscalations, Date.now(), SUPERSEDE_AFTER_MS);
+if (retiredEscalations > 0) {
+  persistEscalations();
+  console.error(`[slack-sre] superseded ${retiredEscalations} escalation(s) older than ${SUPERSEDE_AFTER_MS / HOUR_MS} h`);
+}
+
+const digestClock = createDigestClock(join(DATA_DIR, "slack-escalation-digest.json"));
 
 // -- Pending permission requests ----------------------------------------------
 //
@@ -260,12 +310,6 @@ const AGENT_NOTIFY_TIMEOUT_MS = 10 * 1000;
 // twice. One bounded attempt; this process decides whether to try again (slack-poster.ts).
 const slackPoster = createSlackPoster(createSlackPostClient(SLACK_BOT_TOKEN, SLACK_TIMEOUT_MS), SLACK_TIMEOUT_MS);
 
-/** A post failure as the agent or the log should read it: refused, or of unknown outcome. */
-function describePostFailure(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  return err instanceof SlackPostRejected ? message : `${message} (the message may or may not be visible)`;
-}
-
 /** For posts nobody waits on: a failure is logged, never thrown. */
 async function postOrLog(message: { channel: string; text: string; thread_ts?: string }, what: string): Promise<void> {
   try {
@@ -288,7 +332,12 @@ const threadOwnership = createThreadOwnership({
   botUserId: () => BOT_USER_ID,
 });
 
-// One top-level thread per waiting escalation; see escalator.ts.
+/** A link to a message in the team's workspace. SLACK_TEAM_URL is resolved before any tool runs. */
+function threadLink(channel: string, ts: string): string {
+  return slackPermalink(SLACK_TEAM_URL, channel, ts);
+}
+
+// One top-level thread per waiting escalation, re-paged when it goes stale; see escalator.ts.
 const escalator = createEscalator({
   channel: SRE_SLACK_CHANNEL,
   operatorMentions: OPERATOR_MENTIONS,
@@ -297,7 +346,40 @@ const escalator = createEscalator({
   poster: slackPoster,
   botUserId: () => BOT_USER_ID,
   rememberThread: (ts) => threadOwnership.remember(ts),
+  threadLink,
+  staleAfter: { criticalMs: ESCALATION_STALE_CRITICAL_MS, otherMs: ESCALATION_STALE_OTHER_MS },
 });
+
+/** The escalate tool's answer, worded so the agent knows what the operators saw. */
+function describeEscalation(outcome: EscalateOutcome): { text: string; isError: boolean } {
+  const thread = JSON.stringify({ channel: outcome.channel, thread_ts: outcome.ts });
+  if (outcome.kind === "posted") {
+    const how = outcome.recovered ? "an earlier attempt that timed out had landed; adopted it" : "posted a new top-level escalation";
+    const replaced = outcome.superseded
+      ? `, re-paging and superseding the waiting thread ${outcome.superseded.ts} (${outcome.superseded.reason}); a reply in either acknowledges`
+      : "";
+    return { text: `escalated: ${how}${replaced}. Post updates in ${thread} with the reply tool.`, isError: false };
+  }
+  switch (outcome.page.status) {
+    case "not_needed":
+      return {
+        text: `already escalated and still waiting for the team, so nothing new was posted; post updates in that thread with the reply tool: ${thread}`,
+        isError: false,
+      };
+    case "sent":
+      return {
+        text: `already escalated and still waiting: your message was posted in that thread with every operator mentioned and broadcast to the channel. Post updates there with the reply tool: ${thread}`,
+        isError: false,
+      };
+    case "failed":
+      return {
+        text:
+          `the escalation thread is waiting, but paging the operators in it failed: ${outcome.page.reason}. ` +
+          `Call escalate again to retry the page (it can repeat a page, never a thread): ${thread}`,
+        isError: true,
+      };
+  }
+}
 
 // -- Operator wait: receipt acknowledgement and follow-up ----------------------
 //
@@ -522,16 +604,15 @@ thread you have posted in. DMs always reach you.
 
 Tools:
 - "reply" — omit "channel" to post in the team channel; pass the inbound thread_ts to stay in-thread.
-- "escalate" — posts to the team channel and pages every operator when severity is critical.
+- "escalate" — posts to the team channel; critical pages every operator.
 - "resolve_escalation" — closes one out.
 
-Escalations nag in-thread every 10 min (critical prod) or 1 hour (dev/staging) until an
-operator replies, which stops the nagging. Say what broke, what you tried, what you need.
-
-Keep one alert in one thread: post the escalation, then reply in that thread as you learn
-more. Never open a new top-level message for something already in flight; the channel is
-shared. "escalate" holds you to this: for a fingerprint whose escalation is still waiting, it
-posts nothing and answers with that thread (deduplicated: true); "reply" there.
+Call "escalate" for EVERY real prod critical, even one an outage thread seems to cover: it
+joins a fresh waiting thread (paging in it) or re-pages a stale or less severe one. Then
+"reply" in the thread it returns. Without that page an incident is not escalated (incidents.sh
+refuses it). A prod warning with user-facing impact is critical: pass raised_from and
+raise_reason. Say what broke, what you tried, what you need. Critical escalations nag
+in-thread until an operator replies; warnings get one daily digest.
 
 Message types that arrive automatically:
 - type="escalation_timeout" final_agent_nag="false": nobody replied. Note it and stand by — do NOT re-investigate.
@@ -612,7 +693,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "escalate",
       description:
-        "Escalate an alert to the ops team in the team channel. Pages every operator when severity is critical, and starts the automatic nag timer until someone replies.",
+        "Escalate an alert to the ops team in the team channel. Pages every operator when severity is critical, and nags critical ones until someone replies. " +
+        "Call it for EVERY new prod critical, even when it looks part of an outage already escalated: a waiting thread is joined (a prod critical is paged in it), " +
+        "a stale or less severe one is re-paged with a new top-level message.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -629,7 +712,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["critical", "warning", "info"],
             description:
-              "Alert severity level. 'critical' @-mentions every operator.",
+              "Severity of the impact, which may be above the alert's label: 'critical' @-mentions every operator. " +
+              "Use critical for a prod warning that is user-facing impact or the cause of an outage, with raised_from and raise_reason.",
+          },
+          raised_from: {
+            type: "string",
+            enum: ["warning", "info"],
+            description: "The alert's label severity, when you escalate above it. Requires raise_reason.",
+          },
+          raise_reason: {
+            type: "string",
+            description: "Why the impact is worse than the label, e.g. 'disk at 98%, cause of the read-only Postgres outage'. Requires raised_from.",
           },
           environment: {
             type: "string",
@@ -713,18 +806,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (name === "escalate") {
-    const { alert_fingerprint, alert_name, severity, environment, message } =
-      args as {
-        alert_fingerprint: string;
-        alert_name: string;
-        severity: string;
-        environment: string;
-        message: string;
-      };
+    const parsed = parseEscalateArgs(args);
+    if ("error" in parsed) {
+      return { content: [{ type: "text" as const, text: parsed.error }], isError: true };
+    }
+    const { request } = parsed;
 
     // Trivy findings are posted, and paged at most once, by the Trivy channel itself
-    if (isTrivyEscalation(alert_fingerprint)) {
-      console.error(`[slack-sre] refused a Trivy escalation from the agent: ${alert_fingerprint} (${alert_name})`);
+    if (isTrivyEscalation(request.alertFingerprint)) {
+      console.error(`[slack-sre] refused a Trivy escalation from the agent: ${request.alertFingerprint} (${request.alertName})`);
       return {
         content: [{ type: "text" as const, text: TRIVY_ESCALATION_REFUSED }],
         isError: true,
@@ -732,39 +822,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     try {
-      const outcome = await escalator.escalate({
-        alertFingerprint: alert_fingerprint,
-        alertName: alert_name,
-        severity,
-        environment,
-        message,
-      });
-
-      if (outcome.deduplicated) {
-        console.error(
-          `[slack-sre] ${alert_fingerprint} (${alert_name}) is already escalated and waiting; answered with thread ${outcome.ts}`
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                `already escalated and still waiting for the team, so nothing new was posted; ` +
-                `post updates in that thread with the reply tool: ` +
-                JSON.stringify(outcome),
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `escalated to the team channel (thread: ${outcome.ts})`,
-          },
-        ],
-      };
+      const outcome = await escalator.escalate(request);
+      const answer = describeEscalation(outcome);
+      console.error(`[slack-sre] escalate ${request.alertFingerprint} (${request.alertName}, ${request.severity}): ${answer.text}`);
+      return { content: [{ type: "text" as const, text: answer.text }], isError: answer.isError };
     } catch (err) {
       const text =
         err instanceof SlackPostRejected
@@ -1092,11 +1153,11 @@ slackApp.message(async ({ message }) => {
     return;
   }
 
-  // A reply in an escalation thread counts as acknowledgement — stop nagging.
+  // A reply in an escalation thread counts as acknowledgement — stop nagging. So does a reply
+  // in a thread a re-page replaced: the operator answered the page they saw.
   let isEscalationReply = false;
   if (parentThreadTs) {
-    for (const esc of activeEscalations.values()) {
-      if (esc.slackThreadTs !== parentThreadTs) continue;
+    for (const esc of escalationsForThread(activeEscalations, parentThreadTs)) {
       isEscalationReply = true;
       if (!esc.acknowledged) {
         esc.acknowledged = true;
@@ -1179,45 +1240,21 @@ async function nagSweep(): Promise<void> {
   const now = Date.now();
   let escalationsChanged = false;
 
+  // Critical only; warnings and info wait for the daily digest (escalation-nag.ts)
   for (const [fingerprint, esc] of activeEscalations) {
-    if (esc.acknowledged) continue;
-    // Restored from before the Trivy channel posted its own findings: never nag about one
-    if (isTrivyEscalation(fingerprint)) continue;
-
-    // Once MAX_AGENT_NAGS is reached, only Slack-nag at a slower cadence.
-    // Stop pushing events into Claude's session to preserve context window.
-    const agentExhausted = esc.nagCount >= MAX_AGENT_NAGS;
-    const interval = agentExhausted
-      ? SLACK_ONLY_INTERVAL_MS
-      : esc.environment === "dev"
-        ? DEV_ESCALATION_INTERVAL_MS
-        : ESCALATION_INTERVAL_MS;
-
-    if (now - esc.lastNagAt < interval) continue;
+    const nag = dueNag(esc, now, NAG_SETTINGS);
+    if (nag === undefined) continue;
 
     esc.lastNagAt = now;
-    esc.nagCount++;
+    esc.nagCount = nag.nagCount;
     escalationsChanged = true;
 
-    const minutesWaiting = Math.round((now - esc.escalatedAt) / (60 * 1000));
-
-    // Always nag the team on Slack
     if (esc.slackChannel && esc.slackThreadTs) {
+      const message = nag.broadcast
+        ? { channel: esc.slackChannel, thread_ts: esc.slackThreadTs, text: nag.text, reply_broadcast: true as const }
+        : { channel: esc.slackChannel, thread_ts: esc.slackThreadTs, text: nag.text };
       try {
-        const urgency =
-          esc.severity === "critical" && esc.environment === "prod"
-            ? `:rotating_light: *STILL WAITING* (${minutesWaiting} min) ${OPERATOR_MENTIONS}`
-            : `:bell: Reminder (${minutesWaiting} min)`;
-
-        const slackOnlyNote = agentExhausted
-          ? " _(Slack-only nag — agent standing by silently)_"
-          : "";
-
-        await slackPoster.post({
-          channel: esc.slackChannel,
-          thread_ts: esc.slackThreadTs,
-          text: `${urgency} — alert *${esc.alertName}* [${esc.environment.toUpperCase()}] is still unacknowledged. Nag #${esc.nagCount}.${slackOnlyNote}`,
-        });
+        await slackPoster.post(message);
       } catch (err) {
         console.error(`[slack-sre] failed to nag for ${fingerprint}: ${describePostFailure(err)}`);
       }
@@ -1225,21 +1262,21 @@ async function nagSweep(): Promise<void> {
 
     // Only push timeout events into Claude's session up to MAX_AGENT_NAGS.
     // After that, Slack nags continue but the agent's context is preserved.
-    if (!agentExhausted) {
+    if (nag.notifyAgent) {
       await withTimeout(
         mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: `Escalation for "${esc.alertName}" has been unacknowledged for ${minutesWaiting} minutes. Nag #${esc.nagCount} sent to the team.${esc.nagCount === MAX_AGENT_NAGS ? ` This is the final agent notification — the team appears offline. Will continue Slack-only nags every 2 hours.` : ""}`,
+            content: `Escalation for "${esc.alertName}" has been unacknowledged for ${nag.minutesWaiting} minutes. Nag #${nag.nagCount} sent to the team.${nag.finalAgentNag ? ` This is the final agent notification — the team appears offline. Will continue Slack-only nags every ${SLACK_ONLY_INTERVAL_MS / MINUTE_MS} minutes.` : ""}`,
             meta: {
               type: "escalation_timeout",
               alert_fingerprint: fingerprint,
               alert_name: esc.alertName,
               severity: esc.severity,
               environment: esc.environment,
-              minutes_waiting: String(minutesWaiting),
-              nag_count: String(esc.nagCount),
-              final_agent_nag: esc.nagCount === MAX_AGENT_NAGS ? "true" : "false",
+              minutes_waiting: String(nag.minutesWaiting),
+              nag_count: String(nag.nagCount),
+              final_agent_nag: nag.finalAgentNag ? "true" : "false",
             },
           },
         }),
@@ -1256,6 +1293,44 @@ async function nagSweep(): Promise<void> {
   // One write per sweep rather than one per escalation: the nag counters only have to
   // survive a restart, and a restart cannot land mid-loop.
   if (escalationsChanged) persistEscalations();
+
+  await postEscalationDigest(now);
+}
+
+// A digest Slack refused is retried with backoff. One whose outcome is unknown counts as
+// posted: it pages no one, and posting it twice is worse than once late.
+const DIGEST_RETRY_MIN_MS = MINUTE_MS;
+const DIGEST_RETRY_MAX_MS = HOUR_MS;
+let digestFailures = 0;
+let nextDigestAttemptAt = 0;
+
+async function postEscalationDigest(now: number): Promise<void> {
+  if (now < nextDigestAttemptAt || !isDailySlotDue(digestClock.lastPostedAt(), now, ESCALATION_DIGEST_HOUR_UTC)) return;
+
+  const text = buildEscalationDigest(activeEscalations.values(), now, threadLink);
+  if (text === undefined) {
+    digestClock.markPosted(now);
+    console.error("[slack-sre] escalation digest: nothing waiting, nothing posted");
+    return;
+  }
+
+  try {
+    await slackPoster.post({ channel: SRE_SLACK_CHANNEL, text });
+    console.error("[slack-sre] escalation digest posted");
+  } catch (err) {
+    if (err instanceof SlackPostRejected) {
+      digestFailures++;
+      const delay = Math.min(DIGEST_RETRY_MIN_MS * 2 ** (digestFailures - 1), DIGEST_RETRY_MAX_MS);
+      nextDigestAttemptAt = now + delay;
+      console.error(
+        `[slack-sre] escalation digest refused (attempt ${digestFailures}), retrying in ${Math.round(delay / MINUTE_MS)} min: ${err.message}`
+      );
+      return;
+    }
+    console.error(`[slack-sre] escalation digest: ${describePostFailure(err)}; not posting it again today`);
+  }
+  digestFailures = 0;
+  digestClock.markPosted(now);
 }
 
 // Runbook proposals: 24 h reminder, 7 day expiry, and applying an approval that a restart

@@ -12,6 +12,7 @@
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { isDailySlotDue } from "./daily-slot.js";
 
 export const SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"] as const;
 export type Severity = (typeof SEVERITIES)[number];
@@ -201,10 +202,7 @@ export function recordVulnerabilityReport(
 
 /** Whether today's digest slot (`hourUtc`) has passed without a digest being sent. */
 export function isDigestDue(state: TrivyState, now: number, hourUtc: number): boolean {
-  const day = new Date(now);
-  const slot = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hourUtc);
-
-  return now >= slot && state.lastDigestAt < slot;
+  return isDailySlotDue(state.lastDigestAt, now, hourUtc);
 }
 
 /** Every tracked image with what is new since the previous digest, worst first. */
